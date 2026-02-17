@@ -700,6 +700,7 @@ int main(int argc, char **argv)
   // Store SfM_Data views & intrinsic data
   if (!Save(
     sfm_data,
+    // JPB Must remain json for other parts of the pipe.
     stlplus::create_filespec( sOutputDir, "sfm_data.json" ).c_str(),
     ESfM_Data(VIEWS|INTRINSICS|CONTROL_POINTS)))
   {

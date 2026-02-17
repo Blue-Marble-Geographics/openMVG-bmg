@@ -428,6 +428,41 @@ static __forceinline _Data FastAbs(_Data x)
 
 static __forceinline _Data GradCalc2(_Data y, _Data x)
 {
+#if 0 // Buggy ?
+  _Data const vTwoPI = _Set((float)(2.0 * VL_PI));
+  _Data const vZero = _Set(0.f);
+
+  _Data const vC3 = _Set(0.1821f);
+  _Data const vC1 = _Set(0.9675f);
+
+  _Data const vAbsY = FastAbs(y); // epsilon removed
+  _Data const vHigh = _CastFI(_SetI(0x80000000));
+
+  _Data const vNum = _Sub(x, _Or(vAbsY, _And(x, vHigh)));
+  _Data const vDen = _Add(vAbsY, _Xor(x, _And(x, vHigh)));
+
+  _Data angle = Blend(
+    _Set((float)(3.0 * VL_PI / 4.0)),
+    _Set((float)(VL_PI / 4.0)),
+    _CmpGE(x, vZero)
+  );
+
+  // reciprocal instead of divide
+  _Data r = _Mul(vNum, _mm_rcp_ps(vDen));
+
+  // optional Newton refinement (comment out to go faster)
+  r = _Mul(r, _Sub(_Set(2.0f), _Mul(vDen, r)));
+
+  angle = _Add(angle,
+    _Mul(_Sub(_Mul(vC3, _Mul(r, r)), vC1), r)
+  );
+
+  _Data atan2 = _Xor(angle, _And(y, vHigh));
+
+  // skip Mod2PILimited if downstream wraps bins
+  return _Add(atan2, vTwoPI);
+
+#else
   /* An SSE2-comparable variant of vl_mod_2pi_f(vl_fast_atan2_f (gy, gx) + 2*VL_PI) */
   _Data const vTwoPI   = _Set((float) (2. * VL_PI));
   _Data const vZero    = _Set(0.f);
@@ -450,6 +485,7 @@ static __forceinline _Data GradCalc2(_Data y, _Data x)
   _Data const atan2    = _Xor(vAngle, _And(y, vHighBit));
 
   return Mod2PILimited(_Add(atan2, vTwoPI));
+#endif
 }
 
 static __forceinline float Mod2PILimitedS(float x)

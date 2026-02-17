@@ -64,10 +64,40 @@ features::EDESCRIBER_PRESET stringToEnum(const std::string & sPreset)
   return preset;
 }
 
+extern "C" int hasAVX2 = -1;
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+
+static int
+CpuHasAVX2()
+{
+#if defined(_MSC_VER)
+  int cpuInfo[4];
+  __cpuid(cpuInfo, 0);
+  if (cpuInfo[0] < 7) return 0;
+
+  __cpuidex(cpuInfo, 7, 0);
+  return (cpuInfo[1] & (1 << 5)) != 0;
+#else
+  unsigned eax, ebx, ecx, edx;
+  if (!__get_cpuid_max(0, 0) || __get_cpuid_max(0, 0) < 7)
+    return 0;
+
+  __cpuid_count(7, 0, eax, ebx, ecx, edx);
+  return (ebx & (1 << 5)) != 0;
+#endif
+}
+
 /// - Compute view image description (feature & descriptor extraction)
 /// - Export computed data
 int main(int argc, char **argv)
 {
+  hasAVX2 = CpuHasAVX2();
+
   CmdLine cmd;
 
   std::string sSfM_Data_Filename;
@@ -255,14 +285,13 @@ int main(int argc, char **argv)
   // - if no file, compute features
   {
     system::Timer timer;
-    Image<unsigned char> imageGray;
 
-    system::LoggerProgress my_progress_bar(sfm_data.GetViews().size(), "- EXTRACT FEATURES -" );
+    system::LoggerProgress my_progress_bar((uint32_t) sfm_data.GetViews().size(), "- EXTRACT FEATURES -" );
 
     // Use a boolean to track if we must stop feature extraction
     std::atomic<bool> preemptive_exit(false);
 
-#if (!TEST_CF_SINGLE_IMAGE) || (!TEST_CF_NOTHREADING)
+#if (!TEST_CF_SINGLE_IMAGE) && (!TEST_CF_NOTHREADING)
 #ifdef OPENMVG_USE_OPENMP
     const unsigned int nb_max_thread = omp_get_max_threads();
 
@@ -272,7 +301,7 @@ int main(int argc, char **argv)
         omp_set_num_threads(nb_max_thread);
     }
 
-    #pragma omp parallel for schedule(dynamic) if (iNumThreads > 0) private(imageGray)
+    #pragma omp parallel for schedule(dynamic) if (iNumThreads > 0)
 #endif
 #endif
 #if (TEST_CF_MAX_IMAGES==0)
@@ -281,6 +310,8 @@ int main(int argc, char **argv)
     for (int i = 0; i < std::min(static_cast<int>(sfm_data.views.size()), (int) TEST_CF_MAX_IMAGES); ++i)
 #endif
     {
+      static thread_local Image<unsigned char> imageGray;
+
       Views::const_iterator iterViews = sfm_data.views.begin();
       std::advance(iterViews, i);
       const View * view = iterViews->second.get();

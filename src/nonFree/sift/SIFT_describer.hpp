@@ -23,6 +23,7 @@ extern "C" {
 #include "nonFree/sift/vl/sift.h"
 }
 
+
 namespace openMVG {
 namespace features {
 
@@ -30,21 +31,88 @@ namespace features {
 // [1] R. Arandjelović, A. Zisserman.
 // Three things everyone should know to improve object retrieval. CVPR2012.
 
-inline void siftDescToUChar(
-  vl_sift_pix descr[128],
-  Descriptor<unsigned char,128> & descriptor,
-  bool brootSift = false)
-{
-  if (brootSift)  {
-    // rootsift = sqrt( sift / sum(sift) );
-    const float sum = std::accumulate(descr, descr+128, 0.0f);
-    for (int k=0;k<128;++k)
-      descriptor[k] = static_cast<unsigned char>(512.f*sqrt(descr[k]/sum));
+  inline void siftDescToUChar(
+    const vl_sift_pix descr[128],
+    Descriptor<unsigned char, 128>& descriptor,
+    bool brootSift = false)
+  {
+    if (!brootSift) {
+      for (int k = 0; k < 128; ++k)
+        descriptor[k] = static_cast<unsigned char>(512.f * descr[k]);
+      return;
+      const __m128 scale = _mm_set1_ps(512.0f);
+
+      for (int k = 0; k < 128; k += 16) {
+
+        // Load 16 floats (4 x __m128)
+        __m128 f0 = _mm_loadu_ps(descr + k + 0);
+        __m128 f1 = _mm_loadu_ps(descr + k + 4);
+        __m128 f2 = _mm_loadu_ps(descr + k + 8);
+        __m128 f3 = _mm_loadu_ps(descr + k + 12);
+
+        // Scale
+        f0 = _mm_mul_ps(f0, scale);
+        f1 = _mm_mul_ps(f1, scale);
+        f2 = _mm_mul_ps(f2, scale);
+        f3 = _mm_mul_ps(f3, scale);
+
+        // Convert to int32
+        __m128i i0 = _mm_cvtps_epi32(f0);
+        __m128i i1 = _mm_cvtps_epi32(f1);
+        __m128i i2 = _mm_cvtps_epi32(f2);
+        __m128i i3 = _mm_cvtps_epi32(f3);
+
+        // Pack 32-bit -> 16-bit -> 8-bit (unsigned saturation)
+        __m128i p01 = _mm_packs_epi32(i0, i1);
+        __m128i p23 = _mm_packs_epi32(i2, i3);
+        __m128i p = _mm_packus_epi16(p01, p23);
+
+        // Store 16 bytes
+        _mm_storeu_si128((__m128i*)(descriptor.data() + k), p);
+      }
+    }
+    else {
+      // ---------------- RootSIFT ----------------
+
+      // Compute sum (scalar, cheap)
+      float sum = 0.0f;
+      for (int k = 0; k < 128; ++k)
+        sum += descr[k];
+
+      if (sum <= 0.0f) {
+        // Avoid divide-by-zero; zero descriptor
+        for (int k = 0; k < 128; ++k)
+          descriptor[k] = 0;
+        return;
+      }
+
+      const __m128 invSum = _mm_set1_ps(1.0f / sum);
+      const __m128 scale = _mm_set1_ps(512.0f);
+
+      for (int k = 0; k < 128; k += 4) {
+
+        __m128 f = _mm_loadu_ps(descr + k);
+
+        // descr / sum
+        f = _mm_mul_ps(f, invSum);
+
+        // sqrt
+        f = _mm_sqrt_ps(f);
+
+        // scale
+        f = _mm_mul_ps(f, scale);
+
+        // convert
+        __m128i i = _mm_cvtps_epi32(f);
+
+        // store 4 bytes manually
+        descriptor[k + 0] = (unsigned char)_mm_extract_epi16(i, 0);
+        descriptor[k + 1] = (unsigned char)_mm_extract_epi16(i, 2);
+        descriptor[k + 2] = (unsigned char)_mm_extract_epi16(i, 4);
+        descriptor[k + 3] = (unsigned char)_mm_extract_epi16(i, 6);
+      }
+    }
   }
-  else
-    for (int k=0;k<128;++k)
-    descriptor[k] = static_cast<unsigned char>(512.f*descr[k]);
-}
 
 class SIFT_Image_describer : public Image_describer
 {
@@ -178,11 +246,7 @@ public:
       // Update gradient before launching parallel extraction
       vl_sift_update_gradient(filt);
 
-#if PARALLEL_KEYPOINT_GENERATION
-      #ifdef OPENMVG_USE_OPENMP
-      #pragma omp parallel for private(descr, descriptor)
-      #endif
-#endif
+
       for (int i = 0; i < nkeys; ++i) {
 
         // Feature masking
@@ -206,11 +270,7 @@ public:
             keys[i].sigma, static_cast<float>(angles[q]));
 
           siftDescToUChar(&descr[0], descriptor, _params._root_sift);
-#if PARALLEL_KEYPOINT_GENERATION
-          #ifdef OPENMVG_USE_OPENMP
-          #pragma omp critical
-          #endif
-#endif
+
           {
             regions->Descriptors().push_back(descriptor);
             regions->Features().push_back(fp);

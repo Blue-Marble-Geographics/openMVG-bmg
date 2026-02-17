@@ -45,7 +45,14 @@ target_link_libraries(openMVG_main_ComputeFeatures
     openMVG_sfm
     ${STLPLUS_LIBRARY}
     vlsift
+    ${OpenCV_LIBS}
 )
+
+target_include_directories(openMVG_main_ComputeFeatures
+  PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+)
+
 if (MSVC)
   set_target_properties(openMVG_main_ComputeFeatures PROPERTIES COMPILE_FLAGS "/bigobj")
 endif (MSVC)
@@ -344,3 +351,6 @@ configure_file(${OPENMVG_TUTORIAL_IN_FILE}
 add_subdirectory(clustering)
 add_subdirectory(export)
 add_subdirectory(import)
+
+find_package(OpenCV REQUIRED)
+target_link_libraries(openMVG_main_ComputeFeatures PRIVATE ${OpenCV_LIBS})

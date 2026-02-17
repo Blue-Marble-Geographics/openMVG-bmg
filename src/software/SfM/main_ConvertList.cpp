@@ -195,6 +195,7 @@ int main(int argc, char **argv)
   // Store SfM_Data views & intrinsic data
   if (Save(
       sfm_data,
+    // JPB WIP BUG Requires more changes to go to bin.
       stlplus::create_filespec( sOutputDir, "sfm_data.json" ).c_str(),
       ESfM_Data(VIEWS|INTRINSICS)))
   {

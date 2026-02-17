@@ -693,6 +693,8 @@ Gaussian window size is set to have standard deviation
 
 #define REDUCE_MEMORY /* Share buffer space to reduce memory use 25% */
 
+extern int hasAVX2;
+
 /** ------------------------------------------------------------------
  ** @internal
  ** @brief Fast @f$exp(-x)@f$ approximation
@@ -773,6 +775,14 @@ copy_and_upsample_rows
   }
 }
 
+#if defined(_MSC_VER)
+#define VL_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#define VL_RESTRICT __restrict__
+#else
+#define VL_RESTRICT
+#endif
+
 /** ------------------------------------------------------------------
  ** @internal
  ** @brief Smooth an image
@@ -785,6 +795,600 @@ copy_and_upsample_rows
  ** @param sigma       smoothing.
  **/
 
+#if 1
+void
+GaussianRowSymmetricClampSSE2(
+  float* VL_RESTRICT dst,
+  const float* VL_RESTRICT src,
+  size_t width,
+  const float* VL_RESTRICT k,
+  int W)
+{
+  size_t x = 0;
+
+  /* left edge */
+  for (; x < (size_t)W && x < width; ++x) {
+    float acc = k[0] * src[x];
+    int i;
+    for (i = 1; i <= W; ++i) {
+      size_t xm = (x < (size_t)i) ? 0 : x - (size_t)i;
+      size_t xp = (x + (size_t)i >= width) ? width - 1 : x + (size_t)i;
+      acc += k[i] * (src[xm] + src[xp]);
+    }
+    dst[x] = acc;
+  }
+
+  /* center */
+  for (; x + 3 < width - (size_t)W; x += 4) {
+    __m128 acc = _mm_mul_ps(_mm_set1_ps(k[0]),
+      _mm_loadu_ps(src + x));
+
+    int i;
+    for (i = 1; i <= W; ++i) {
+      __m128 km = _mm_set1_ps(k[i]);
+      __m128 a = _mm_loadu_ps(src + x - i);
+      __m128 b = _mm_loadu_ps(src + x + i);
+      acc = _mm_add_ps(acc, _mm_mul_ps(km, _mm_add_ps(a, b)));
+    }
+
+    _mm_storeu_ps(dst + x, acc);
+  }
+
+  /* right edge */
+  for (; x < width; ++x) {
+    float acc = k[0] * src[x];
+    int i;
+    for (i = 1; i <= W; ++i) {
+      size_t xm = (x < (size_t)i) ? 0 : x - (size_t)i;
+      size_t xp = (x + (size_t)i >= width) ? width - 1 : x + (size_t)i;
+      acc += k[i] * (src[xm] + src[xp]);
+    }
+    dst[x] = acc;
+  }
+}
+
+void
+GaussianRowSymmetricClampAVX2(
+  float* VL_RESTRICT dst,
+  const float* VL_RESTRICT src,
+  size_t width,
+  const float* VL_RESTRICT k,
+  int W);
+
+void AccumulateW13_AVX2_Block(
+  float k0,
+  const float* VL_RESTRICT rowCenter,
+  float* const VL_RESTRICT rowUp[64],
+  float* const VL_RESTRICT rowDn[64],
+  const float* VL_RESTRICT kw,
+  float* VL_RESTRICT out,
+  int width);
+
+typedef void (*GaussianRowFn)(
+  float*,
+  const float*,
+  vl_size,
+  const float*,
+  int);
+
+static GaussianRowFn gGaussianRowFn = 0;
+
+static void
+_vl_sift_smooth(
+  VlSiftFilt* self,
+  vl_sift_pix* VL_RESTRICT outputImage,
+  vl_sift_pix* VL_RESTRICT tempImage, /* unused, ABI only */
+  vl_sift_pix const* VL_RESTRICT inputImage,
+  vl_size width,
+  vl_size height,
+  double sigma)
+{
+  if (hasAVX2) {
+    gGaussianRowFn = GaussianRowSymmetricClampAVX2;
+  }
+  else {
+    gGaussianRowFn = GaussianRowSymmetricClampSSE2;
+  }
+
+  (void)tempImage;
+
+  /* ------------------------------------------------------------
+   * Build symmetric Gaussian kernel (half only)
+   * ------------------------------------------------------------ */
+  if (self->gaussFilterSigma != sigma) {
+    int i;
+    float acc = 0.0f;
+
+    self->gaussFilterWidth = VL_MAX((int)ceil(4.0 * sigma), 1);
+    {
+      int W = self->gaussFilterWidth;
+      size_t needed = sizeof(vl_sift_pix) * (size_t)(W + 1);
+
+      if (needed > self->gaussFilterSize) {
+        if (self->gaussFilter) vl_free(self->gaussFilter);
+        self->gaussFilter = vl_malloc(needed);
+        self->gaussFilterSize = needed;
+      }
+
+      self->gaussFilterSigma = sigma;
+
+      for (i = 0; i <= W; ++i) {
+        float d = (float)i / (float)sigma;
+        float v = expf(-0.5f * d * d);
+        self->gaussFilter[i] = v;
+        acc += (i == 0) ? v : 2.0f * v;
+      }
+
+      for (i = 0; i <= W; ++i) {
+        self->gaussFilter[i] /= acc;
+      }
+    }
+  }
+
+  {
+    const int W = self->gaussFilterWidth;
+    const float* VL_RESTRICT k = self->gaussFilter;
+
+    if (W == 0) {
+      memcpy(outputImage, inputImage,
+        sizeof(vl_sift_pix) * width * height);
+      return;
+    }
+
+    /* ------------------------------------------------------------
+     * Ring buffer: exactly 2W+1 horizontally filtered rows
+     * ------------------------------------------------------------ */
+    {
+      const int R = 2 * W + 1;
+      float* VL_RESTRICT rowBuf =
+        (float*)vl_malloc(sizeof(float) * (size_t)R * width);
+
+      const int Wplus1 = W + 1;
+      int center = W;
+      int t;
+
+      GaussianRowFn rowFn = gGaussianRowFn;
+      float* VL_RESTRICT rowPtr[64];
+      int i;
+      for (i = 0; i < R; ++i)
+        rowPtr[i] = rowBuf + (size_t)i * width;
+
+      /* ----------------------------------------------------------
+       * Initialize window for y = 0 (rows [-W .. +W] clamped)
+       * ---------------------------------------------------------- */
+      for (t = -W; t <= W; ++t) {
+        vl_size srcY;
+        if (t < 0) {
+          srcY = 0;
+        }
+        else {
+          srcY = (vl_size)t;
+          if (srcY >= height) srcY = height - 1;
+        }
+
+        rowFn(
+          rowBuf + (size_t)(t + W) * width,
+          inputImage + srcY * width,
+          width,
+          k,
+          W);
+      }
+
+      /* Helper to slide the vertical window by one row. */
+#define SLIDE_RING() do {                       \
+      int add = center + Wplus1;                         \
+      if (add >= R) add -= R;                            \
+                                                          \
+      rowFn(rowPtr[add],                                 \
+            inputImage + (y + Wplus1) * width,           \
+            width, k, W);                                \
+                                                          \
+      center++;                                          \
+      if (center == R) center = 0;                       \
+    } while(0)
+
+    /* ----------------------------------------------------------
+     * Main loop (W-dispatch hoisted, MSVC optimized)
+     * ---------------------------------------------------------- */
+      {
+        vl_size y, x;
+        int i;
+
+        /* Hoist kernel coefficients ONCE */
+        float k0 = k[0];
+        float kw[64];
+        for (i = 1; i <= W; ++i)
+          kw[i] = k[i];
+
+        float* VL_RESTRICT rowUp[64];
+        float* VL_RESTRICT rowDn[64];
+
+        switch (W) {
+
+          /* ======================================================
+           * W == 5
+           * ====================================================== */
+        case 5:
+          for (y = 0; y < height; ++y) {
+
+            float* VL_RESTRICT out = outputImage + y * width;
+            float* VL_RESTRICT rowCenter = rowBuf + (size_t)center * width;
+
+            for (i = 1; i <= 5; ++i) {
+              int up = center - i;
+              int dn = center + i;
+              if (up < 0) up += R;
+              if (dn >= R) dn -= R;
+              rowUp[i] = rowBuf + (size_t)up * width;
+              rowDn[i] = rowBuf + (size_t)dn * width;
+            }
+
+#pragma loop(ivdep)
+            for (x = 0; x + 3 < width; x += 4) {
+
+              float a0 =
+                k0 * rowCenter[x] +
+                kw[1] * (rowUp[1][x] + rowDn[1][x]) +
+                kw[2] * (rowUp[2][x] + rowDn[2][x]) +
+                kw[3] * (rowUp[3][x] + rowDn[3][x]) +
+                kw[4] * (rowUp[4][x] + rowDn[4][x]) +
+                kw[5] * (rowUp[5][x] + rowDn[5][x]);
+
+              float a1 =
+                k0 * rowCenter[x + 1] +
+                kw[1] * (rowUp[1][x + 1] + rowDn[1][x + 1]) +
+                kw[2] * (rowUp[2][x + 1] + rowDn[2][x + 1]) +
+                kw[3] * (rowUp[3][x + 1] + rowDn[3][x + 1]) +
+                kw[4] * (rowUp[4][x + 1] + rowDn[4][x + 1]) +
+                kw[5] * (rowUp[5][x + 1] + rowDn[5][x + 1]);
+
+              float a2 =
+                k0 * rowCenter[x + 2] +
+                kw[1] * (rowUp[1][x + 2] + rowDn[1][x + 2]) +
+                kw[2] * (rowUp[2][x + 2] + rowDn[2][x + 2]) +
+                kw[3] * (rowUp[3][x + 2] + rowDn[3][x + 2]) +
+                kw[4] * (rowUp[4][x + 2] + rowDn[4][x + 2]) +
+                kw[5] * (rowUp[5][x + 2] + rowDn[5][x + 2]);
+
+              float a3 =
+                k0 * rowCenter[x + 3] +
+                kw[1] * (rowUp[1][x + 3] + rowDn[1][x + 3]) +
+                kw[2] * (rowUp[2][x + 3] + rowDn[2][x + 3]) +
+                kw[3] * (rowUp[3][x + 3] + rowDn[3][x + 3]) +
+                kw[4] * (rowUp[4][x + 3] + rowDn[4][x + 3]) +
+                kw[5] * (rowUp[5][x + 3] + rowDn[5][x + 3]);
+
+              out[x] = a0;
+              out[x + 1] = a1;
+              out[x + 2] = a2;
+              out[x + 3] = a3;
+            }
+
+            for (; x < width; ++x) {
+              out[x] =
+                k0 * rowCenter[x] +
+                kw[1] * (rowUp[1][x] + rowDn[1][x]) +
+                kw[2] * (rowUp[2][x] + rowDn[2][x]) +
+                kw[3] * (rowUp[3][x] + rowDn[3][x]) +
+                kw[4] * (rowUp[4][x] + rowDn[4][x]) +
+                kw[5] * (rowUp[5][x] + rowDn[5][x]);
+            }
+
+            SLIDE_RING();
+          }
+          break;
+
+          /* ======================================================
+           * W == 7
+           * ====================================================== */
+        case 7:
+          for (y = 0; y < height; ++y) {
+
+            float* VL_RESTRICT out = outputImage + y * width;
+            float* VL_RESTRICT rowCenter = rowBuf + (size_t)center * width;
+
+            for (i = 1; i <= 7; ++i) {
+              int up = center - i;
+              int dn = center + i;
+              if (up < 0) up += R;
+              if (dn >= R) dn -= R;
+              rowUp[i] = rowBuf + (size_t)up * width;
+              rowDn[i] = rowBuf + (size_t)dn * width;
+            }
+
+#pragma loop(ivdep)
+            for (x = 0; x + 3 < width; x += 4) {
+              float a0 =
+                k0 * rowCenter[x] +
+                kw[1] * (rowUp[1][x] + rowDn[1][x]) +
+                kw[2] * (rowUp[2][x] + rowDn[2][x]) +
+                kw[3] * (rowUp[3][x] + rowDn[3][x]) +
+                kw[4] * (rowUp[4][x] + rowDn[4][x]) +
+                kw[5] * (rowUp[5][x] + rowDn[5][x]) +
+                kw[6] * (rowUp[6][x] + rowDn[6][x]) +
+                kw[7] * (rowUp[7][x] + rowDn[7][x]);
+
+              float a1 =
+                k0 * rowCenter[x + 1] +
+                kw[1] * (rowUp[1][x + 1] + rowDn[1][x + 1]) +
+                kw[2] * (rowUp[2][x + 1] + rowDn[2][x + 1]) +
+                kw[3] * (rowUp[3][x + 1] + rowDn[3][x + 1]) +
+                kw[4] * (rowUp[4][x + 1] + rowDn[4][x + 1]) +
+                kw[5] * (rowUp[5][x + 1] + rowDn[5][x + 1]) +
+                kw[6] * (rowUp[6][x + 1] + rowDn[6][x + 1]) +
+                kw[7] * (rowUp[7][x + 1] + rowDn[7][x + 1]);
+
+              float a2 =
+                k0 * rowCenter[x + 2] +
+                kw[1] * (rowUp[1][x + 2] + rowDn[1][x + 2]) +
+                kw[2] * (rowUp[2][x + 2] + rowDn[2][x + 2]) +
+                kw[3] * (rowUp[3][x + 2] + rowDn[3][x + 2]) +
+                kw[4] * (rowUp[4][x + 2] + rowDn[4][x + 2]) +
+                kw[5] * (rowUp[5][x + 2] + rowDn[5][x + 2]) +
+                kw[6] * (rowUp[6][x + 2] + rowDn[6][x + 2]) +
+                kw[7] * (rowUp[7][x + 2] + rowDn[7][x + 2]);
+
+              float a3 =
+                k0 * rowCenter[x + 3] +
+                kw[1] * (rowUp[1][x + 3] + rowDn[1][x + 3]) +
+                kw[2] * (rowUp[2][x + 3] + rowDn[2][x + 3]) +
+                kw[3] * (rowUp[3][x + 3] + rowDn[3][x + 3]) +
+                kw[4] * (rowUp[4][x + 3] + rowDn[4][x + 3]) +
+                kw[5] * (rowUp[5][x + 3] + rowDn[5][x + 3]) +
+                kw[6] * (rowUp[6][x + 3] + rowDn[6][x + 3]) +
+                kw[7] * (rowUp[7][x + 3] + rowDn[7][x + 3]);
+
+              out[x] = a0;
+              out[x + 1] = a1;
+              out[x + 2] = a2;
+              out[x + 3] = a3;
+            }
+
+            for (; x < width; ++x) {
+              out[x] =
+                k0 * rowCenter[x] +
+                kw[1] * (rowUp[1][x] + rowDn[1][x]) +
+                kw[2] * (rowUp[2][x] + rowDn[2][x]) +
+                kw[3] * (rowUp[3][x] + rowDn[3][x]) +
+                kw[4] * (rowUp[4][x] + rowDn[4][x]) +
+                kw[5] * (rowUp[5][x] + rowDn[5][x]) +
+                kw[6] * (rowUp[6][x] + rowDn[6][x]) +
+                kw[7] * (rowUp[7][x] + rowDn[7][x]);
+            }
+
+            SLIDE_RING();
+          }
+          break;
+
+        case 8:
+          for (y = 0; y < height; ++y) {
+
+            float* VL_RESTRICT out = outputImage + y * width;
+            float* VL_RESTRICT rowCenter = rowBuf + (size_t)center * width;
+
+            for (i = 1; i <= 8; ++i) {
+              int up = center - i;
+              int dn = center + i;
+              if (up < 0) up += R;
+              if (dn >= R) dn -= R;
+              rowUp[i] = rowBuf + (size_t)up * width;
+              rowDn[i] = rowBuf + (size_t)dn * width;
+            }
+
+#pragma loop(ivdep)
+            for (x = 0; x + 3 < width; x += 4) {
+
+              float a0 =
+                k0 * rowCenter[x] +
+                kw[1] * (rowUp[1][x] + rowDn[1][x]) +
+                kw[2] * (rowUp[2][x] + rowDn[2][x]) +
+                kw[3] * (rowUp[3][x] + rowDn[3][x]) +
+                kw[4] * (rowUp[4][x] + rowDn[4][x]) +
+                kw[5] * (rowUp[5][x] + rowDn[5][x]) +
+                kw[6] * (rowUp[6][x] + rowDn[6][x]) +
+                kw[7] * (rowUp[7][x] + rowDn[7][x]) +
+                kw[8] * (rowUp[8][x] + rowDn[8][x]);
+
+              float a1 =
+                k0 * rowCenter[x + 1] +
+                kw[1] * (rowUp[1][x + 1] + rowDn[1][x + 1]) +
+                kw[2] * (rowUp[2][x + 1] + rowDn[2][x + 1]) +
+                kw[3] * (rowUp[3][x + 1] + rowDn[3][x + 1]) +
+                kw[4] * (rowUp[4][x + 1] + rowDn[4][x + 1]) +
+                kw[5] * (rowUp[5][x + 1] + rowDn[5][x + 1]) +
+                kw[6] * (rowUp[6][x + 1] + rowDn[6][x + 1]) +
+                kw[7] * (rowUp[7][x + 1] + rowDn[7][x + 1]) +
+                kw[8] * (rowUp[8][x + 1] + rowDn[8][x + 1]);
+
+              float a2 =
+                k0 * rowCenter[x + 2] +
+                kw[1] * (rowUp[1][x + 2] + rowDn[1][x + 2]) +
+                kw[2] * (rowUp[2][x + 2] + rowDn[2][x + 2]) +
+                kw[3] * (rowUp[3][x + 2] + rowDn[3][x + 2]) +
+                kw[4] * (rowUp[4][x + 2] + rowDn[4][x + 2]) +
+                kw[5] * (rowUp[5][x + 2] + rowDn[5][x + 2]) +
+                kw[6] * (rowUp[6][x + 2] + rowDn[6][x + 2]) +
+                kw[7] * (rowUp[7][x + 2] + rowDn[7][x + 2]) +
+                kw[8] * (rowUp[8][x + 2] + rowDn[8][x + 2]);
+
+              float a3 =
+                k0 * rowCenter[x + 3] +
+                kw[1] * (rowUp[1][x + 3] + rowDn[1][x + 3]) +
+                kw[2] * (rowUp[2][x + 3] + rowDn[2][x + 3]) +
+                kw[3] * (rowUp[3][x + 3] + rowDn[3][x + 3]) +
+                kw[4] * (rowUp[4][x + 3] + rowDn[4][x + 3]) +
+                kw[5] * (rowUp[5][x + 3] + rowDn[5][x + 3]) +
+                kw[6] * (rowUp[6][x + 3] + rowDn[6][x + 3]) +
+                kw[7] * (rowUp[7][x + 3] + rowDn[7][x + 3]) +
+                kw[8] * (rowUp[8][x + 3] + rowDn[8][x + 3]);
+
+              out[x] = a0;
+              out[x + 1] = a1;
+              out[x + 2] = a2;
+              out[x + 3] = a3;
+            }
+
+            for (; x < width; ++x) {
+              out[x] =
+                k0 * rowCenter[x] +
+                kw[1] * (rowUp[1][x] + rowDn[1][x]) +
+                kw[2] * (rowUp[2][x] + rowDn[2][x]) +
+                kw[3] * (rowUp[3][x] + rowDn[3][x]) +
+                kw[4] * (rowUp[4][x] + rowDn[4][x]) +
+                kw[5] * (rowUp[5][x] + rowDn[5][x]) +
+                kw[6] * (rowUp[6][x] + rowDn[6][x]) +
+                kw[7] * (rowUp[7][x] + rowDn[7][x]) +
+                kw[8] * (rowUp[8][x] + rowDn[8][x]);
+            }
+
+            SLIDE_RING();
+          }
+          break;
+
+          /* ======================================================
+           * W == 10 (2-accumulator scalar)
+           * ====================================================== */
+        case 10:
+          for (y = 0; y < height; ++y) {
+            float* VL_RESTRICT out = outputImage + y * width;
+            float* VL_RESTRICT rowCenter = rowBuf + (size_t)center * width;
+
+            for (i = 1; i <= 10; ++i) {
+              int up = center - i;
+              int dn = center + i;
+              if (up < 0) up += R;
+              if (dn >= R) dn -= R;
+              rowUp[i] = rowBuf + (size_t)up * width;
+              rowDn[i] = rowBuf + (size_t)dn * width;
+            }
+
+#pragma loop(ivdep)
+            for (x = 0; x < width; ++x) {
+
+              float acc0 = 0.0f;
+              float acc1 = 0.0f;
+
+              acc0 += kw[1] * (rowUp[1][x] + rowDn[1][x]);
+              acc1 += kw[2] * (rowUp[2][x] + rowDn[2][x]);
+              acc0 += kw[3] * (rowUp[3][x] + rowDn[3][x]);
+              acc1 += kw[4] * (rowUp[4][x] + rowDn[4][x]);
+              acc0 += kw[5] * (rowUp[5][x] + rowDn[5][x]);
+              acc1 += kw[6] * (rowUp[6][x] + rowDn[6][x]);
+              acc0 += kw[7] * (rowUp[7][x] + rowDn[7][x]);
+              acc1 += kw[8] * (rowUp[8][x] + rowDn[8][x]);
+              acc0 += kw[9] * (rowUp[9][x] + rowDn[9][x]);
+              acc1 += kw[10] * (rowUp[10][x] + rowDn[10][x]);
+
+              out[x] = k0 * rowCenter[x] + acc0 + acc1;
+            }
+
+            SLIDE_RING();
+          }
+          break;
+
+          /* ======================================================
+           * W == 13 (AVX2 fast path)
+           * ====================================================== */
+        case 13:
+          if (hasAVX2) {
+            for (y = 0; y < height; ++y) {
+
+              float* VL_RESTRICT out = outputImage + y * width;
+              float* VL_RESTRICT rowCenter = rowBuf + (size_t)center * width;
+
+              for (i = 1; i <= 13; ++i) {
+                int up = center - i;
+                int dn = center + i;
+                if (up < 0) up += R;
+                if (dn >= R) dn -= R;
+                rowUp[i] = rowBuf + (size_t)up * width;
+                rowDn[i] = rowBuf + (size_t)dn * width;
+              }
+
+              AccumulateW13_AVX2_Block(k0, rowCenter, rowUp, rowDn, kw, out, width);
+
+              SLIDE_RING();
+            }
+          }
+          else {
+            for (y = 0; y < height; ++y) {
+              /* scalar fallback */
+
+              float* VL_RESTRICT out = outputImage + y * width;
+              float* VL_RESTRICT rowCenter = rowBuf + (size_t)center * width;
+
+              for (i = 1; i <= 13; ++i) {
+                int up = center - i;
+                int dn = center + i;
+                if (up < 0) up += R;
+                if (dn >= R) dn -= R;
+                rowUp[i] = rowBuf + (size_t)up * width;
+                rowDn[i] = rowBuf + (size_t)dn * width;
+              }
+              for (x = 0; x < width; ++x) {
+                float acc = k0 * rowCenter[x];
+                for (i = 1; i <= 13; ++i)
+                  acc += kw[i] * (rowUp[i][x] + rowDn[i][x]);
+                out[x] = acc;
+              }
+
+              SLIDE_RING();
+            }
+          }
+          break;
+
+          /* ======================================================
+           * Fallback
+           * ====================================================== */
+        default:
+          for (y = 0; y < height; ++y) {
+
+            float* VL_RESTRICT out = outputImage + y * width;
+            float* VL_RESTRICT rowCenter = rowBuf + (size_t)center * width;
+
+            for (i = 1; i <= W; ++i) {
+              int up = center - i;
+              int dn = center + i;
+              if (up < 0) up += R;
+              if (dn >= R) dn -= R;
+              rowUp[i] = rowBuf + (size_t)up * width;
+              rowDn[i] = rowBuf + (size_t)dn * width;
+            }
+
+#pragma loop(ivdep)
+            for (x = 0; x + 1 < width; x += 2) {
+
+              float a0 = k0 * rowCenter[x];
+              float a1 = k0 * rowCenter[x + 1];
+
+              for (i = 1; i <= W; ++i) {
+                a0 += kw[i] * (rowUp[i][x] + rowDn[i][x]);
+                a1 += kw[i] * (rowUp[i][x + 1] + rowDn[i][x + 1]);
+              }
+
+              out[x] = a0;
+              out[x + 1] = a1;
+            }
+
+            for (; x < width; ++x) {
+              float acc = k0 * rowCenter[x];
+              for (i = 1; i <= W; ++i)
+                acc += kw[i] * (rowUp[i][x] + rowDn[i][x]);
+              out[x] = acc;
+            }
+
+            SLIDE_RING();
+          }
+          break;
+        }
+      }
+
+      vl_free(rowBuf);
+    }
+  }
+}
+
+#else
 static void
 _vl_sift_smooth (VlSiftFilt * self,
                  vl_sift_pix * outputImage,
@@ -836,6 +1440,7 @@ _vl_sift_smooth (VlSiftFilt * self,
                    - self->gaussFilterWidth, self->gaussFilterWidth,
                    1, VL_PAD_BY_CONTINUITY | VL_TRANSPOSE) ;
 }
+#endif
 
 /** ------------------------------------------------------------------
  ** @internal
@@ -1181,6 +1786,68 @@ vl_sift_process_next_octave (VlSiftFilt *f)
   return VL_ERR_OK ;
 }
 
+static inline void DogSubtractSse2(
+  vl_sift_pix* dst,
+  const vl_sift_pix* a,
+  const vl_sift_pix* b,
+  int count)
+{
+  int i = 0;
+  int simdEnd = count & ~3;
+
+  for (; i < simdEnd; i += 4) {
+    __m128 va = _mm_loadu_ps(a + i);
+    __m128 vb = _mm_loadu_ps(b + i);
+    __m128 vd = _mm_sub_ps(vb, va);
+    _mm_storeu_ps(dst + i, vd);
+  }
+
+  for (; i < count; ++i) {
+    dst[i] = b[i] - a[i];
+  }
+}
+
+void DogSubtract130TileAvx2(
+  float* VL_RESTRICT dst,
+  const float* VL_RESTRICT a,
+  const float* VL_RESTRICT b,
+  int height,
+  int stride);
+
+static __forceinline void DogSubtract(
+  vl_sift_pix* VL_RESTRICT dst,
+  const vl_sift_pix* VL_RESTRICT a,
+  const vl_sift_pix* VL_RESTRICT b,
+  int width,
+  int height,
+  int stride)
+{
+  if (hasAVX2 && width == 130) {
+    // AVX2 owns the vertical loop
+    DogSubtract130TileAvx2(
+      dst,
+      a,
+      b,
+      height,
+      stride);
+    return;
+  }
+
+  // Fallbacks: row-based
+  for (int y = 0; y < height; ++y) {
+    if (hasAVX2) {
+      DogSubtractAvx2(dst, a, b, width);
+    }
+    else {
+      DogSubtractSse2(dst, a, b, width);
+    }
+
+    dst += stride;
+    a += stride;
+    b += stride;
+  }
+}
+
 /** ------------------------------------------------------------------
  ** @brief Detect keypoints
  **
@@ -1195,27 +1862,27 @@ void
 vl_sift_detect (VlSiftFilt * f)
 {
 #if FAST_SIFT_DETECT
-  vl_sift_pix* dog   = f-> dog ;
-  int          s_min = f-> s_min ;
-  int          s_max = f-> s_max ;
-  int          w     = f-> octave_width ;
-  int          h     = f-> octave_height ;
-  double       te    = f-> edge_thresh ;
-  double       tp    = f-> peak_thresh ;
+  vl_sift_pix* dog = f->dog;
+  int          s_min = f->s_min;
+  int          s_max = f->s_max;
+  int          w = f->octave_width;
+  int          h = f->octave_height;
+  double       te = f->edge_thresh;
+  double       tp = f->peak_thresh;
 
-  int const    xo    = 1 ;      /* x-stride */
-  int const    yo    = w ;      /* y-stride */
-  int const    so    = w * h ;  /* s-stride */
+  int const    xo = 1;      /* x-stride */
+  int const    yo = w;      /* y-stride */
+  int const    so = w * h;  /* s-stride */
 
-  double       xper  = pow (2.0, f->o_cur) ;
+  double       xper = pow(2.0, f->o_cur);
 
-  int x, y, s, i, ii, jj ;
+  int x, y, s, i, ii, jj;
   vl_sift_pix const* __restrict pt;
-  vl_sift_pix v ;
-  VlSiftKeypoint * __restrict k ;
+  vl_sift_pix v;
+  VlSiftKeypoint* __restrict k;
 
   /* clear current list */
-  f-> nkeys = 0 ;
+  f->nkeys = 0;
 
   /* -----------------------------------------------------------------
    *                                          Find local maxima of DoG
@@ -1223,207 +1890,221 @@ vl_sift_detect (VlSiftFilt * f)
 
   float const tolerance = 0.8 * tp;
 
-  int const tileHeight = 1;
-  int const tileWidth = 512;//192*4; /* Determined empirically */
-  int const imageInteriorHeight = ((h-1)-1);
-  int const imageInteriorWidth = ((w-1)-1);
-  int numTilesY = ceil( ((double) imageInteriorHeight) / tileHeight);
-  int numTilesX = ceil( ((double) imageInteriorWidth) / tileWidth);
+  int const tileHeight = 16;
+  int const tileWidth = 128;//192*4; /* Determined empirically */
+  int const imageInteriorHeight = ((h - 1) - 1);
+  int const imageInteriorWidth = ((w - 1) - 1);
+  int numTilesY = ceil(((double)imageInteriorHeight) / tileHeight);
+  int numTilesX = ceil(((double)imageInteriorWidth) / tileWidth);
 
-  vl_sift_pix const* __restrict octaves[] = {
-    vl_sift_get_octave (f, (s_min + 1) - 1 ),
-    vl_sift_get_octave (f, (s_min + 1) - 0 ),
-    vl_sift_get_octave (f, (s_min + 1) + 1 ),
-    vl_sift_get_octave (f, (s_min + 1) + 2 )
-  };
+  /* ------------------------------------------------------------
+ * Build full DoG stack (VLFeat semantics)
+ * ------------------------------------------------------------ */
+  vl_sift_pix* dogPtr = dog;
+  for (int ss = s_min; ss <= s_max - 1; ++ss) {
+    const vl_sift_pix* a = vl_sift_get_octave(f, ss);
+    const vl_sift_pix* b = vl_sift_get_octave(f, ss + 1);
 
-  /* curDog is the UL image index of the DoG for the first image.
-   * It will always have a previous (curDog-so) and next (curDog+so) DoG */
-  vl_sift_pix* __restrict curDog = dog + so ;
+    // Full image DoG for this scale
+    DogSubtract(
+      dogPtr,   // dst
+      a,        // octave[s]
+      b,        // octave[s+1]
+      w,        // width
+      h,        // height
+      w         // stride
+    );
+
+    dogPtr += so; // advance one DoG slice
+  }
 
   /* Detect keypoints in blocks.  Block size is designed to maximize cache reuse. */
-  for (s = s_min + 1 ; s <= s_max - 2 ; ++s, curDog += so) {
-    int tileIndexBase = w + 1;
-    for (int ty = 0; ty < imageInteriorHeight; ty += tileHeight, tileIndexBase += w) {
-      int const actualTileHeight = min(tileHeight, imageInteriorHeight-ty);
-      for (int tx = 0; tx < imageInteriorWidth; tx += tileWidth) {
-        /* Fill in the DoG for the next tile. */
-        vl_sift_pix const* __restrict octavesForTile[4];
+  for (s = s_min + 1; s <= s_max - 2; ++s) {
+    for (int ty = 0, tileIndexBase = w + 1;
+      ty < imageInteriorHeight;
+      ty += tileHeight, tileIndexBase += tileHeight * w) {
 
+      int const actualTileHeight = min(tileHeight, imageInteriorHeight - ty);
+      for (int tx = 0; tx < imageInteriorWidth; tx += tileWidth) {
         /* Keypoint detection requires the DoG be calculated on its
          * pixels and may use its surrounding pixels (1-pixel border).
          * It may also need access to similar data from the previous
          * and next DoG sets */
         int const tileIndex = tileIndexBase + tx; /* UL image index to start examining. */
-        int const actualTileWidth = min(tileWidth, imageInteriorWidth-tx);
+        int const actualTileWidth = min(tileWidth, imageInteriorWidth - tx);
 
-        /* Naively we could calculate the DoGs with a one-pixel border,
-         * but here subtly change the border to minimize redundant work
-         * between adjacent tiles, both vertically and horizontally. */
-        int tileDogIndex = tileIndex;
-        int dogWidth = actualTileWidth;
-        int dogHeight = actualTileHeight;
-        // Several cases:
-        if (0 == ty) {
-          tileDogIndex -= w; /* top row */
-          dogHeight++;
-          dogHeight++;   /* and bottom */
-        } else {
-          tileDogIndex += w;
-        }
-
-        if (0 == tx) {
-          tileDogIndex--;
-          dogWidth++;
-          dogWidth++; /* right column */
-        } else {
-          ++tileDogIndex;
-        }
-
-        /* Similarly, we could calculate the DoG with a one-pixel depth
-         * border, but here we detect all cases and build the relevant
-         * data just once. */
-        if (s == s_min+1) {
-          int dogIndex = tileDogIndex;
-
-          /* The first time we need the prev, current, and next DoG. */
-          vl_sift_pix const* const __restrict prevOctave = octaves[0];
-          vl_sift_pix const* const __restrict octave = octaves[1];
-          vl_sift_pix const* const __restrict nextOctave = octaves[2];
-          vl_sift_pix const* const __restrict nextNextOctave = octaves[3];
-
-          vl_sift_pix* const __restrict prevDog = curDog - so;
-          vl_sift_pix* const __restrict nextDog = curDog + so;
-
-          for (y = 0; y < dogHeight; ++y, dogIndex += w) {
-            for (int k = dogIndex, last = dogIndex+dogWidth; k != last; ++k) {
-              prevDog[k] = octave[k] - prevOctave[k];
-              curDog[k] = nextOctave[k] - octave[k];
-              nextDog[k] = nextNextOctave[k] - nextOctave[k];
-            }
-          }
-        } else {
-          // Have a prev
-          // Have a cur
-          // May need next
-          if (s <= s_max-2) {
-            // Need a next
-            int dogIndex = tileDogIndex;
-
-            // Fill in the dog
-            vl_sift_pix const* const __restrict nextOctave = octaves[2] ;
-            vl_sift_pix const* const __restrict nextNextOctave = octaves[3] ;
-
-            vl_sift_pix* const __restrict nextDog = curDog + so;
-            for (y = 0; y < dogHeight; ++y, dogIndex += w) {
-              for (int k = dogIndex, last = dogIndex+dogWidth; k != last; ++k) {
-                nextDog[k] = nextNextOctave[k] - nextOctave[k];
-              }
-            }
-          }
-        }
-      
         /* Scan the tile itself */
-        pt = curDog + tileIndex;
+        const vl_sift_pix* VL_RESTRICT prevDog =
+          dog + so * ((s - 1) - s_min);
+        const vl_sift_pix* VL_RESTRICT curDogS =
+          dog + so * ((s)-s_min);
+        const vl_sift_pix* VL_RESTRICT nextDog =
+          dog + so * ((s + 1) - s_min);
+        pt = curDogS + tileIndex;
 
-        for (y = 0; y < tileHeight; ++y, pt += w-tileWidth) {
-          for (x = 0; x < tileWidth; ++x, ++pt) {
-            v = *pt;
+        for (y = 0; y < actualTileHeight; ++y, pt += w - actualTileWidth) {
+          for (x = 0; x < actualTileWidth; ++x, ++pt) {
 
-#define CHECK_NEIGHBORS(CMP,SGN)                    \
-        ( v CMP ## = SGN tolerance &&               \
-          v CMP *(pt + xo) &&                       \
-          v CMP *(pt - xo) &&                       \
-          v CMP *(pt + so) &&                       \
-          v CMP *(pt - so) &&                       \
-          v CMP *(pt + yo) &&                       \
-          v CMP *(pt - yo) &&                       \
-                                                    \
-          v CMP *(pt + yo + xo) &&                  \
-          v CMP *(pt + yo - xo) &&                  \
-          v CMP *(pt - yo + xo) &&                  \
-          v CMP *(pt - yo - xo) &&                  \
-                                                    \
-          v CMP *(pt + xo      + so) &&             \
-          v CMP *(pt - xo      + so) &&             \
-          v CMP *(pt + yo      + so) &&             \
-          v CMP *(pt - yo      + so) &&             \
-          v CMP *(pt + yo + xo + so) &&             \
-          v CMP *(pt + yo - xo + so) &&             \
-          v CMP *(pt - yo + xo + so) &&             \
-          v CMP *(pt - yo - xo + so) &&             \
-                                                    \
-          v CMP *(pt + xo      - so) &&             \
-          v CMP *(pt - xo      - so) &&             \
-          v CMP *(pt + yo      - so) &&             \
-          v CMP *(pt - yo      - so) &&             \
-          v CMP *(pt + yo + xo - so) &&             \
-          v CMP *(pt + yo - xo - so) &&             \
-          v CMP *(pt - yo + xo - so) &&             \
-          v CMP *(pt - yo - xo - so) )
+            int const idx = (int)(pt - curDogS);
+            vl_sift_pix const v = curDogS[idx];
 
-            if (CHECK_NEIGHBORS(>,+) || CHECK_NEIGHBORS(<,-) ) {
-              /* make room for more keypoints */
-              if (f->nkeys >= f->keys_res) {
-                f->keys_res += 32768 ;
-                if (f->keys) {
-                  f->keys = vl_realloc (f->keys,
-                                        f->keys_res *
-                                        sizeof(VlSiftKeypoint)) ;
-                } else {
-                  f->keys = vl_malloc (f->keys_res *
-                                       sizeof(VlSiftKeypoint)) ;
+            /* ---------------- POSITIVE EXTREMA ---------------- */
+            if (v >= tolerance) {
+
+              /* -------- Stage 1: axial neighbors (same scale) -------- */
+              if (
+                v >= curDogS[idx + xo] &&
+                v >= curDogS[idx - xo] &&
+                v >= curDogS[idx + yo] &&
+                v >= curDogS[idx - yo] &&
+                v >= prevDog[idx] &&
+                v >= nextDog[idx]
+                ) {
+
+                /* -------- Stage 2: full 26-neighbor test -------- */
+                if (
+                  /* same-scale diagonals */
+                  v >= curDogS[idx + yo + xo] &&
+                  v >= curDogS[idx + yo - xo] &&
+                  v >= curDogS[idx - yo + xo] &&
+                  v >= curDogS[idx - yo - xo] &&
+
+                  /* prev scale */
+                  v >= prevDog[idx + xo] &&
+                  v >= prevDog[idx - xo] &&
+                  v >= prevDog[idx + yo] &&
+                  v >= prevDog[idx - yo] &&
+                  v >= prevDog[idx + yo + xo] &&
+                  v >= prevDog[idx + yo - xo] &&
+                  v >= prevDog[idx - yo + xo] &&
+                  v >= prevDog[idx - yo - xo] &&
+
+                  /* next scale */
+                  v >= nextDog[idx + xo] &&
+                  v >= nextDog[idx - xo] &&
+                  v >= nextDog[idx + yo] &&
+                  v >= nextDog[idx - yo] &&
+                  v >= nextDog[idx + yo + xo] &&
+                  v >= nextDog[idx + yo - xo] &&
+                  v >= nextDog[idx - yo + xo] &&
+                  v >= nextDog[idx - yo - xo]
+                  ) {
+                  goto is_keypoint;
                 }
               }
-
-              k = f->keys + (f->nkeys ++) ;
-
-              k-> ix = tx + x + 1;
-              k-> iy = ty + y + 1;
-              k-> is = s ;
             }
-          } // x
-        } // y
+
+            /* ---------------- NEGATIVE EXTREMA ---------------- */
+            else if (v <= -tolerance) {
+
+              /* -------- Stage 1: axial neighbors -------- */
+              if (
+                v <= curDogS[idx + xo] &&
+                v <= curDogS[idx - xo] &&
+                v <= curDogS[idx + yo] &&
+                v <= curDogS[idx - yo] &&
+                v <= prevDog[idx] &&
+                v <= nextDog[idx]
+                ) {
+
+                /* -------- Stage 2: full -------- */
+                if (
+                  /* same-scale diagonals */
+                  v <= curDogS[idx + yo + xo] &&
+                  v <= curDogS[idx + yo - xo] &&
+                  v <= curDogS[idx - yo + xo] &&
+                  v <= curDogS[idx - yo - xo] &&
+
+                  /* prev scale */
+                  v <= prevDog[idx + xo] &&
+                  v <= prevDog[idx - xo] &&
+                  v <= prevDog[idx + yo] &&
+                  v <= prevDog[idx - yo] &&
+                  v <= prevDog[idx + yo + xo] &&
+                  v <= prevDog[idx + yo - xo] &&
+                  v <= prevDog[idx - yo + xo] &&
+                  v <= prevDog[idx - yo - xo] &&
+
+                  /* next scale */
+                  v <= nextDog[idx + xo] &&
+                  v <= nextDog[idx - xo] &&
+                  v <= nextDog[idx + yo] &&
+                  v <= nextDog[idx - yo] &&
+                  v <= nextDog[idx + yo + xo] &&
+                  v <= nextDog[idx + yo - xo] &&
+                  v <= nextDog[idx - yo + xo] &&
+                  v <= nextDog[idx - yo - xo]
+                  ) {
+                  goto is_keypoint;
+                }
+              }
+            }
+
+            continue;
+
+          is_keypoint:
+            /* make room for more keypoints */
+            if (f->nkeys >= f->keys_res) {
+              f->keys_res += 32768;
+              if (f->keys) {
+                f->keys = vl_realloc(
+                  f->keys,
+                  f->keys_res * sizeof(VlSiftKeypoint)
+                );
+              }
+              else {
+                f->keys = vl_malloc(
+                  f->keys_res * sizeof(VlSiftKeypoint)
+                );
+              }
+            }
+
+            k = f->keys + (f->nkeys++);
+            k->ix = tx + x;
+            k->iy = ty + y;
+            k->is = s;
+          }
+        }
       } // tx
     } // ty
-
-    /* Advance to next octave */
-    for (int i = 0; i < 3; ++i) {
-      octaves[i] = octaves[i+1];
-    }
-    octaves[3] = (s < s_max-2) ? vl_sift_get_octave (f, s + 3 ) : 0;
   } // s
+
     
   /* -----------------------------------------------------------------
    *                                               Refine local maxima
    * -------------------------------------------------------------- */
 
   /* this pointer is used to write the keypoints back */
-  k = f->keys ;
+  k = f->keys;
 
-  for (i = 0 ; i < f->nkeys ; ++i) {
+  for (i = 0; i < f->nkeys; ++i) {
+    int x = f->keys[i].ix;
+    int y = f->keys[i].iy;
+    int s = f->keys[i].is;
 
-    int x = f-> keys [i] .ix ;
-    int y = f-> keys [i] .iy ;
-    int s = f-> keys [i]. is ;
+    double Dx = 0, Dy = 0, Ds = 0, Dxx = 0, Dyy = 0, Dss = 0, Dxy = 0, Dxs = 0, Dys = 0;
+    double A[3 * 3], b[3];
 
-    double Dx=0,Dy=0,Ds=0,Dxx=0,Dyy=0,Dss=0,Dxy=0,Dxs=0,Dys=0 ;
-    double A [3*3], b [3] ;
+    int dx = 0;
+    int dy = 0;
 
-    int dx = 0 ;
-    int dy = 0 ;
+    int iter, i, j;
 
-    int iter, i, j ;
+    for (iter = 0; iter < 5; ++iter) {
+      x += dx;
+      y += dy;
 
-    for (iter = 0 ; iter < 5 ; ++iter) {
-
-      x += dx ;
-      y += dy ;
+      /* Reject if moved outside valid refinement bounds */
+      if (x <= 0 || x >= w - 1 ||
+        y <= 0 || y >= h - 1)
+      {
+        goto discard_keypoint;
+      }
 
       pt = dog
         + xo * x
         + yo * y
-        + so * (s - s_min) ;
+        + so * (s - s_min);
 
       /** @brief Index GSS @internal */
 #define at(dx,dy,ds) (*( pt + (dx)*xo + (dy)*yo + (ds)*so))
@@ -1432,82 +2113,82 @@ vl_sift_detect (VlSiftFilt * f)
 #define Aat(i,j)     (A[(i)+(j)*3])
 
       /* compute the gradient */
-      Dx = 0.5 * (at(+1,0,0) - at(-1,0,0)) ;
-      Dy = 0.5 * (at(0,+1,0) - at(0,-1,0));
-      Ds = 0.5 * (at(0,0,+1) - at(0,0,-1)) ;
+      Dx = 0.5 * (at(+1, 0, 0) - at(-1, 0, 0));
+      Dy = 0.5 * (at(0, +1, 0) - at(0, -1, 0));
+      Ds = 0.5 * (at(0, 0, +1) - at(0, 0, -1));
 
       /* compute the Hessian */
-      Dxx = (at(+1,0,0) + at(-1,0,0) - 2.0 * at(0,0,0)) ;
-      Dyy = (at(0,+1,0) + at(0,-1,0) - 2.0 * at(0,0,0)) ;
-      Dss = (at(0,0,+1) + at(0,0,-1) - 2.0 * at(0,0,0)) ;
+      Dxx = (at(+1, 0, 0) + at(-1, 0, 0) - 2.0 * at(0, 0, 0));
+      Dyy = (at(0, +1, 0) + at(0, -1, 0) - 2.0 * at(0, 0, 0));
+      Dss = (at(0, 0, +1) + at(0, 0, -1) - 2.0 * at(0, 0, 0));
 
-      Dxy = 0.25 * ( at(+1,+1,0) + at(-1,-1,0) - at(-1,+1,0) - at(+1,-1,0) ) ;
-      Dxs = 0.25 * ( at(+1,0,+1) + at(-1,0,-1) - at(-1,0,+1) - at(+1,0,-1) ) ;
-      Dys = 0.25 * ( at(0,+1,+1) + at(0,-1,-1) - at(0,-1,+1) - at(0,+1,-1) ) ;
+      Dxy = 0.25 * (at(+1, +1, 0) + at(-1, -1, 0) - at(-1, +1, 0) - at(+1, -1, 0));
+      Dxs = 0.25 * (at(+1, 0, +1) + at(-1, 0, -1) - at(-1, 0, +1) - at(+1, 0, -1));
+      Dys = 0.25 * (at(0, +1, +1) + at(0, -1, -1) - at(0, -1, +1) - at(0, +1, -1));
 
       /* solve linear system ....................................... */
-      Aat(0,0) = Dxx ;
-      Aat(1,1) = Dyy ;
-      Aat(2,2) = Dss ;
-      Aat(0,1) = Aat(1,0) = Dxy ;
-      Aat(0,2) = Aat(2,0) = Dxs ;
-      Aat(1,2) = Aat(2,1) = Dys ;
+      Aat(0, 0) = Dxx;
+      Aat(1, 1) = Dyy;
+      Aat(2, 2) = Dss;
+      Aat(0, 1) = Aat(1, 0) = Dxy;
+      Aat(0, 2) = Aat(2, 0) = Dxs;
+      Aat(1, 2) = Aat(2, 1) = Dys;
 
-      b[0] = - Dx ;
-      b[1] = - Dy ;
-      b[2] = - Ds ;
+      b[0] = -Dx;
+      b[1] = -Dy;
+      b[2] = -Ds;
 
       /* Gauss elimination */
-      for(j = 0 ; j < 3 ; ++j) {
-        double maxa    = 0 ;
-        double maxabsa = 0 ;
-        int    maxi    = -1 ;
-        double tmp ;
+      for (j = 0; j < 3; ++j) {
+        double maxa = 0;
+        double maxabsa = 0;
+        int    maxi = -1;
+        double tmp;
 
         /* look for the maximally stable pivot */
-        for (i = j ; i < 3 ; ++i) {
-          double a    = Aat (i,j) ;
-          double absa = vl_abs_d (a) ;
+        for (i = j; i < 3; ++i) {
+          double a = Aat(i, j);
+          double absa = vl_abs_d(a);
           if (absa > maxabsa) {
-            maxa    = a ;
-            maxabsa = absa ;
-            maxi    = i ;
+            maxa = a;
+            maxabsa = absa;
+            maxi = i;
           }
         }
 
         /* if singular give up */
         if (maxabsa < 1e-10f) {
-          b[0] = 0 ;
-          b[1] = 0 ;
-          b[2] = 0 ;
-          break ;
+          b[0] = 0;
+          b[1] = 0;
+          b[2] = 0;
+          break;
         }
 
-        i = maxi ;
+        i = maxi;
 
         /* swap j-th row with i-th row and normalize j-th row */
-        for(jj = j ; jj < 3 ; ++jj) {
-          tmp = Aat(i,jj) ; Aat(i,jj) = Aat(j,jj) ; Aat(j,jj) = tmp ;
-          Aat(j,jj) /= maxa ;
+        for (jj = j; jj < 3; ++jj) {
+          tmp = Aat(i, jj); Aat(i, jj) = Aat(j, jj); Aat(j, jj) = tmp;
+          Aat(j, jj) /= maxa;
         }
-        tmp = b[j] ; b[j] = b[i] ; b[i] = tmp ;
-        b[j] /= maxa ;
+        tmp = b[j]; b[j] = b[i]; b[i] = tmp;
+        b[j] /= maxa;
 
         /* elimination */
-        for (ii = j+1 ; ii < 3 ; ++ii) {
-          double x = Aat(ii,j) ;
-          for (jj = j ; jj < 3 ; ++jj) {
-            Aat(ii,jj) -= x * Aat(j,jj) ;
+        for (ii = j + 1; ii < 3; ++ii) {
+          double x = Aat(ii, j);
+          for (jj = j; jj < 3; ++jj) {
+            Aat(ii, jj) -= x * Aat(j, jj);
           }
-          b[ii] -= x * b[j] ;
+          b[ii] -= x * b[j];
         }
       }
 
       /* backward substitution */
-      for (i = 2 ; i > 0 ; --i) {
-        double x = b[i] ;
-        for (ii = i-1 ; ii >= 0 ; --ii) {
-          b[ii] -= x * Aat(ii,i) ;
+      for (i = 2; i > 0; --i) {
+        double x = b[i];
+        for (ii = i - 1; ii >= 0; --ii) {
+          b[ii] -= x * Aat(ii, i);
         }
       }
 
@@ -1516,55 +2197,58 @@ vl_sift_detect (VlSiftFilt * f)
        * and re-iterate the computation. Otherwise we are all set.
        */
 
-      dx= ((b[0] >  0.6 && x < w - 2) ?  1 : 0)
-        + ((b[0] < -0.6 && x > 1    ) ? -1 : 0) ;
+      dx = ((b[0] > 0.6 && x < w - 2) ? 1 : 0)
+        + ((b[0] < -0.6 && x > 1) ? -1 : 0);
 
-      dy= ((b[1] >  0.6 && y < h - 2) ?  1 : 0)
-        + ((b[1] < -0.6 && y > 1    ) ? -1 : 0) ;
+      dy = ((b[1] > 0.6 && y < h - 2) ? 1 : 0)
+        + ((b[1] < -0.6 && y > 1) ? -1 : 0);
 
-      if (dx == 0 && dy == 0) break ;
+      if (dx == 0 && dy == 0) break;
     }
 
     /* check threshold and other conditions */
     {
-      double val   = at(0,0,0)
-        + 0.5 * (Dx * b[0] + Dy * b[1] + Ds * b[2]) ;
-      double score = (Dxx+Dyy)*(Dxx+Dyy) / (Dxx*Dyy - Dxy*Dxy) ;
-      double xn = x + b[0] ;
-      double yn = y + b[1] ;
-      double sn = s + b[2] ;
+      double val = at(0, 0, 0)
+        + 0.5 * (Dx * b[0] + Dy * b[1] + Ds * b[2]);
+      double score = (Dxx + Dyy) * (Dxx + Dyy) / (Dxx * Dyy - Dxy * Dxy);
+      double xn = x + b[0];
+      double yn = y + b[1];
+      double sn = s + b[2];
 
       vl_bool good =
-        vl_abs_d (val)  > tp                  &&
-        score           < (te+1)*(te+1)/te    &&
-        score           >= 0                  &&
-        vl_abs_d (b[0]) <  1.5                &&
-        vl_abs_d (b[1]) <  1.5                &&
-        vl_abs_d (b[2]) <  1.5                &&
-        xn              >= 0                  &&
-        xn              <= w - 1              &&
-        yn              >= 0                  &&
-        yn              <= h - 1              &&
-        sn              >= s_min              &&
-        sn              <= s_max ;
+        vl_abs_d(val) > tp &&
+        score < (te + 1) * (te + 1) / te &&
+        score >= 0 &&
+        vl_abs_d(b[0]) < 1.5 &&
+        vl_abs_d(b[1]) < 1.5 &&
+        vl_abs_d(b[2]) < 1.5 &&
+        xn >= 0 &&
+        xn <= w - 1 &&
+        yn >= 0 &&
+        yn <= h - 1 &&
+        sn >= s_min &&
+        sn <= s_max;
 
-      if (good) {
-        k-> o     = f->o_cur ;
-        k-> ix    = x ;
-        k-> iy    = y ;
-        k-> is    = s ;
-        k-> s     = sn ;
-        k-> x     = xn * xper ;
-        k-> y     = yn * xper ;
-        k-> sigma = f->sigma0 * pow (2.0, sn/f->S) * xper ;
-        ++ k ;
-      }
+      if (!good)
+        goto discard_keypoint;
 
-    } /* done checking */
+      k->o = f->o_cur;
+      k->ix = x;
+      k->iy = y;
+      k->is = s;
+      k->s = sn;
+      k->x = xn * xper;
+      k->y = yn * xper;
+      k->sigma = f->sigma0 * pow(2.0, sn / f->S) * xper;
+      ++k;
+    }
+
+  discard_keypoint:
+    ;
   } /* next keypoint to refine */
 
   /* update keypoint count */
-  f-> nkeys = (int)(k - f->keys) ;
+  f->nkeys = (int)(k - f->keys);
 #else
   vl_sift_pix* dog   = f-> dog ;
   int          s_min = f-> s_min ;

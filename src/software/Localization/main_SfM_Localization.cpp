@@ -503,7 +503,7 @@ int main(int argc, char **argv)
   }
   if (!Save(
     sfm_data,
-    stlplus::create_filespec( sOutDir, "sfm_data_expanded.json" ).c_str(),
+    stlplus::create_filespec( sOutDir, "sfm_data_expanded.bin" ).c_str(),
     flag_save))
   {
     return EXIT_FAILURE;

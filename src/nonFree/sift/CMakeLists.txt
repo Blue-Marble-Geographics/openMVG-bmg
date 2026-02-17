@@ -23,6 +23,7 @@ set(FEATS
   vl/sift.c
   vl/host.c
   vl/mathop.c
+  vl/siftAVX2Support.c
   vl/random.c)
 set_source_files_properties(${FEATS} PROPERTIES LANGUAGE C)
 add_library(vlsift ${FEATS})
