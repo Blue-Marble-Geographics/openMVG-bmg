@@ -29,6 +29,8 @@ using namespace openMVG::sfm;
 
 #include <cstdlib>
 
+extern "C" int hasAVX2 = -1;
+
 #ifdef OPENMVG_USE_OPENMP
 #include <omp.h>
 #endif
@@ -49,6 +51,8 @@ std::string FindCommonRootDir(const std::string & dir1, const std::string & dir2
 // ----------------------------------------------------
 int main(int argc, char **argv)
 {
+
+
   std::cout << std::endl
     << "-----------------------------------------------------------\n"
     << "  Images localization in an existing SfM reconstruction:\n"
