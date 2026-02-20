@@ -285,6 +285,7 @@ int main(int argc, char **argv)
   // - if no file, compute features
   {
     system::Timer timer;
+    Image<unsigned char> imageGray;
 
     system::LoggerProgress my_progress_bar((uint32_t) sfm_data.GetViews().size(), "- EXTRACT FEATURES -" );
 
@@ -301,7 +302,7 @@ int main(int argc, char **argv)
         omp_set_num_threads(nb_max_thread);
     }
 
-    #pragma omp parallel for schedule(dynamic) if (iNumThreads > 0)
+    #pragma omp parallel for schedule(dynamic) private(imageGray) if (iNumThreads > 0)
 #endif
 #endif
 #if (TEST_CF_MAX_IMAGES==0)
@@ -310,8 +311,6 @@ int main(int argc, char **argv)
     for (int i = 0; i < std::min(static_cast<int>(sfm_data.views.size()), (int) TEST_CF_MAX_IMAGES); ++i)
 #endif
     {
-      static thread_local Image<unsigned char> imageGray;
-
       Views::const_iterator iterViews = sfm_data.views.begin();
       std::advance(iterViews, i);
       const View * view = iterViews->second.get();

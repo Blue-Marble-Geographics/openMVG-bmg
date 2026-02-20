@@ -8,7 +8,7 @@
 #define BINARY_FEATURES              (1)
 
 /* Potentially faster, but will reorder generated keypoints and make debugging more difficult. */
-#define PARALLEL_KEYPOINT_GENERATION (1)
+#define PARALLEL_KEYPOINT_GENERATION (0) // Do not enable.  Nested OpenMP
 
 #define FAST_SIFT_DETECT             (1) /* Default behavior.  No error loss. */
 #define FAST_SIFT_GRADIENT_UPDATE    (1) /* Faster, adds insignificant error. */

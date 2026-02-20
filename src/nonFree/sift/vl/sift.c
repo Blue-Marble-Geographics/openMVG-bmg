@@ -818,6 +818,11 @@ GaussianRowSymmetricClampSSE2(
     dst[x] = acc;
   }
 
+  // Nothing to vectorize if width <= W
+  if (width <= (size_t)W) {
+    return;
+  }
+
   /* center */
   for (; x + 3 < width - (size_t)W; x += 4) {
     __m128 acc = _mm_mul_ps(_mm_set1_ps(k[0]),
@@ -975,17 +980,20 @@ _vl_sift_smooth(
       }
 
       /* Helper to slide the vertical window by one row. */
-#define SLIDE_RING() do {                       \
-      int add = center + Wplus1;                         \
-      if (add >= R) add -= R;                            \
-                                                          \
-      rowFn(rowPtr[add],                                 \
-            inputImage + (y + Wplus1) * width,           \
-            width, k, W);                                \
-                                                          \
-      center++;                                          \
-      if (center == R) center = 0;                       \
-    } while(0)
+#define SLIDE_RING() do {                                  \
+  int add = center + Wplus1;                                \
+  if (add >= R) add -= R;                                   \
+                                                            \
+  vl_size srcY = y + (vl_size)Wplus1;                       \
+  if (srcY >= height) srcY = height - 1;                    \
+                                                            \
+  rowFn(rowPtr[add],                                        \
+        inputImage + srcY * width,                          \
+        width, k, W);                                       \
+                                                            \
+  center++;                                                 \
+  if (center == R) center = 0;                              \
+} while(0)
 
     /* ----------------------------------------------------------
      * Main loop (W-dispatch hoisted, MSVC optimized)
@@ -1524,11 +1532,11 @@ vl_sift_new (int width, int height,
 
 #ifdef REDUCE_MEMORY
   const size_t commonSize =
-      sizeof(vl_sift_pix) *
-      max(
+    sizeof(vl_sift_pix) *
+    max(
           nel * ( f->s_max - f->s_min ), /* dog */
           nel * 2 * ( f->s_max - f->s_min ) /* grad */
-      );
+    );
   f-> dog     = vl_malloc(commonSize) ;
   f-> grad    = f->dog ;
 
@@ -1857,442 +1865,441 @@ static __forceinline void DogSubtract(
  **
  ** @param f SIFT filter.
  **/
+
+#undef DO_ORIGINAL
+#undef VALIDATE
+#undef VALIDATE2
+
+#ifdef VALIDATE2
+#pragma optimize("", off) // JPB WIP BUG
+#endif
 VL_EXPORT
 void
 vl_sift_detect (VlSiftFilt * f)
 {
-#if FAST_SIFT_DETECT
-  vl_sift_pix* dog = f->dog;
-  int          s_min = f->s_min;
-  int          s_max = f->s_max;
-  int          w = f->octave_width;
-  int          h = f->octave_height;
-  double       te = f->edge_thresh;
-  double       tp = f->peak_thresh;
+  VlSiftFilt* start = f;
 
-  int const    xo = 1;      /* x-stride */
-  int const    yo = w;      /* y-stride */
-  int const    so = w * h;  /* s-stride */
+#ifdef DO_ORIGINAL
+  for (int pass = 1; pass < 2; ++pass) {
+#else
+#ifdef VALIDATE
+  int pass0Keys = 0;
+  for (int pass = 0; pass < 2; ++pass) {
+#else
+  for (int pass = 0; pass < 1; ++pass) {
+#endif
+#endif
+    if (pass == 0) { // OPT
+      vl_sift_pix* dog = f->dog;
+      int          s_min = f->s_min;
+      int          s_max = f->s_max;
+      int          w = f->octave_width;
+      int          h = f->octave_height;
+      double       te = f->edge_thresh;
+      double       tp = f->peak_thresh;
 
-  double       xper = pow(2.0, f->o_cur);
+      int const    xo = 1;      /* x-stride */
+      int const    yo = w;      /* y-stride */
+      int const    so = w * h;  /* s-stride */
 
-  int x, y, s, i, ii, jj;
-  vl_sift_pix const* __restrict pt;
-  vl_sift_pix v;
-  VlSiftKeypoint* __restrict k;
+      double       xper = pow(2.0, f->o_cur);
 
-  /* clear current list */
-  f->nkeys = 0;
+      int x, y, s, i, ii, jj;
+      vl_sift_pix const* __restrict pt;
+      vl_sift_pix v;
+      VlSiftKeypoint* __restrict k;
 
-  /* -----------------------------------------------------------------
-   *                                          Find local maxima of DoG
-   * -------------------------------------------------------------- */
+      /* clear current list */
+      f->nkeys = 0;
 
-  float const tolerance = 0.8 * tp;
+      /* -----------------------------------------------------------------
+       *                                          Find local maxima of DoG
+       * -------------------------------------------------------------- */
 
-  int const tileHeight = 16;
-  int const tileWidth = 128;//192*4; /* Determined empirically */
-  int const imageInteriorHeight = ((h - 1) - 1);
-  int const imageInteriorWidth = ((w - 1) - 1);
-  int numTilesY = ceil(((double)imageInteriorHeight) / tileHeight);
-  int numTilesX = ceil(((double)imageInteriorWidth) / tileWidth);
+      float const tolerance = 0.8 * tp;
 
-  /* ------------------------------------------------------------
- * Build full DoG stack (VLFeat semantics)
- * ------------------------------------------------------------ */
-  vl_sift_pix* dogPtr = dog;
-  for (int ss = s_min; ss <= s_max - 1; ++ss) {
-    const vl_sift_pix* a = vl_sift_get_octave(f, ss);
-    const vl_sift_pix* b = vl_sift_get_octave(f, ss + 1);
+      int const tileHeight = 16;
+      int const tileWidth = 128;//192*4; /* Determined empirically */
+      int const imageInteriorHeight = ((h - 1) - 1);
+      int const imageInteriorWidth = ((w - 1) - 1);
+      int numTilesY = ceil(((double)imageInteriorHeight) / tileHeight);
+      int numTilesX = ceil(((double)imageInteriorWidth) / tileWidth);
 
-    // Full image DoG for this scale
-    DogSubtract(
-      dogPtr,   // dst
-      a,        // octave[s]
-      b,        // octave[s+1]
-      w,        // width
-      h,        // height
-      w         // stride
-    );
+      /* ------------------------------------------------------------
+     * Build full DoG stack (VLFeat semantics)
+     * ------------------------------------------------------------ */
+      vl_sift_pix* dogPtr = dog;
+      for (int ss = s_min; ss <= s_max - 1; ++ss) {
+        const vl_sift_pix* a = vl_sift_get_octave(f, ss);
+        const vl_sift_pix* b = vl_sift_get_octave(f, ss + 1);
 
-    dogPtr += so; // advance one DoG slice
-  }
+        // Full image DoG for this scale
+        DogSubtract(
+          dogPtr,   // dst
+          a,        // octave[s]
+          b,        // octave[s+1]
+          w,        // width
+          h,        // height
+          w         // stride
+        );
 
-  /* Detect keypoints in blocks.  Block size is designed to maximize cache reuse. */
-  for (s = s_min + 1; s <= s_max - 2; ++s) {
-    for (int ty = 0, tileIndexBase = w + 1;
-      ty < imageInteriorHeight;
-      ty += tileHeight, tileIndexBase += tileHeight * w) {
-
-      int const actualTileHeight = min(tileHeight, imageInteriorHeight - ty);
-      for (int tx = 0; tx < imageInteriorWidth; tx += tileWidth) {
-        /* Keypoint detection requires the DoG be calculated on its
-         * pixels and may use its surrounding pixels (1-pixel border).
-         * It may also need access to similar data from the previous
-         * and next DoG sets */
-        int const tileIndex = tileIndexBase + tx; /* UL image index to start examining. */
-        int const actualTileWidth = min(tileWidth, imageInteriorWidth - tx);
-
-        /* Scan the tile itself */
-        const vl_sift_pix* VL_RESTRICT prevDog =
-          dog + so * ((s - 1) - s_min);
-        const vl_sift_pix* VL_RESTRICT curDogS =
-          dog + so * ((s)-s_min);
-        const vl_sift_pix* VL_RESTRICT nextDog =
-          dog + so * ((s + 1) - s_min);
-        pt = curDogS + tileIndex;
-
-        for (y = 0; y < actualTileHeight; ++y, pt += w - actualTileWidth) {
-          for (x = 0; x < actualTileWidth; ++x, ++pt) {
-
-            int const idx = (int)(pt - curDogS);
-            vl_sift_pix const v = curDogS[idx];
-
-            /* ---------------- POSITIVE EXTREMA ---------------- */
-            if (v >= tolerance) {
-
-              /* -------- Stage 1: axial neighbors (same scale) -------- */
-              if (
-                v >= curDogS[idx + xo] &&
-                v >= curDogS[idx - xo] &&
-                v >= curDogS[idx + yo] &&
-                v >= curDogS[idx - yo] &&
-                v >= prevDog[idx] &&
-                v >= nextDog[idx]
-                ) {
-
-                /* -------- Stage 2: full 26-neighbor test -------- */
-                if (
-                  /* same-scale diagonals */
-                  v >= curDogS[idx + yo + xo] &&
-                  v >= curDogS[idx + yo - xo] &&
-                  v >= curDogS[idx - yo + xo] &&
-                  v >= curDogS[idx - yo - xo] &&
-
-                  /* prev scale */
-                  v >= prevDog[idx + xo] &&
-                  v >= prevDog[idx - xo] &&
-                  v >= prevDog[idx + yo] &&
-                  v >= prevDog[idx - yo] &&
-                  v >= prevDog[idx + yo + xo] &&
-                  v >= prevDog[idx + yo - xo] &&
-                  v >= prevDog[idx - yo + xo] &&
-                  v >= prevDog[idx - yo - xo] &&
-
-                  /* next scale */
-                  v >= nextDog[idx + xo] &&
-                  v >= nextDog[idx - xo] &&
-                  v >= nextDog[idx + yo] &&
-                  v >= nextDog[idx - yo] &&
-                  v >= nextDog[idx + yo + xo] &&
-                  v >= nextDog[idx + yo - xo] &&
-                  v >= nextDog[idx - yo + xo] &&
-                  v >= nextDog[idx - yo - xo]
-                  ) {
-                  goto is_keypoint;
-                }
-              }
-            }
-
-            /* ---------------- NEGATIVE EXTREMA ---------------- */
-            else if (v <= -tolerance) {
-
-              /* -------- Stage 1: axial neighbors -------- */
-              if (
-                v <= curDogS[idx + xo] &&
-                v <= curDogS[idx - xo] &&
-                v <= curDogS[idx + yo] &&
-                v <= curDogS[idx - yo] &&
-                v <= prevDog[idx] &&
-                v <= nextDog[idx]
-                ) {
-
-                /* -------- Stage 2: full -------- */
-                if (
-                  /* same-scale diagonals */
-                  v <= curDogS[idx + yo + xo] &&
-                  v <= curDogS[idx + yo - xo] &&
-                  v <= curDogS[idx - yo + xo] &&
-                  v <= curDogS[idx - yo - xo] &&
-
-                  /* prev scale */
-                  v <= prevDog[idx + xo] &&
-                  v <= prevDog[idx - xo] &&
-                  v <= prevDog[idx + yo] &&
-                  v <= prevDog[idx - yo] &&
-                  v <= prevDog[idx + yo + xo] &&
-                  v <= prevDog[idx + yo - xo] &&
-                  v <= prevDog[idx - yo + xo] &&
-                  v <= prevDog[idx - yo - xo] &&
-
-                  /* next scale */
-                  v <= nextDog[idx + xo] &&
-                  v <= nextDog[idx - xo] &&
-                  v <= nextDog[idx + yo] &&
-                  v <= nextDog[idx - yo] &&
-                  v <= nextDog[idx + yo + xo] &&
-                  v <= nextDog[idx + yo - xo] &&
-                  v <= nextDog[idx - yo + xo] &&
-                  v <= nextDog[idx - yo - xo]
-                  ) {
-                  goto is_keypoint;
-                }
-              }
-            }
-
-            continue;
-
-          is_keypoint:
-            /* make room for more keypoints */
-            if (f->nkeys >= f->keys_res) {
-              f->keys_res += 32768;
-              if (f->keys) {
-                f->keys = vl_realloc(
-                  f->keys,
-                  f->keys_res * sizeof(VlSiftKeypoint)
-                );
-              }
-              else {
-                f->keys = vl_malloc(
-                  f->keys_res * sizeof(VlSiftKeypoint)
-                );
-              }
-            }
-
-            k = f->keys + (f->nkeys++);
-            k->ix = tx + x;
-            k->iy = ty + y;
-            k->is = s;
-          }
-        }
-      } // tx
-    } // ty
-  } // s
-
-    
-  /* -----------------------------------------------------------------
-   *                                               Refine local maxima
-   * -------------------------------------------------------------- */
-
-  /* this pointer is used to write the keypoints back */
-  k = f->keys;
-
-  for (i = 0; i < f->nkeys; ++i) {
-    int x = f->keys[i].ix;
-    int y = f->keys[i].iy;
-    int s = f->keys[i].is;
-
-    double Dx = 0, Dy = 0, Ds = 0, Dxx = 0, Dyy = 0, Dss = 0, Dxy = 0, Dxs = 0, Dys = 0;
-    double A[3 * 3], b[3];
-
-    int dx = 0;
-    int dy = 0;
-
-    int iter, i, j;
-
-    for (iter = 0; iter < 5; ++iter) {
-      x += dx;
-      y += dy;
-
-      /* Reject if moved outside valid refinement bounds */
-      if (x <= 0 || x >= w - 1 ||
-        y <= 0 || y >= h - 1)
-      {
-        goto discard_keypoint;
+        dogPtr += so; // advance one DoG slice
       }
 
-      pt = dog
-        + xo * x
-        + yo * y
-        + so * (s - s_min);
+      /* Detect keypoints in blocks.  Block size is designed to maximize cache reuse. */
+      for (s = s_min + 1; s <= s_max - 2; ++s) {
+        vl_sift_pix* __restrict prevDog = dog + so * ((s - 1) - s_min);
+        vl_sift_pix* __restrict curDog = dog + so * (s - s_min);
+        vl_sift_pix* __restrict nextDog = dog + so * ((s + 1) - s_min);
 
-      /** @brief Index GSS @internal */
+        for (int ty = 0; ty < imageInteriorHeight; ty += tileHeight) {
+
+          int actualTileHeight = min(tileHeight, imageInteriorHeight - ty);
+
+          for (int tx = 0; tx < imageInteriorWidth; tx += tileWidth) {
+
+            int actualTileWidth = min(tileWidth, imageInteriorWidth - tx);
+            int tileIndexBase = (ty + 1) * w + (tx + 1);
+
+            const vl_sift_pix* __restrict ptRow = curDog + tileIndexBase;
+
+            for (int y = 0; y < actualTileHeight; ++y) {
+
+              const vl_sift_pix* __restrict pt = ptRow;
+              int globalY = ty + y + 1;
+
+              for (int x = 0; x < actualTileWidth; ++x, ++pt) {
+                float v = *pt;
+
+                ptrdiff_t idx = pt - curDog;
+
+                const vl_sift_pix* nextBase = nextDog + idx;
+                const vl_sift_pix* prevBase = prevDog + idx;
+
+                if (
+                  (v >= tolerance &&
+                    v >= pt[xo] &&
+                    v >= pt[-xo] &&
+                    v >= nextBase[0] &&
+                    v >= prevBase[0] &&
+                    v >= pt[yo] &&
+                    v >= pt[-yo] &&
+                    v >= pt[yo + xo] &&
+                    v >= pt[yo - xo] &&
+                    v >= pt[-yo + xo] &&
+                    v >= pt[-yo - xo] &&
+                    v >= nextBase[xo] &&
+                    v >= nextBase[-xo] &&
+                    v >= nextBase[yo] &&
+                    v >= nextBase[-yo] &&
+                    v >= nextBase[yo + xo] &&
+                    v >= nextBase[yo - xo] &&
+                    v >= nextBase[-yo + xo] &&
+                    v >= nextBase[-yo - xo] &&
+                    v >= prevBase[xo] &&
+                    v >= prevBase[-xo] &&
+                    v >= prevBase[yo] &&
+                    v >= prevBase[-yo] &&
+                    v >= prevBase[yo + xo] &&
+                    v >= prevBase[yo - xo] &&
+                    v >= prevBase[-yo + xo] &&
+                    v >= prevBase[-yo - xo]
+                    ) ||
+                  (v <= -tolerance &&
+                    v <= pt[xo] &&
+                    v <= pt[-xo] &&
+                    v <= nextBase[0] &&
+                    v <= prevBase[0] &&
+                    v <= pt[yo] &&
+                    v <= pt[-yo] &&
+                    v <= pt[yo + xo] &&
+                    v <= pt[yo - xo] &&
+                    v <= pt[-yo + xo] &&
+                    v <= pt[-yo - xo] &&
+                    v <= nextBase[xo] &&
+                    v <= nextBase[-xo] &&
+                    v <= nextBase[yo] &&
+                    v <= nextBase[-yo] &&
+                    v <= nextBase[yo + xo] &&
+                    v <= nextBase[yo - xo] &&
+                    v <= nextBase[-yo + xo] &&
+                    v <= nextBase[-yo - xo] &&
+                    v <= prevBase[xo] &&
+                    v <= prevBase[-xo] &&
+                    v <= prevBase[yo] &&
+                    v <= prevBase[-yo] &&
+                    v <= prevBase[yo + xo] &&
+                    v <= prevBase[yo - xo] &&
+                    v <= prevBase[-yo + xo] &&
+                    v <= prevBase[-yo - xo]
+                    )
+                  ) {
+                  goto is_keypoint;
+                }
+                continue;
+#ifdef VALIDATE2
+                static int printCount = 0;
+                if (printCount < 10) {
+                  printf("OPT  s=%d y=%d x=%d\n", s, globalY, globalX);
+                  ++printCount;
+                }
+#endif
+
+              is_keypoint:
+                /* make room for more keypoints */
+                if (f->nkeys >= f->keys_res) {
+                  f->keys_res += 32768;
+                  if (f->keys) {
+                    f->keys = vl_realloc(
+                      f->keys,
+                      f->keys_res * sizeof(VlSiftKeypoint)
+                    );
+                  }
+                  else {
+                    f->keys = vl_malloc(
+                      f->keys_res * sizeof(VlSiftKeypoint)
+                    );
+                  }
+                }
+
+                k = f->keys + (f->nkeys++);
+                k->ix = tx + x + 1;
+                k->iy = ty + y + 1;
+                k->is = s;
+              }
+
+              ptRow += w;
+            }
+          } // tx
+        } // ty
+      } // s
+
+      /* -----------------------------------------------------------------
+       *                                               Refine local maxima
+       * -------------------------------------------------------------- */
+
+       /* this pointer is used to write the keypoints back */
+      k = f->keys;
+
+      for (i = 0; i < f->nkeys; ++i) {
+        int x = f->keys[i].ix;
+        int y = f->keys[i].iy;
+        int s = f->keys[i].is;
+
+        double Dx = 0, Dy = 0, Ds = 0, Dxx = 0, Dyy = 0, Dss = 0, Dxy = 0, Dxs = 0, Dys = 0;
+        double A[3 * 3], b[3];
+
+        int dx = 0;
+        int dy = 0;
+
+        int iter, i, j;
+
+        for (iter = 0; iter < 5; ++iter) {
+          x += dx;
+          y += dy;
+
+          pt = dog
+            + xo * x
+            + yo * y
+            + so * (s - s_min);
+
+          /** @brief Index GSS @internal */
 #define at(dx,dy,ds) (*( pt + (dx)*xo + (dy)*yo + (ds)*so))
 
       /** @brief Index matrix A @internal */
 #define Aat(i,j)     (A[(i)+(j)*3])
 
       /* compute the gradient */
-      Dx = 0.5 * (at(+1, 0, 0) - at(-1, 0, 0));
-      Dy = 0.5 * (at(0, +1, 0) - at(0, -1, 0));
-      Ds = 0.5 * (at(0, 0, +1) - at(0, 0, -1));
+          Dx = 0.5 * (at(+1, 0, 0) - at(-1, 0, 0));
+          Dy = 0.5 * (at(0, +1, 0) - at(0, -1, 0));
+          Ds = 0.5 * (at(0, 0, +1) - at(0, 0, -1));
 
-      /* compute the Hessian */
-      Dxx = (at(+1, 0, 0) + at(-1, 0, 0) - 2.0 * at(0, 0, 0));
-      Dyy = (at(0, +1, 0) + at(0, -1, 0) - 2.0 * at(0, 0, 0));
-      Dss = (at(0, 0, +1) + at(0, 0, -1) - 2.0 * at(0, 0, 0));
+          /* compute the Hessian */
+          Dxx = (at(+1, 0, 0) + at(-1, 0, 0) - 2.0 * at(0, 0, 0));
+          Dyy = (at(0, +1, 0) + at(0, -1, 0) - 2.0 * at(0, 0, 0));
+          Dss = (at(0, 0, +1) + at(0, 0, -1) - 2.0 * at(0, 0, 0));
 
-      Dxy = 0.25 * (at(+1, +1, 0) + at(-1, -1, 0) - at(-1, +1, 0) - at(+1, -1, 0));
-      Dxs = 0.25 * (at(+1, 0, +1) + at(-1, 0, -1) - at(-1, 0, +1) - at(+1, 0, -1));
-      Dys = 0.25 * (at(0, +1, +1) + at(0, -1, -1) - at(0, -1, +1) - at(0, +1, -1));
+          Dxy = 0.25 * (at(+1, +1, 0) + at(-1, -1, 0) - at(-1, +1, 0) - at(+1, -1, 0));
+          Dxs = 0.25 * (at(+1, 0, +1) + at(-1, 0, -1) - at(-1, 0, +1) - at(+1, 0, -1));
+          Dys = 0.25 * (at(0, +1, +1) + at(0, -1, -1) - at(0, -1, +1) - at(0, +1, -1));
 
-      /* solve linear system ....................................... */
-      Aat(0, 0) = Dxx;
-      Aat(1, 1) = Dyy;
-      Aat(2, 2) = Dss;
-      Aat(0, 1) = Aat(1, 0) = Dxy;
-      Aat(0, 2) = Aat(2, 0) = Dxs;
-      Aat(1, 2) = Aat(2, 1) = Dys;
+          /* solve linear system ....................................... */
+          Aat(0, 0) = Dxx;
+          Aat(1, 1) = Dyy;
+          Aat(2, 2) = Dss;
+          Aat(0, 1) = Aat(1, 0) = Dxy;
+          Aat(0, 2) = Aat(2, 0) = Dxs;
+          Aat(1, 2) = Aat(2, 1) = Dys;
 
-      b[0] = -Dx;
-      b[1] = -Dy;
-      b[2] = -Ds;
+          b[0] = -Dx;
+          b[1] = -Dy;
+          b[2] = -Ds;
 
-      /* Gauss elimination */
-      for (j = 0; j < 3; ++j) {
-        double maxa = 0;
-        double maxabsa = 0;
-        int    maxi = -1;
-        double tmp;
+          /* Gauss elimination */
+          for (j = 0; j < 3; ++j) {
+            double maxa = 0;
+            double maxabsa = 0;
+            int    maxi = -1;
+            double tmp;
 
-        /* look for the maximally stable pivot */
-        for (i = j; i < 3; ++i) {
-          double a = Aat(i, j);
-          double absa = vl_abs_d(a);
-          if (absa > maxabsa) {
-            maxa = a;
-            maxabsa = absa;
-            maxi = i;
+            /* look for the maximally stable pivot */
+            for (i = j; i < 3; ++i) {
+              double a = Aat(i, j);
+              double absa = vl_abs_d(a);
+              if (absa > maxabsa) {
+                maxa = a;
+                maxabsa = absa;
+                maxi = i;
+              }
+            }
+
+            /* if singular give up */
+            if (maxabsa < 1e-10f) {
+              b[0] = 0;
+              b[1] = 0;
+              b[2] = 0;
+              break;
+            }
+
+            i = maxi;
+
+            /* swap j-th row with i-th row and normalize j-th row */
+            for (jj = j; jj < 3; ++jj) {
+              tmp = Aat(i, jj); Aat(i, jj) = Aat(j, jj); Aat(j, jj) = tmp;
+              Aat(j, jj) /= maxa;
+            }
+            tmp = b[j]; b[j] = b[i]; b[i] = tmp;
+            b[j] /= maxa;
+
+            /* elimination */
+            for (ii = j + 1; ii < 3; ++ii) {
+              double x = Aat(ii, j);
+              for (jj = j; jj < 3; ++jj) {
+                Aat(ii, jj) -= x * Aat(j, jj);
+              }
+              b[ii] -= x * b[j];
+            }
+          }
+
+          /* backward substitution */
+          for (i = 2; i > 0; --i) {
+            double x = b[i];
+            for (ii = i - 1; ii >= 0; --ii) {
+              b[ii] -= x * Aat(ii, i);
+            }
+          }
+
+          /* .......................................................... */
+          /* If the translation of the keypoint is big, move the keypoint
+           * and re-iterate the computation. Otherwise we are all set.
+           */
+
+          dx = ((b[0] > 0.6 && x < w - 2) ? 1 : 0)
+            + ((b[0] < -0.6 && x > 1) ? -1 : 0);
+
+          dy = ((b[1] > 0.6 && y < h - 2) ? 1 : 0)
+            + ((b[1] < -0.6 && y > 1) ? -1 : 0);
+
+          if (dx == 0 && dy == 0) break;
+        }
+
+        /* check threshold and other conditions */
+        {
+          double val = at(0, 0, 0)
+            + 0.5 * (Dx * b[0] + Dy * b[1] + Ds * b[2]);
+          double score = (Dxx + Dyy) * (Dxx + Dyy) / (Dxx * Dyy - Dxy * Dxy);
+          double xn = x + b[0];
+          double yn = y + b[1];
+          double sn = s + b[2];
+
+          vl_bool good =
+            vl_abs_d(val) > tp &&
+            score < (te + 1) * (te + 1) / te &&
+            score >= 0 &&
+            vl_abs_d(b[0]) < 1.5 &&
+            vl_abs_d(b[1]) < 1.5 &&
+            vl_abs_d(b[2]) < 1.5 &&
+            xn >= 0 &&
+            xn <= w - 1 &&
+            yn >= 0 &&
+            yn <= h - 1 &&
+            sn >= s_min &&
+            sn <= s_max;
+
+          if (good) {
+            k->o = f->o_cur;
+            k->ix = x;
+            k->iy = y;
+            k->is = s;
+            k->s = sn;
+            k->x = xn * xper;
+            k->y = yn * xper;
+            k->sigma = f->sigma0 * pow(2.0, sn / f->S) * xper;
+            ++k;
           }
         }
+      } /* next keypoint to refine */
 
-        /* if singular give up */
-        if (maxabsa < 1e-10f) {
-          b[0] = 0;
-          b[1] = 0;
-          b[2] = 0;
-          break;
-        }
+      /* update keypoint count */
+      f->nkeys = (int)(k - f->keys);
+#ifdef VALIDATE
+      pass0Keys = f->nkeys;
+#endif
+#ifdef VALIDATE2
+      printf("OPT final keys: %d\n", f->nkeys);
+#endif
+    }
+    else { //REF
+      f = start; // restart
+      vl_sift_pix* dog = f->dog;
+      int          s_min = f->s_min;
+      int          s_max = f->s_max;
+      int          w = f->octave_width;
+      int          h = f->octave_height;
+      double       te = f->edge_thresh;
+      double       tp = f->peak_thresh;
 
-        i = maxi;
+      int const    xo = 1;      /* x-stride */
+      int const    yo = w;      /* y-stride */
+      int const    so = w * h;  /* s-stride */
 
-        /* swap j-th row with i-th row and normalize j-th row */
-        for (jj = j; jj < 3; ++jj) {
-          tmp = Aat(i, jj); Aat(i, jj) = Aat(j, jj); Aat(j, jj) = tmp;
-          Aat(j, jj) /= maxa;
-        }
-        tmp = b[j]; b[j] = b[i]; b[i] = tmp;
-        b[j] /= maxa;
+      double       xper = pow(2.0, f->o_cur);
 
-        /* elimination */
-        for (ii = j + 1; ii < 3; ++ii) {
-          double x = Aat(ii, j);
-          for (jj = j; jj < 3; ++jj) {
-            Aat(ii, jj) -= x * Aat(j, jj);
+      int x, y, s, i, ii, jj;
+      vl_sift_pix* pt, v;
+      VlSiftKeypoint* k;
+
+      /* clear current list */
+      f->nkeys = 0;
+
+      /* compute difference of gaussian (DoG) */
+      pt = f->dog;
+      for (s = s_min; s <= s_max - 1; ++s) {
+        vl_sift_pix* src_a = vl_sift_get_octave(f, s);
+        vl_sift_pix* src_b = vl_sift_get_octave(f, s + 1);
+        vl_sift_pix* end_a = src_a + w * h;
+        while (src_a != end_a) {
+#if 0 // JPB WIP BUG are identical
+          float new = *src_b - *src_a;
+          if (new != *pt) {
+            __debugbreak();
           }
-          b[ii] -= x * b[j];
+#endif
+          *pt++ = *src_b++ - *src_a++;
         }
       }
 
-      /* backward substitution */
-      for (i = 2; i > 0; --i) {
-        double x = b[i];
-        for (ii = i - 1; ii >= 0; --ii) {
-          b[ii] -= x * Aat(ii, i);
-        }
-      }
+      /* -----------------------------------------------------------------
+       *                                          Find local maxima of DoG
+       * -------------------------------------------------------------- */
 
-      /* .......................................................... */
-      /* If the translation of the keypoint is big, move the keypoint
-       * and re-iterate the computation. Otherwise we are all set.
-       */
+       /* start from dog [1,1,s_min+1] */
+      pt = dog + xo + yo + so;
 
-      dx = ((b[0] > 0.6 && x < w - 2) ? 1 : 0)
-        + ((b[0] < -0.6 && x > 1) ? -1 : 0);
-
-      dy = ((b[1] > 0.6 && y < h - 2) ? 1 : 0)
-        + ((b[1] < -0.6 && y > 1) ? -1 : 0);
-
-      if (dx == 0 && dy == 0) break;
-    }
-
-    /* check threshold and other conditions */
-    {
-      double val = at(0, 0, 0)
-        + 0.5 * (Dx * b[0] + Dy * b[1] + Ds * b[2]);
-      double score = (Dxx + Dyy) * (Dxx + Dyy) / (Dxx * Dyy - Dxy * Dxy);
-      double xn = x + b[0];
-      double yn = y + b[1];
-      double sn = s + b[2];
-
-      vl_bool good =
-        vl_abs_d(val) > tp &&
-        score < (te + 1) * (te + 1) / te &&
-        score >= 0 &&
-        vl_abs_d(b[0]) < 1.5 &&
-        vl_abs_d(b[1]) < 1.5 &&
-        vl_abs_d(b[2]) < 1.5 &&
-        xn >= 0 &&
-        xn <= w - 1 &&
-        yn >= 0 &&
-        yn <= h - 1 &&
-        sn >= s_min &&
-        sn <= s_max;
-
-      if (!good)
-        goto discard_keypoint;
-
-      k->o = f->o_cur;
-      k->ix = x;
-      k->iy = y;
-      k->is = s;
-      k->s = sn;
-      k->x = xn * xper;
-      k->y = yn * xper;
-      k->sigma = f->sigma0 * pow(2.0, sn / f->S) * xper;
-      ++k;
-    }
-
-  discard_keypoint:
-    ;
-  } /* next keypoint to refine */
-
-  /* update keypoint count */
-  f->nkeys = (int)(k - f->keys);
-#else
-  vl_sift_pix* dog   = f-> dog ;
-  int          s_min = f-> s_min ;
-  int          s_max = f-> s_max ;
-  int          w     = f-> octave_width ;
-  int          h     = f-> octave_height ;
-  double       te    = f-> edge_thresh ;
-  double       tp    = f-> peak_thresh ;
-
-  int const    xo    = 1 ;      /* x-stride */
-  int const    yo    = w ;      /* y-stride */
-  int const    so    = w * h ;  /* s-stride */
-
-  double       xper  = pow (2.0, f->o_cur) ;
-
-  int x, y, s, i, ii, jj ;
-  vl_sift_pix *pt, v ;
-  VlSiftKeypoint *k ;
-
-  /* clear current list */
-  f-> nkeys = 0 ;
-
-  /* compute difference of gaussian (DoG) */
-  pt = f-> dog ;
-  for (s = s_min ; s <= s_max - 1 ; ++s) {
-    vl_sift_pix* src_a = vl_sift_get_octave (f, s    ) ;
-    vl_sift_pix* src_b = vl_sift_get_octave (f, s + 1) ;
-    vl_sift_pix* end_a = src_a + w * h ;
-    while (src_a != end_a) {
-      *pt++ = *src_b++ - *src_a++ ;
-    }
-  }
-
-  /* -----------------------------------------------------------------
-   *                                          Find local maxima of DoG
-   * -------------------------------------------------------------- */
-
-  /* start from dog [1,1,s_min+1] */
-  pt  = dog + xo + yo + so ;
-
-  for(s = s_min + 1 ; s <= s_max - 2 ; ++s) {
-    for(y = 1 ; y < h - 1 ; ++y) {
-      for(x = 1 ; x < w - 1 ; ++x) {
-        v = *pt ;
+      for (s = s_min + 1; s <= s_max - 2; ++s) {
+        for (y = 1; y < h - 1; ++y) {
+          for (x = 1; x < w - 1; ++x) {
+            v = *pt;
 
 #define CHECK_NEIGHBORS(CMP,SGN)                    \
         ( v CMP ## = SGN 0.8 * tp &&                \
@@ -2326,206 +2333,236 @@ vl_sift_detect (VlSiftFilt * f)
           v CMP *(pt - yo + xo - so) &&             \
           v CMP *(pt - yo - xo - so) )
 
-        if (CHECK_NEIGHBORS(>,+) ||
-            CHECK_NEIGHBORS(<,-) ) {
+            if (CHECK_NEIGHBORS(> , +) ||
+              CHECK_NEIGHBORS(< , -)) {
+#ifdef VALIDAE2
+              static int printCountRef = 0;
+              if (printCountRef < 10) {
+                printf("REF  s=%d y=%d x=%d\n", s, y, x);
+                ++printCountRef;
+              }
+#endif
 
-          /* make room for more keypoints */
-          if (f->nkeys >= f->keys_res) {
-            f->keys_res += 500 ;
-            if (f->keys) {
-              f->keys = vl_realloc (f->keys,
-                                    f->keys_res *
-                                    sizeof(VlSiftKeypoint)) ;
-            } else {
-              f->keys = vl_malloc (f->keys_res *
-                                   sizeof(VlSiftKeypoint)) ;
+              /* make room for more keypoints */
+              if (f->nkeys >= f->keys_res) {
+                f->keys_res += 500;
+                if (f->keys) {
+                  f->keys = vl_realloc(f->keys,
+                    f->keys_res *
+                    sizeof(VlSiftKeypoint));
+                }
+                else {
+                  f->keys = vl_malloc(f->keys_res *
+                    sizeof(VlSiftKeypoint));
+                }
+              }
+
+              k = f->keys + (f->nkeys++);
+
+              k->ix = x;
+              k->iy = y;
+              k->is = s;
             }
+            pt += 1;
           }
-
-          k = f->keys + (f->nkeys ++) ;
-
-          k-> ix = x ;
-          k-> iy = y ;
-          k-> is = s ;
+          pt += 2;
         }
-        pt += 1 ;
+        pt += 2 * yo;
       }
-      pt += 2 ;
-    }
-    pt += 2 * yo ;
-  }
 
-  /* -----------------------------------------------------------------
-   *                                               Refine local maxima
-   * -------------------------------------------------------------- */
+      /* -----------------------------------------------------------------
+       *                                               Refine local maxima
+       * -------------------------------------------------------------- */
 
-  /* this pointer is used to write the keypoints back */
-  k = f->keys ;
+       /* this pointer is used to write the keypoints back */
+      k = f->keys;
 
-  for (i = 0 ; i < f->nkeys ; ++i) {
+      for (i = 0; i < f->nkeys; ++i) {
+        int x = f->keys[i].ix;
+        int y = f->keys[i].iy;
+        int s = f->keys[i].is;
 
-    int x = f-> keys [i] .ix ;
-    int y = f-> keys [i] .iy ;
-    int s = f-> keys [i]. is ;
+        double Dx = 0, Dy = 0, Ds = 0, Dxx = 0, Dyy = 0, Dss = 0, Dxy = 0, Dxs = 0, Dys = 0;
+        double A[3 * 3], b[3];
 
-    double Dx=0,Dy=0,Ds=0,Dxx=0,Dyy=0,Dss=0,Dxy=0,Dxs=0,Dys=0 ;
-    double A [3*3], b [3] ;
+        int dx = 0;
+        int dy = 0;
 
-    int dx = 0 ;
-    int dy = 0 ;
+        int iter, i, j;
 
-    int iter, i, j ;
+        for (iter = 0; iter < 5; ++iter) {
 
-    for (iter = 0 ; iter < 5 ; ++iter) {
+          x += dx;
+          y += dy;
 
-      x += dx ;
-      y += dy ;
+          pt = dog
+            + xo * x
+            + yo * y
+            + so * (s - s_min);
 
-      pt = dog
-        + xo * x
-        + yo * y
-        + so * (s - s_min) ;
-
-      /** @brief Index GSS @internal */
+          /** @brief Index GSS @internal */
 #define at(dx,dy,ds) (*( pt + (dx)*xo + (dy)*yo + (ds)*so))
 
       /** @brief Index matrix A @internal */
 #define Aat(i,j)     (A[(i)+(j)*3])
 
       /* compute the gradient */
-      Dx = 0.5 * (at(+1,0,0) - at(-1,0,0)) ;
-      Dy = 0.5 * (at(0,+1,0) - at(0,-1,0));
-      Ds = 0.5 * (at(0,0,+1) - at(0,0,-1)) ;
+          Dx = 0.5 * (at(+1, 0, 0) - at(-1, 0, 0));
+          Dy = 0.5 * (at(0, +1, 0) - at(0, -1, 0));
+          Ds = 0.5 * (at(0, 0, +1) - at(0, 0, -1));
 
-      /* compute the Hessian */
-      Dxx = (at(+1,0,0) + at(-1,0,0) - 2.0 * at(0,0,0)) ;
-      Dyy = (at(0,+1,0) + at(0,-1,0) - 2.0 * at(0,0,0)) ;
-      Dss = (at(0,0,+1) + at(0,0,-1) - 2.0 * at(0,0,0)) ;
+          /* compute the Hessian */
+          Dxx = (at(+1, 0, 0) + at(-1, 0, 0) - 2.0 * at(0, 0, 0));
+          Dyy = (at(0, +1, 0) + at(0, -1, 0) - 2.0 * at(0, 0, 0));
+          Dss = (at(0, 0, +1) + at(0, 0, -1) - 2.0 * at(0, 0, 0));
 
-      Dxy = 0.25 * ( at(+1,+1,0) + at(-1,-1,0) - at(-1,+1,0) - at(+1,-1,0) ) ;
-      Dxs = 0.25 * ( at(+1,0,+1) + at(-1,0,-1) - at(-1,0,+1) - at(+1,0,-1) ) ;
-      Dys = 0.25 * ( at(0,+1,+1) + at(0,-1,-1) - at(0,-1,+1) - at(0,+1,-1) ) ;
+          Dxy = 0.25 * (at(+1, +1, 0) + at(-1, -1, 0) - at(-1, +1, 0) - at(+1, -1, 0));
+          Dxs = 0.25 * (at(+1, 0, +1) + at(-1, 0, -1) - at(-1, 0, +1) - at(+1, 0, -1));
+          Dys = 0.25 * (at(0, +1, +1) + at(0, -1, -1) - at(0, -1, +1) - at(0, +1, -1));
 
-      /* solve linear system ....................................... */
-      Aat(0,0) = Dxx ;
-      Aat(1,1) = Dyy ;
-      Aat(2,2) = Dss ;
-      Aat(0,1) = Aat(1,0) = Dxy ;
-      Aat(0,2) = Aat(2,0) = Dxs ;
-      Aat(1,2) = Aat(2,1) = Dys ;
+          /* solve linear system ....................................... */
+          Aat(0, 0) = Dxx;
+          Aat(1, 1) = Dyy;
+          Aat(2, 2) = Dss;
+          Aat(0, 1) = Aat(1, 0) = Dxy;
+          Aat(0, 2) = Aat(2, 0) = Dxs;
+          Aat(1, 2) = Aat(2, 1) = Dys;
 
-      b[0] = - Dx ;
-      b[1] = - Dy ;
-      b[2] = - Ds ;
+          b[0] = -Dx;
+          b[1] = -Dy;
+          b[2] = -Ds;
 
-      /* Gauss elimination */
-      for(j = 0 ; j < 3 ; ++j) {
-        double maxa    = 0 ;
-        double maxabsa = 0 ;
-        int    maxi    = -1 ;
-        double tmp ;
+          /* Gauss elimination */
+          for (j = 0; j < 3; ++j) {
+            double maxa = 0;
+            double maxabsa = 0;
+            int    maxi = -1;
+            double tmp;
 
-        /* look for the maximally stable pivot */
-        for (i = j ; i < 3 ; ++i) {
-          double a    = Aat (i,j) ;
-          double absa = vl_abs_d (a) ;
-          if (absa > maxabsa) {
-            maxa    = a ;
-            maxabsa = absa ;
-            maxi    = i ;
+            /* look for the maximally stable pivot */
+            for (i = j; i < 3; ++i) {
+              double a = Aat(i, j);
+              double absa = vl_abs_d(a);
+              if (absa > maxabsa) {
+                maxa = a;
+                maxabsa = absa;
+                maxi = i;
+              }
+            }
+
+            /* if singular give up */
+            if (maxabsa < 1e-10f) {
+              b[0] = 0;
+              b[1] = 0;
+              b[2] = 0;
+              break;
+            }
+
+            i = maxi;
+
+            /* swap j-th row with i-th row and normalize j-th row */
+            for (jj = j; jj < 3; ++jj) {
+              tmp = Aat(i, jj); Aat(i, jj) = Aat(j, jj); Aat(j, jj) = tmp;
+              Aat(j, jj) /= maxa;
+            }
+            tmp = b[j]; b[j] = b[i]; b[i] = tmp;
+            b[j] /= maxa;
+
+            /* elimination */
+            for (ii = j + 1; ii < 3; ++ii) {
+              double x = Aat(ii, j);
+              for (jj = j; jj < 3; ++jj) {
+                Aat(ii, jj) -= x * Aat(j, jj);
+              }
+              b[ii] -= x * b[j];
+            }
           }
-        }
 
-        /* if singular give up */
-        if (maxabsa < 1e-10f) {
-          b[0] = 0 ;
-          b[1] = 0 ;
-          b[2] = 0 ;
-          break ;
-        }
-
-        i = maxi ;
-
-        /* swap j-th row with i-th row and normalize j-th row */
-        for(jj = j ; jj < 3 ; ++jj) {
-          tmp = Aat(i,jj) ; Aat(i,jj) = Aat(j,jj) ; Aat(j,jj) = tmp ;
-          Aat(j,jj) /= maxa ;
-        }
-        tmp = b[j] ; b[j] = b[i] ; b[i] = tmp ;
-        b[j] /= maxa ;
-
-        /* elimination */
-        for (ii = j+1 ; ii < 3 ; ++ii) {
-          double x = Aat(ii,j) ;
-          for (jj = j ; jj < 3 ; ++jj) {
-            Aat(ii,jj) -= x * Aat(j,jj) ;
+          /* backward substitution */
+          for (i = 2; i > 0; --i) {
+            double x = b[i];
+            for (ii = i - 1; ii >= 0; --ii) {
+              b[ii] -= x * Aat(ii, i);
+            }
           }
-          b[ii] -= x * b[j] ;
+
+          /* .......................................................... */
+          /* If the translation of the keypoint is big, move the keypoint
+           * and re-iterate the computation. Otherwise we are all set.
+           */
+
+          dx = ((b[0] > 0.6 && x < w - 2) ? 1 : 0)
+            + ((b[0] < -0.6 && x > 1) ? -1 : 0);
+
+          dy = ((b[1] > 0.6 && y < h - 2) ? 1 : 0)
+            + ((b[1] < -0.6 && y > 1) ? -1 : 0);
+
+          if (dx == 0 && dy == 0) break;
         }
-      }
 
-      /* backward substitution */
-      for (i = 2 ; i > 0 ; --i) {
-        double x = b[i] ;
-        for (ii = i-1 ; ii >= 0 ; --ii) {
-          b[ii] -= x * Aat(ii,i) ;
-        }
-      }
+        /* check threshold and other conditions */
+        {
+          double val = at(0, 0, 0)
+            + 0.5 * (Dx * b[0] + Dy * b[1] + Ds * b[2]);
+          double score = (Dxx + Dyy) * (Dxx + Dyy) / (Dxx * Dyy - Dxy * Dxy);
+          double xn = x + b[0];
+          double yn = y + b[1];
+          double sn = s + b[2];
 
-      /* .......................................................... */
-      /* If the translation of the keypoint is big, move the keypoint
-       * and re-iterate the computation. Otherwise we are all set.
-       */
+          vl_bool good =
+            vl_abs_d(val) > tp &&
+            score < (te + 1) * (te + 1) / te &&
+            score >= 0 &&
+            vl_abs_d(b[0]) < 1.5 &&
+            vl_abs_d(b[1]) < 1.5 &&
+            vl_abs_d(b[2]) < 1.5 &&
+            xn >= 0 &&
+            xn <= w - 1 &&
+            yn >= 0 &&
+            yn <= h - 1 &&
+            sn >= s_min &&
+            sn <= s_max;
 
-      dx= ((b[0] >  0.6 && x < w - 2) ?  1 : 0)
-        + ((b[0] < -0.6 && x > 1    ) ? -1 : 0) ;
+          if (good) {
+            k->o = f->o_cur;
+            k->ix = x;
+            k->iy = y;
+            k->is = s;
+            k->s = sn;
+            k->x = xn * xper;
+            k->y = yn * xper;
+            k->sigma = f->sigma0 * pow(2.0, sn / f->S) * xper;
+            ++k;
+          }
 
-      dy= ((b[1] >  0.6 && y < h - 2) ?  1 : 0)
-        + ((b[1] < -0.6 && y > 1    ) ? -1 : 0) ;
+        } /* done checking */
+      } /* next keypoint to refine */
 
-      if (dx == 0 && dy == 0) break ;
+      f->nkeys = (int)(k - f->keys);
+#ifdef VALIDATE2
+      printf("REF final keys: %d\n", f->nkeys);
+#endif
     }
 
-    /* check threshold and other conditions */
-    {
-      double val   = at(0,0,0)
-        + 0.5 * (Dx * b[0] + Dy * b[1] + Ds * b[2]) ;
-      double score = (Dxx+Dyy)*(Dxx+Dyy) / (Dxx*Dyy - Dxy*Dxy) ;
-      double xn = x + b[0] ;
-      double yn = y + b[1] ;
-      double sn = s + b[2] ;
-
-      vl_bool good =
-        vl_abs_d (val)  > tp                  &&
-        score           < (te+1)*(te+1)/te    &&
-        score           >= 0                  &&
-        vl_abs_d (b[0]) <  1.5                &&
-        vl_abs_d (b[1]) <  1.5                &&
-        vl_abs_d (b[2]) <  1.5                &&
-        xn              >= 0                  &&
-        xn              <= w - 1              &&
-        yn              >= 0                  &&
-        yn              <= h - 1              &&
-        sn              >= s_min              &&
-        sn              <= s_max ;
-
-      if (good) {
-        k-> o     = f->o_cur ;
-        k-> ix    = x ;
-        k-> iy    = y ;
-        k-> is    = s ;
-        k-> s     = sn ;
-        k-> x     = xn * xper ;
-        k-> y     = yn * xper ;
-        k-> sigma = f->sigma0 * pow (2.0, sn/f->S) * xper ;
-        ++ k ;
-      }
-
-    } /* done checking */
-  } /* next keypoint to refine */
-
-  /* update keypoint count */
-  f-> nkeys = (int)(k - f->keys) ;
+#ifdef VALIDATE2
+    if (pass == 0) {
+      FILE* ff = fopen("opt_candidates.txt", "w");
+      for (int i = 0; i < f->nkeys; ++i)
+        fprintf(ff, "%d %d %d\n", f->keys[i].is, f->keys[i].iy, f->keys[i].ix);
+      fclose(ff);
+    }
+    else {
+      FILE* ff = fopen("ref_candidates.txt", "w");
+      for (int i = 0; i < f->nkeys; ++i)
+        fprintf(ff, "%d %d %d\n", f->keys[i].is, f->keys[i].iy, f->keys[i].ix);
+      fclose(ff);
+    }
+#endif
+  }
+#ifdef VALIDATE
+  if (pass0Keys != f->nkeys) {
+    printf("Validation failed: keypoint count mismatch. OPT %d vs REF %d\n", pass0Keys, f->nkeys);
+  }
 #endif
 }
 
@@ -2541,6 +2578,99 @@ vl_sift_detect (VlSiftFilt * f)
  **/
 
 #if FAST_SIFT_GRADIENT_UPDATE
+#if 1
+static inline void FastGradientRow(
+  vl_sift_pix const** g,
+  vl_sift_pix const** __restrict s,
+  vl_sift_pix const* const __restrict end,
+  int xo,
+  int yo
+)
+{
+  vl_sift_pix* __restrict src = (vl_sift_pix*)*s;
+  vl_sift_pix* __restrict grad = (vl_sift_pix*)*g;
+
+  const int count = (int)(end - src);
+  const int numGroups = count / GROUP_SIZE;
+
+  const _Data vHalf = _Set(0.5f);
+
+  int i = 0;
+
+  // Tune these. 2 groups ahead is a decent starting point.
+  const int pfGroups = 2;
+  const int pfDist = pfGroups * GROUP_SIZE;
+
+  // Unroll by 2 groups
+  for (; i + 1 < numGroups; i += 2) {
+    vl_sift_pix* __restrict p0 = src + 0 * GROUP_SIZE;
+    vl_sift_pix* __restrict p1 = src + 1 * GROUP_SIZE;
+    // ---- group 0 ----
+    {
+      const _Data vPx = _Load(p0 + xo);
+      const _Data vMx = _Load(p0 - xo);
+      const _Data vPy = _Load(p0 + yo);
+      const _Data vMy = _Load(p0 - yo);
+
+      const _Data vHalfGx = _Mul(vHalf, _Sub(vPx, vMx));
+      const _Data vHalfGy = _Mul(vHalf, _Sub(vPy, vMy));
+
+      // Norm = gx^2 + gy^2
+      const _Data vNorm = _Add(_Mul(vHalfGx, vHalfGx), _Mul(vHalfGy, vHalfGy));
+
+      const _Data vMag = _Sqrt(vNorm);
+      const _Data vAng = GradCalc2(vHalfGy, vHalfGx);
+
+      _Store(grad + 0, _UnpackLow(vMag, vAng));
+      _Store(grad + GROUP_SIZE, _UnpackHigh(vMag, vAng));
+    }
+
+    // ---- group 1 ----
+    {
+      const _Data vPx = _Load(p1 + xo);
+      const _Data vMx = _Load(p1 - xo);
+      const _Data vPy = _Load(p1 + yo);
+      const _Data vMy = _Load(p1 - yo);
+
+      const _Data vHalfGx = _Mul(vHalf, _Sub(vPx, vMx));
+      const _Data vHalfGy = _Mul(vHalf, _Sub(vPy, vMy));
+
+      const _Data vNorm = _Add(_Mul(vHalfGx, vHalfGx), _Mul(vHalfGy, vHalfGy));
+
+      const _Data vMag = _Sqrt(vNorm);
+      const _Data vAng = GradCalc2(vHalfGy, vHalfGx);
+
+      vl_sift_pix* __restrict g1 = grad + GROUP_SIZE * 2;
+      _Store(g1 + 0, _UnpackLow(vMag, vAng));
+      _Store(g1 + GROUP_SIZE, _UnpackHigh(vMag, vAng));
+    }
+
+    src += 2 * GROUP_SIZE;
+    grad += 2 * GROUP_SIZE * 2;
+  }
+
+  // Tail group (if odd)
+  for (; i < numGroups; ++i, src += GROUP_SIZE, grad += GROUP_SIZE * 2) {
+    const _Data vPx = _Load(src + xo);
+    const _Data vMx = _Load(src - xo);
+    const _Data vPy = _Load(src + yo);
+    const _Data vMy = _Load(src - yo);
+
+    const _Data vHalfGx = _Mul(vHalf, _Sub(vPx, vMx));
+    const _Data vHalfGy = _Mul(vHalf, _Sub(vPy, vMy));
+
+    const _Data vNorm = _Add(_Mul(vHalfGx, vHalfGx), _Mul(vHalfGy, vHalfGy));
+    const _Data vMag = _Sqrt(vNorm);
+    const _Data vAng = GradCalc2(vHalfGy, vHalfGx);
+
+    _Store(grad + 0, _UnpackLow(vMag, vAng));
+    _Store(grad + GROUP_SIZE, _UnpackHigh(vMag, vAng));
+  }
+
+  *s = (vl_sift_pix const*)src;
+  *g = (vl_sift_pix const*)grad;
+}
+#else
 void FastGradientRow(
   vl_sift_pix const ** g,
   vl_sift_pix const ** __restrict s,
@@ -2589,6 +2719,7 @@ void FastGradientRow(
   *s = src;
   *g = grad;
 }
+#endif
 #endif /* FAST_SIFT_GRADIENT_UPDATE */
 
 void

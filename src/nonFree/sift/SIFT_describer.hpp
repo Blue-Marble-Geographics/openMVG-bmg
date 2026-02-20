@@ -31,88 +31,111 @@ namespace features {
 // [1] R. Arandjelović, A. Zisserman.
 // Three things everyone should know to improve object retrieval. CVPR2012.
 
+#if 0
+  inline void siftDescToUChar(
+    vl_sift_pix descr[128],
+    Descriptor<unsigned char, 128>& descriptor,
+    bool brootSift = false)
+  {
+    if (brootSift) {
+      // rootsift = sqrt( sift / sum(sift) );
+      const float sum = std::accumulate(descr, descr + 128, 0.0f);
+      for (int k = 0; k < 128; ++k)
+        descriptor[k] = static_cast<unsigned char>(512.f * sqrt(descr[k] / sum));
+    }
+    else
+      for (int k = 0; k < 128; ++k)
+        descriptor[k] = static_cast<unsigned char>(512.f * descr[k]);
+  }
+#else
   inline void siftDescToUChar(
     const vl_sift_pix descr[128],
     Descriptor<unsigned char, 128>& descriptor,
     bool brootSift = false)
   {
-    if (!brootSift) {
-      for (int k = 0; k < 128; ++k)
-        descriptor[k] = static_cast<unsigned char>(512.f * descr[k]);
-      return;
-      const __m128 scale = _mm_set1_ps(512.0f);
+    const __m128 scale = _mm_set1_ps(512.0f);
 
+    if (!brootSift) {
       for (int k = 0; k < 128; k += 16) {
 
-        // Load 16 floats (4 x __m128)
         __m128 f0 = _mm_loadu_ps(descr + k + 0);
         __m128 f1 = _mm_loadu_ps(descr + k + 4);
         __m128 f2 = _mm_loadu_ps(descr + k + 8);
         __m128 f3 = _mm_loadu_ps(descr + k + 12);
 
-        // Scale
         f0 = _mm_mul_ps(f0, scale);
         f1 = _mm_mul_ps(f1, scale);
         f2 = _mm_mul_ps(f2, scale);
         f3 = _mm_mul_ps(f3, scale);
 
-        // Convert to int32
-        __m128i i0 = _mm_cvtps_epi32(f0);
-        __m128i i1 = _mm_cvtps_epi32(f1);
-        __m128i i2 = _mm_cvtps_epi32(f2);
-        __m128i i3 = _mm_cvtps_epi32(f3);
+        // truncation to match static_cast<unsigned char>
+        __m128i i0 = _mm_cvttps_epi32(f0);
+        __m128i i1 = _mm_cvttps_epi32(f1);
+        __m128i i2 = _mm_cvttps_epi32(f2);
+        __m128i i3 = _mm_cvttps_epi32(f3);
 
-        // Pack 32-bit -> 16-bit -> 8-bit (unsigned saturation)
         __m128i p01 = _mm_packs_epi32(i0, i1);
         __m128i p23 = _mm_packs_epi32(i2, i3);
         __m128i p = _mm_packus_epi16(p01, p23);
 
-        // Store 16 bytes
-        _mm_storeu_si128((__m128i*)(descriptor.data() + k), p);
+        _mm_storeu_si128(
+          reinterpret_cast<__m128i*>(descriptor.data() + k),
+          p
+        );
       }
+
     }
     else {
-      // ---------------- RootSIFT ----------------
-
-      // Compute sum (scalar, cheap)
       float sum = 0.0f;
       for (int k = 0; k < 128; ++k)
         sum += descr[k];
 
       if (sum <= 0.0f) {
-        // Avoid divide-by-zero; zero descriptor
-        for (int k = 0; k < 128; ++k)
-          descriptor[k] = 0;
+        memset(descriptor.data(), 0, 128);
         return;
       }
 
       const __m128 invSum = _mm_set1_ps(1.0f / sum);
-      const __m128 scale = _mm_set1_ps(512.0f);
 
-      for (int k = 0; k < 128; k += 4) {
+      for (int k = 0; k < 128; k += 16) {
 
-        __m128 f = _mm_loadu_ps(descr + k);
+        __m128 f0 = _mm_loadu_ps(descr + k + 0);
+        __m128 f1 = _mm_loadu_ps(descr + k + 4);
+        __m128 f2 = _mm_loadu_ps(descr + k + 8);
+        __m128 f3 = _mm_loadu_ps(descr + k + 12);
 
-        // descr / sum
-        f = _mm_mul_ps(f, invSum);
+        f0 = _mm_mul_ps(f0, invSum);
+        f1 = _mm_mul_ps(f1, invSum);
+        f2 = _mm_mul_ps(f2, invSum);
+        f3 = _mm_mul_ps(f3, invSum);
 
-        // sqrt
-        f = _mm_sqrt_ps(f);
+        f0 = _mm_sqrt_ps(f0);
+        f1 = _mm_sqrt_ps(f1);
+        f2 = _mm_sqrt_ps(f2);
+        f3 = _mm_sqrt_ps(f3);
 
-        // scale
-        f = _mm_mul_ps(f, scale);
+        f0 = _mm_mul_ps(f0, scale);
+        f1 = _mm_mul_ps(f1, scale);
+        f2 = _mm_mul_ps(f2, scale);
+        f3 = _mm_mul_ps(f3, scale);
 
-        // convert
-        __m128i i = _mm_cvtps_epi32(f);
+        __m128i i0 = _mm_cvttps_epi32(f0);
+        __m128i i1 = _mm_cvttps_epi32(f1);
+        __m128i i2 = _mm_cvttps_epi32(f2);
+        __m128i i3 = _mm_cvttps_epi32(f3);
 
-        // store 4 bytes manually
-        descriptor[k + 0] = (unsigned char)_mm_extract_epi16(i, 0);
-        descriptor[k + 1] = (unsigned char)_mm_extract_epi16(i, 2);
-        descriptor[k + 2] = (unsigned char)_mm_extract_epi16(i, 4);
-        descriptor[k + 3] = (unsigned char)_mm_extract_epi16(i, 6);
+        __m128i p01 = _mm_packs_epi32(i0, i1);
+        __m128i p23 = _mm_packs_epi32(i2, i3);
+        __m128i p = _mm_packus_epi16(p01, p23);
+
+        _mm_storeu_si128(
+          reinterpret_cast<__m128i*>(descriptor.data() + k),
+          p
+        );
       }
     }
   }
+#endif
 
 class SIFT_Image_describer : public Image_describer
 {
@@ -246,12 +269,9 @@ public:
       // Update gradient before launching parallel extraction
       vl_sift_update_gradient(filt);
 
-
       for (int i = 0; i < nkeys; ++i) {
-
         // Feature masking
-        if (mask)
-        {
+        if (mask) {
           const image::Image<unsigned char> & maskIma = *mask;
           if (maskIma(keys[i].y, keys[i].x) == 0)
             continue;
@@ -259,8 +279,7 @@ public:
 
         double angles [4] = {0.0, 0.0, 0.0, 0.0};
         int nangles = 1; // by default (1 upright feature)
-        if (_bOrientation)
-        { // compute from 1 to 4 orientations
+        if (_bOrientation) { // compute from 1 to 4 orientations
           nangles = vl_sift_calc_keypoint_orientations(filt, angles, keys+i);
         }
 
