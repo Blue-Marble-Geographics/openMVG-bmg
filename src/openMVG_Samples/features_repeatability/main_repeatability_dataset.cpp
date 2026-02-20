@@ -26,6 +26,8 @@ using namespace openMVG::matching;
 #include "openMVG/features/sift/SIFT_Anatomy_Image_Describer.hpp"
 #include "nonFree/sift/SIFT_describer.hpp"
 
+extern "C" int hasAVX2 = -1;
+
 // Class to load images and ground truth homography matrices
 // A reference image
 // And a series of transformed images with the Homography mapping to the reference
