@@ -31,18 +31,14 @@ template <class Archive>
 inline void openMVG::cameras::Pinhole_Intrinsic_Radial_K3::save( Archive & ar ) const
 {
     Pinhole_Intrinsic::save(ar);
-    ar( cereal::make_nvp( "disto_k3", K1_ ) );
-    ar( cereal::make_nvp( "disto_k3", K2_ ) );
-    ar( cereal::make_nvp( "disto_k3", K3_ ) );
+    ar( cereal::make_nvp( "disto_k3", params_ ) );
 }
 
 template <class Archive>
 inline void openMVG::cameras::Pinhole_Intrinsic_Radial_K3::load( Archive & ar )
 {
     Pinhole_Intrinsic::load(ar);
-    ar( cereal::make_nvp( "disto_k3", K1_  ) );
-    ar( cereal::make_nvp( "disto_k3", K2_  ) );
-    ar( cereal::make_nvp( "disto_k3", K3_  ) );
+    ar( cereal::make_nvp( "disto_k3", params_ ) );
 }
 
 CEREAL_REGISTER_TYPE_WITH_NAME(openMVG::cameras::Pinhole_Intrinsic_Radial_K1, "pinhole_radial_k1");
