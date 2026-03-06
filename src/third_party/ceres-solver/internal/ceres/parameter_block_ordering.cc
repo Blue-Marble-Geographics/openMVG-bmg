@@ -122,6 +122,31 @@ void ComputeRecursiveIndependentSetOrdering(const Program& program,
 Graph<ParameterBlock*>* CreateHessianGraph(const Program& program) {
   Graph<ParameterBlock*>* graph = CHECK_NOTNULL(new Graph<ParameterBlock*>);
   const vector<ParameterBlock*>& parameter_blocks = program.parameter_blocks();
+  const vector<ResidualBlock*>& residual_blocks = program.residual_blocks();
+
+  // Count non-constant vertices for precise reservation.
+  int num_vertices = 0;
+  for (int i = 0; i < parameter_blocks.size(); ++i) {
+    if (!parameter_blocks[i]->IsConstant()) {
+      ++num_vertices;
+    }
+  }
+
+  // Count edges (upper bound: one per pair of non-constant params per residual).
+  int num_edges = 0;
+  for (int i = 0; i < residual_blocks.size(); ++i) {
+    const int npb = residual_blocks[i]->NumParameterBlocks();
+    // For typical SfM residuals npb=2, so edges_per_residual=1
+    int non_const = 0;
+    ParameterBlock* const* pb = residual_blocks[i]->parameter_blocks();
+    for (int j = 0; j < npb; ++j) {
+      if (!pb[j]->IsConstant()) ++non_const;
+    }
+    num_edges += non_const * (non_const - 1) / 2;
+  }
+
+  graph->Reserve(num_vertices, num_edges);
+
   for (int i = 0; i < parameter_blocks.size(); ++i) {
     ParameterBlock* parameter_block = parameter_blocks[i];
     if (!parameter_block->IsConstant()) {
@@ -129,23 +154,29 @@ Graph<ParameterBlock*>* CreateHessianGraph(const Program& program) {
     }
   }
 
-  const vector<ResidualBlock*>& residual_blocks = program.residual_blocks();
-  for (int i = 0; i < residual_blocks.size(); ++i) {
+  const int num_residual_blocks = static_cast<int>(residual_blocks.size());
+  for (int i = 0; i < num_residual_blocks; ++i) {
     const ResidualBlock* residual_block = residual_blocks[i];
-    const int num_parameter_blocks = residual_block->NumParameterBlocks();
-    ParameterBlock* const* parameter_blocks =
-        residual_block->parameter_blocks();
-    for (int j = 0; j < num_parameter_blocks; ++j) {
-      if (parameter_blocks[j]->IsConstant()) {
+    const int num_pb = residual_block->NumParameterBlocks();
+    ParameterBlock* const* pb = residual_block->parameter_blocks();
+
+    // Fast path: most SfM residuals have exactly 2 non-constant parameter blocks.
+    if (num_pb == 2) {
+      if (!pb[0]->IsConstant() && !pb[1]->IsConstant()) {
+        graph->AddEdge(pb[0], pb[1]);
+      }
+      continue;
+    }
+
+    for (int j = 0; j < num_pb; ++j) {
+      if (pb[j]->IsConstant()) {
         continue;
       }
-
-      for (int k = j + 1; k < num_parameter_blocks; ++k) {
-        if (parameter_blocks[k]->IsConstant()) {
+      for (int k = j + 1; k < num_pb; ++k) {
+        if (pb[k]->IsConstant()) {
           continue;
         }
-
-        graph->AddEdge(parameter_blocks[j], parameter_blocks[k]);
+        graph->AddEdge(pb[j], pb[k]);
       }
     }
   }

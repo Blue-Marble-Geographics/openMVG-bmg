@@ -47,13 +47,22 @@ namespace internal {
 // should be hashable.
 template <typename Vertex>
 class Graph {
- public:
+public:
   Graph() {}
+
+  // Reserve space for the expected number of vertices and edges.
+  void Reserve(int num_vertices, int num_edges) {
+    vertices_.reserve(num_vertices);
+    edges_.reserve(num_vertices);
+    estimated_avg_degree_ = num_vertices > 0
+      ? std::max(2 * num_edges / num_vertices, 1)
+      : 0;
+  }
 
   // Add a vertex.
   void AddVertex(const Vertex& vertex) {
     if (vertices_.insert(vertex).second) {
-      edges_[vertex] = HashSet<Vertex>();
+      edges_[vertex].reserve(estimated_avg_degree_);
     }
   }
 
@@ -65,7 +74,7 @@ class Graph {
     vertices_.erase(vertex);
     const HashSet<Vertex>& sinks = edges_[vertex];
     for (typename HashSet<Vertex>::const_iterator it = sinks.begin();
-         it != sinks.end(); ++it) {
+      it != sinks.end(); ++it) {
       edges_[*it].erase(vertex);
     }
 
@@ -73,12 +82,6 @@ class Graph {
     return true;
   }
 
-  // Add an edge between the vertex1 and vertex2. Calling AddEdge on a
-  // pair of vertices which do not exist in the graph yet will result
-  // in undefined behavior.
-  //
-  // It is legal to call this method repeatedly for the same set of
-  // vertices.
   void AddEdge(const Vertex& vertex1, const Vertex& vertex2) {
     DCHECK(vertices_.find(vertex1) != vertices_.end());
     DCHECK(vertices_.find(vertex2) != vertices_.end());
@@ -88,8 +91,6 @@ class Graph {
     }
   }
 
-  // Calling Neighbors on a vertex not in the graph will result in
-  // undefined behaviour.
   const HashSet<Vertex>& Neighbors(const Vertex& vertex) const {
     return FindOrDie(edges_, vertex);
   }
@@ -98,9 +99,10 @@ class Graph {
     return vertices_;
   }
 
- private:
+private:
   HashSet<Vertex> vertices_;
   HashMap<Vertex, HashSet<Vertex> > edges_;
+  int estimated_avg_degree_ = 0;
 
   CERES_DISALLOW_COPY_AND_ASSIGN(Graph);
 };
