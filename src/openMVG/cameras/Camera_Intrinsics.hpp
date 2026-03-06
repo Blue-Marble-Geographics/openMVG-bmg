@@ -277,24 +277,10 @@ inline double AngleBetweenRay
   // X = R.t() * K.inv() * x + C // Camera world point
   // getting the ray:
   // ray = X - C = R.t() * K.inv() * x
-  const Vec3 ray1 = ( pose1.rotation().transpose() * intrinsic1->oneBearing( x1 ) ).normalized();
-  const Vec3 ray2 = ( pose2.rotation().transpose() * intrinsic2->oneBearing( x2 ) ).normalized();
+  const Vec3 ray1 = ( pose1.rotation().transpose() * intrinsic1->operator()( x1 ) ).normalized();
+  const Vec3 ray2 = ( pose2.rotation().transpose() * intrinsic2->operator()( x2 ) ).normalized();
   const double dotAngle = ray1.dot( ray2 );
   return R2D( acos( clamp( dotAngle, -1.0 + 1.e-8, 1.0 - 1.e-8 ) ) );
-}
-
-inline double AngleBetweenRayInRadians
-(
-  const Vec3& ray1,
-  const Vec3& ray2
-)
-{
-  // x = (u, v, 1.0)  // image coordinates
-  // X = R.t() * K.inv() * x + C // Camera world point
-  // getting the ray:
-  // ray = X - C = R.t() * K.inv() * x
-  const double dotAngle = ray1.dot(ray2);
-  return acos(clamp(dotAngle, -1.0 + 1.e-8, 1.0 - 1.e-8));
 }
 
 /**

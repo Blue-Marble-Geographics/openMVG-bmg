@@ -243,7 +243,7 @@ bool TrustRegionMinimizer::EvaluateGradientAndJacobian() {
       //
       // jacobian_scaling_ = diag(J'J)^{-1}
       jacobian_->SquaredColumnNorm(jacobian_scaling_.data());
-      for (int i = 0, num_cols = jacobian_->num_cols(); i < num_cols; ++i) {
+      for (int i = 0; i < jacobian_->num_cols(); ++i) {
         // Add one to the denominator to prevent division by zero.
         jacobian_scaling_[i] = 1.0 / (1.0 + sqrt(jacobian_scaling_[i]));
       }

@@ -76,11 +76,11 @@ class PartitionedMatrixViewBase {
   virtual void RightMultiplyF(const double* x, double* y) const = 0;
 
   // Create and return the block diagonal of the matrix E'E.
-  virtual BlockSparseMatrix* CreateBlockDiagonalEtE() = 0;
+  virtual BlockSparseMatrix* CreateBlockDiagonalEtE() const = 0;
 
   // Create and return the block diagonal of the matrix F'F. Caller
   // owns the result.
-  virtual BlockSparseMatrix* CreateBlockDiagonalFtF() = 0;
+  virtual BlockSparseMatrix* CreateBlockDiagonalFtF() const = 0;
 
   // Compute the block diagonal of the matrix E'E and store it in
   // block_diagonal. The matrix block_diagonal is expected to have a
@@ -106,7 +106,7 @@ class PartitionedMatrixViewBase {
   virtual int num_cols()         const = 0;
 
   static PartitionedMatrixViewBase* Create(const LinearSolver::Options& options,
-                                           BlockSparseMatrix& matrix);
+                                           const BlockSparseMatrix& matrix);
 };
 
 template <int kRowBlockSize = Eigen::Dynamic,
@@ -116,15 +116,15 @@ class PartitionedMatrixView : public PartitionedMatrixViewBase {
  public:
   // matrix = [E F], where the matrix E contains the first
   // num_col_blocks_a column blocks.
-  PartitionedMatrixView(BlockSparseMatrix& matrix, int num_col_blocks_e);
+  PartitionedMatrixView(const BlockSparseMatrix& matrix, int num_col_blocks_e);
 
   virtual ~PartitionedMatrixView();
   virtual void LeftMultiplyE(const double* x, double* y) const;
   virtual void LeftMultiplyF(const double* x, double* y) const;
   virtual void RightMultiplyE(const double* x, double* y) const;
   virtual void RightMultiplyF(const double* x, double* y) const;
-  virtual BlockSparseMatrix* CreateBlockDiagonalEtE();
-  virtual BlockSparseMatrix* CreateBlockDiagonalFtF();
+  virtual BlockSparseMatrix* CreateBlockDiagonalEtE() const;
+  virtual BlockSparseMatrix* CreateBlockDiagonalFtF() const;
   virtual void UpdateBlockDiagonalEtE(BlockSparseMatrix* block_diagonal) const;
   virtual void UpdateBlockDiagonalFtF(BlockSparseMatrix* block_diagonal) const;
   virtual int num_col_blocks_e() const { return num_col_blocks_e_;  }
@@ -136,9 +136,9 @@ class PartitionedMatrixView : public PartitionedMatrixViewBase {
 
  private:
   BlockSparseMatrix* CreateBlockDiagonalMatrixLayout(int start_col_block,
-                                                     int end_col_block);
+                                                     int end_col_block) const;
 
-  BlockSparseMatrix& matrix_;
+  const BlockSparseMatrix& matrix_;
   int num_row_blocks_e_;
   int num_col_blocks_e_;
   int num_col_blocks_f_;

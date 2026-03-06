@@ -73,7 +73,7 @@ namespace internal {
 
 template <int kRowBlockSize, int kEBlockSize, int kFBlockSize>
 SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::~SchurEliminator() {
-  //STLDeleteElements(&rhs_locks_);
+  STLDeleteElements(&rhs_locks_);
 }
 
 template <int kRowBlockSize, int kEBlockSize, int kFBlockSize>
@@ -88,7 +88,7 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Init(
   num_eliminate_blocks_ = num_eliminate_blocks;
   assume_full_rank_ete_ = assume_full_rank_ete;
 
-  const int num_col_blocks = bs->col_sizes.size();
+  const int num_col_blocks = bs->cols.size();
   const int num_row_blocks = bs->rows.size();
 
   buffer_size_ = 1;
@@ -102,7 +102,7 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Init(
   lhs_row_layout_.resize(num_col_blocks - num_eliminate_blocks_);
   for (int i = num_eliminate_blocks_; i < num_col_blocks; ++i) {
     lhs_row_layout_[i - num_eliminate_blocks_] = lhs_num_rows;
-    lhs_num_rows += bs->col_sizes[i];
+    lhs_num_rows += bs->cols[i].size;
   }
 
   int r = 0;
@@ -112,7 +112,7 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Init(
   // the way also compute the amount of space each chunk will need
   // to perform the elimination.
   while (r < num_row_blocks) {
-    const int chunk_block_id = bs->rows[r].cells[0].block_id;
+    const int chunk_block_id = bs->rows[r].cells.front().block_id;
     if (chunk_block_id >= num_eliminate_blocks_) {
       break;
     }
@@ -122,40 +122,30 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Init(
     chunk.size = 0;
     chunk.start = r;
     int buffer_size = 0;
-    const int e_block_size = bs->col_sizes[chunk_block_id];
+    const int e_block_size = bs->cols[chunk_block_id].size;
 
     // Add to the chunk until the first block in the row is
     // different than the one in the first row for the chunk.
     while (r + chunk.size < num_row_blocks) {
       const CompressedRow& row = bs->rows[r + chunk.size];
-      if (row.cells[0].block_id != chunk_block_id) {
+      if (row.cells.front().block_id != chunk_block_id) {
         break;
       }
 
       // Iterate over the blocks in the row, ignoring the first
       // block since it is the one to be eliminated.
-      for (int c = 1, cnt = row.num_cells; c < cnt; ++c) {
-        const Cell& cell = row.cells[c];      
-        for (const auto& i : chunk.buffer_layout) {
-          if (i.first == cell.block_id) {
-          	goto duplicate;
-          }
+      for (int c = 1; c < row.cells.size(); ++c) {
+        const Cell& cell = row.cells[c];
+        if (InsertIfNotPresent(
+                &(chunk.buffer_layout), cell.block_id, buffer_size)) {
+          buffer_size += e_block_size * bs->cols[cell.block_id].size;
         }
-        chunk.buffer_layout.emplace_back(cell.block_id, buffer_size);
-        buffer_size += e_block_size * bs->col_sizes[cell.block_id];
-duplicate:
-        ;
       }
 
       buffer_size_ = std::max(buffer_size, buffer_size_);
       ++chunk.size;
     }
 
-    std::sort(std::begin(chunk.buffer_layout), std::end(chunk.buffer_layout),
-      []( const auto& a, const auto& b ) {
-        return a.first < b.first;
-      }
-    );    
     CHECK_GT(chunk.size, 0);
     r += chunk.size;
   }
@@ -173,15 +163,11 @@ duplicate:
   // allocate buffer_size_ per thread.
   chunk_outer_product_buffer_.reset(new double[buffer_size_ * num_threads_]);
 
-#if 1
-  rhs_locks_.resize(num_col_blocks - num_eliminate_blocks_);
-#else
   STLDeleteElements(&rhs_locks_);
   rhs_locks_.resize(num_col_blocks - num_eliminate_blocks_);
   for (int i = 0; i < num_col_blocks - num_eliminate_blocks_; ++i) {
     rhs_locks_[i] = new Mutex;
   }
-#endif
 }
 
 template <int kRowBlockSize, int kEBlockSize, int kFBlockSize>
@@ -198,9 +184,7 @@ Eliminate(const BlockSparseMatrix* A,
   }
 
   const CompressedRowBlockStructure* bs = A->block_structure();
-  const auto& bs_col_sizes = bs->col_sizes;
-  const auto& bs_col_positions = bs->col_positions;
-  const int num_col_blocks = bs_col_sizes.size();
+  const int num_col_blocks = bs->cols.size();
 
   // Add the diagonal to the schur complement.
   if (D != NULL) {
@@ -211,15 +195,15 @@ Eliminate(const BlockSparseMatrix* A,
       CellInfo* cell_info = lhs->GetCell(block_id, block_id,
                                          &r, &c,
                                          &row_stride, &col_stride);
-      if (cell_info) {
-        const int block_size = bs_col_sizes[i];
+      if (cell_info != NULL) {
+        const int block_size = bs->cols[i].size;
         typename EigenTypes<Eigen::Dynamic>::ConstVectorRef
-          diag(D + bs_col_positions[i], block_size);
+            diag(D + bs->cols[i].position, block_size);
 
+        CeresMutexLock l(&cell_info->m);
         MatrixRef m(cell_info->values, row_stride, col_stride);
-        // Removed in 2.1+? CeresMutexLock l(&cell_info->m);
         m.block(r, c, block_size, block_size).diagonal()
-          += diag.array().square().matrix();
+            += diag.array().square().matrix();
       }
     }
   }
@@ -238,28 +222,13 @@ Eliminate(const BlockSparseMatrix* A,
   // block. EliminateRowOuterProduct does the corresponding operation
   // for the lhs of the reduced linear system.
 
-  MatrixType matrix_type;
-  if (typeid(*lhs) == typeid(BlockRandomAccessDenseMatrix)) {
-    matrix_type = eDense;
-  } else if (typeid(*lhs) == typeid(BlockRandomAccessDiagonalMatrix)) {
-    matrix_type = eDiagonal;
-  } else if (typeid(*lhs) == typeid(BlockRandomAccessSparseMatrix)) {
-    matrix_type = eSparse;
-  } else {
-    throw "Unknown matrix lhs.";
-  }
-
   int ncores = num_threads_;
   if (ncores > 1) {
-  SetEnvironmentVariableA( "OMP_PROC_BIND", "true" );
-  SetEnvironmentVariableA( "OMP_PLACES", "cores" );
-    ncores = std::max(ncores/4, 1); // 2 too much, 3 not better, 6 not better.
+    ncores = std::max(ncores / 4, 1); // 2 too much, 3 not better, 6 not better.
   }
 
-  const int cnt = chunks_.size();
-  
 #pragma omp parallel for num_threads(ncores) schedule(dynamic)
-  for (int i = 0; i < cnt; ++i) {
+  for (int i = 0; i < chunks_.size(); ++i) {
 #ifdef CERES_USE_OPENMP
     int thread_id = omp_get_thread_num();
 #else
@@ -267,24 +236,23 @@ Eliminate(const BlockSparseMatrix* A,
 #endif
     double* buffer = buffer_.get() + thread_id * buffer_size_;
     const Chunk& chunk = chunks_[i];
-    const auto chunk_start = chunk.start;
-    const int e_block_id = bs->rows[chunk_start].cells[0].block_id;
-    const int e_block_size = bs_col_sizes[e_block_id];
+    const int e_block_id = bs->rows[chunk.start].cells.front().block_id;
+    const int e_block_size = bs->cols[e_block_id].size;
 
     VectorRef(buffer, buffer_size_).setZero();
 
     typename EigenTypes<kEBlockSize, kEBlockSize>::Matrix
-      ete(e_block_size, e_block_size);
+        ete(e_block_size, e_block_size);
 
     if (D != NULL) {
       const typename EigenTypes<kEBlockSize>::ConstVectorRef
-        diag(D + bs_col_positions[e_block_id], e_block_size);
+          diag(D + bs->cols[e_block_id].position, e_block_size);
       ete = diag.array().square().matrix().asDiagonal();
     } else {
       ete.setZero();
     }
 
-    FixedArray<double, 10, 0 /* No init */> g(e_block_size);
+    FixedArray<double, 8> g(e_block_size);
     typename EigenTypes<kEBlockSize>::VectorRef gref(g.get(), e_block_size);
     gref.setZero();
 
@@ -301,7 +269,7 @@ Eliminate(const BlockSparseMatrix* A,
     // in this chunk (g) and add the outer product of the f_blocks to
     // Schur complement (S += F'F).
     ChunkDiagonalBlockAndGradient(
-        chunk, A, b, chunk_start, &ete, g.get(), buffer, lhs, matrix_type);
+        chunk, A, b, chunk.start, &ete, g.get(), buffer, lhs);
 
     // Normally one wouldn't compute the inverse explicitly, but
     // e_block_size will typically be a small number like 3, in
@@ -309,40 +277,30 @@ Eliminate(const BlockSparseMatrix* A,
     // use it to multiply other matrices/vectors instead of doing a
     // Solve call over and over again.
     typename EigenTypes<kEBlockSize, kEBlockSize>::Matrix inverse_ete =
-      InvertPSDMatrix<kEBlockSize>(assume_full_rank_ete_, ete);
+        InvertPSDMatrix<kEBlockSize>(assume_full_rank_ete_, ete);
 
     // For the current chunk compute and update the rhs of the reduced
     // linear system.
     //
     //   rhs = F'b - F'E(E'E)^(-1) E'b
 
-    FixedArray<double, 10, 0 /* No init */> inverse_ete_g(e_block_size);
+    FixedArray<double, 8> inverse_ete_g(e_block_size);
     MatrixVectorMultiply<kEBlockSize, kEBlockSize, 0>(
-      inverse_ete.data(),
-      e_block_size,
-      e_block_size,
-      g.get(),
-      inverse_ete_g.get());
+        inverse_ete.data(),
+        e_block_size,
+        e_block_size,
+        g.get(),
+        inverse_ete_g.get());
 
-    UpdateRhs(chunk, A, b, chunk_start, inverse_ete_g.get(), rhs);
+    UpdateRhs(chunk, A, b, chunk.start, inverse_ete_g.get(), rhs);
 
     // S -= F'E(E'E)^{-1}E'F
-    if (eDense == matrix_type) {
-      ChunkOuterProduct<BlockRandomAccessDenseMatrix>(bs, inverse_ete, buffer, chunk.buffer_layout, (BlockRandomAccessDenseMatrix*) lhs, thread_id);
-    } else if (eDiagonal == matrix_type) {
-      ChunkOuterProduct<BlockRandomAccessDiagonalMatrix>(bs, inverse_ete, buffer, chunk.buffer_layout, (BlockRandomAccessDiagonalMatrix*) lhs, thread_id);
-    } else {
-      ChunkOuterProduct<BlockRandomAccessSparseMatrix>(bs, inverse_ete, buffer, chunk.buffer_layout, (BlockRandomAccessSparseMatrix*) lhs, thread_id);
-    }
+    ChunkOuterProduct(bs, inverse_ete, buffer, chunk.buffer_layout, lhs);
   }
 
   // For rows with no e_blocks, the schur complement update reduces to
   // S += F'F.
   NoEBlockRowsUpdate(A, b,  uneliminated_row_begins_, lhs, rhs);
-
-  if (ncores > 1) {
-  SetEnvironmentVariableA( "OMP_PROC_BIND", "false" );
-  }
 }
 
 template <int kRowBlockSize, int kEBlockSize, int kFBlockSize>
@@ -353,106 +311,67 @@ BackSubstitute(const BlockSparseMatrix* A,
                const double* D,
                const double* z,
                double* y) {
-  const CompressedRowBlockStructure* __restrict bs = A->block_structure();
-  const double* values = A->values();
-  const int cnt = (int) chunks_.size();
-  const auto& bs_rows = bs->rows;
-  const auto& bs_col_sizes = bs->col_sizes;
-  const auto& bs_col_positions = bs->col_positions;
-
+  const CompressedRowBlockStructure* bs = A->block_structure();
   int ncores = num_threads_;
   if (ncores > 1) {
-    SetEnvironmentVariableA("OMP_PROC_BIND", "true");
-    SetEnvironmentVariableA("OMP_PLACES", "cores");
-    ncores = std::max(ncores/4, 1);
+    ncores = std::max(ncores / 4, 1);
   }
 #pragma omp parallel for num_threads(ncores) schedule(dynamic)
-  for (int i = 0; i < cnt; ++i) {
+  for (int i = 0; i < chunks_.size(); ++i) {
     const Chunk& chunk = chunks_[i];
-    const auto chunk_start = chunk.start;
-    const int e_block_id = bs_rows[chunk_start].cells[0].block_id;
-    const auto e_block_size = bs_col_sizes[e_block_id];
-    const auto e_block_position = bs_col_positions[e_block_id];
+    const int e_block_id = bs->rows[chunk.start].cells.front().block_id;
+    const int e_block_size = bs->cols[e_block_id].size;
 
-    double* y_ptr = y + e_block_position;
+    double* y_ptr = y +  bs->cols[e_block_id].position;
     typename EigenTypes<kEBlockSize>::VectorRef y_block(y_ptr, e_block_size);
 
     typename EigenTypes<kEBlockSize, kEBlockSize>::Matrix
         ete(e_block_size, e_block_size);
     if (D != NULL) {
       const typename EigenTypes<kEBlockSize>::ConstVectorRef
-          diag(D + e_block_position, e_block_size);
+          diag(D + bs->cols[e_block_id].position, e_block_size);
       ete = diag.array().square().matrix().asDiagonal();
     } else {
       ete.setZero();
     }
 
-    SmallBiasHelper sbhOuter1;
-    sbhOuter1.num_col_a_ = e_block_size;
-    sbhOuter1.C_ = y_ptr;
-
-    SmallBiasHelper sbhOuter2;
-    sbhOuter2.num_col_a_ = e_block_size;
-    sbhOuter2.num_col_b_ = e_block_size;
-    sbhOuter2.cih_.r_ = 0;
-    sbhOuter2.cih_.c_ = 0;
-    sbhOuter2.cih_.row_stride_ = e_block_size;
-    sbhOuter2.cih_.col_stride_ = e_block_size;
-    sbhOuter2.C_ = ete.data();
-
-    SmallBiasHelper sbhInner;
-
-    for (int j = 0, cnt2 = chunk.size; j < cnt2; ++j) {
-      const CompressedRow& row = bs_rows[chunk_start + j];
-      const auto& row_cells = row.cells;
-      const int num_cells = row.num_cells;
-      const auto row_block_size = row.block.size;
-      const Cell& e_cell = row_cells[0];
-      const auto* e_cell_values = values + e_cell.position;
+    const double* values = A->values();
+    for (int j = 0; j < chunk.size; ++j) {
+      const CompressedRow& row = bs->rows[chunk.start + j];
+      const Cell& e_cell = row.cells.front();
       DCHECK_EQ(e_block_id, e_cell.block_id);
 
-      FixedArray<double, 10, 0 /* No init */> sj(row_block_size);
+      FixedArray<double, 8> sj(row.block.size);
 
-      typename EigenTypes<kRowBlockSize>::VectorRef(sj.get(), row_block_size) =
-        typename EigenTypes<kRowBlockSize>::ConstVectorRef
-        (b + row.block.position, row_block_size);
+      typename EigenTypes<kRowBlockSize>::VectorRef(sj.get(), row.block.size) =
+          typename EigenTypes<kRowBlockSize>::ConstVectorRef
+          (b + bs->rows[chunk.start + j].block.position, row.block.size);
 
-      sbhInner.num_row_a_ = row_block_size;
-      sbhInner.C_ = sj.get();
-
-      for (int c = 1, cnt3 = num_cells; c < cnt3; ++c) {
-        const auto& row_cell_c = row_cells[c];
-        const int f_block_id = row_cell_c.block_id;
-        const int f_block_size = bs_col_sizes[f_block_id];
+      for (int c = 1; c < row.cells.size(); ++c) {
+        const int f_block_id = row.cells[c].block_id;
+        const int f_block_size = bs->cols[f_block_id].size;
         const int r_block = f_block_id - num_eliminate_blocks_;
 
-        sbhInner.A_ = values + row_cell_c.position;
-        sbhInner.num_col_a_ = f_block_size;
-        sbhInner.B_ = z + lhs_row_layout_[r_block];
-
-        MatrixVectorMultiply2<kRowBlockSize, kFBlockSize, -1>(sbhInner);
+        MatrixVectorMultiply<kRowBlockSize, kFBlockSize, -1>(
+            values + row.cells[c].position, row.block.size, f_block_size,
+            z + lhs_row_layout_[r_block],
+            sj.get());
       }
 
-      sbhOuter1.A_ = e_cell_values;
-      sbhOuter1.num_row_a_ = row_block_size;
-      sbhOuter1.B_ = sj.get();
+      MatrixTransposeVectorMultiply<kRowBlockSize, kEBlockSize, 1>(
+          values + e_cell.position, row.block.size, e_block_size,
+          sj.get(),
+          y_ptr);
 
-      MatrixTransposeVectorMultiply2<kRowBlockSize, kEBlockSize, 1>(sbhOuter1);
-
-      sbhOuter2.A_ = e_cell_values;
-      sbhOuter2.num_row_a_ = row_block_size;
-      sbhOuter2.B_ = e_cell_values;
-      sbhOuter2.num_row_b_ = row_block_size;
-
-      MatrixTransposeMatrixMultiply2
-          <kRowBlockSize, kEBlockSize, kRowBlockSize, kEBlockSize, 1>(sbhOuter2);
+      MatrixTransposeMatrixMultiply
+          <kRowBlockSize, kEBlockSize, kRowBlockSize, kEBlockSize, 1>(
+              values + e_cell.position, row.block.size, e_block_size,
+              values + e_cell.position, row.block.size, e_block_size,
+              ete.data(), 0, 0, e_block_size, e_block_size);
     }
 
     y_block = InvertPSDMatrix<kEBlockSize>(assume_full_rank_ete_, ete)
         * y_block;
-  }
-  if (ncores > 1) {
-    SetEnvironmentVariableA("OMP_PROC_BIND", "false");
   }
 }
 
@@ -469,57 +388,34 @@ UpdateRhs(const Chunk& chunk,
           const double* inverse_ete_g,
           double* rhs) {
   const CompressedRowBlockStructure* bs = A->block_structure();
-  const auto& bs_rows = bs->rows;
-  const auto& bs_cols_sizes = bs->col_sizes;
+  const int e_block_id = bs->rows[chunk.start].cells.front().block_id;
+  const int e_block_size = bs->cols[e_block_id].size;
+
+  int b_pos = bs->rows[row_block_counter].block.position;
   const double* values = A->values();
-  const int e_block_id = bs_rows[chunk.start].cells[0].block_id;
-  const int e_block_size = bs_cols_sizes[e_block_id];
-
-  SmallBiasHelper sbhOuter;
-  sbhOuter.num_col_a_ = e_block_size;
-  sbhOuter.B_ = inverse_ete_g;
-
-  SmallBiasHelper sbhInner;
-
-  int b_pos = bs_rows[row_block_counter].block.position;
-  for (int j = 0, cnt = chunk.size; j < cnt; ++j) {
-    const CompressedRow& row = bs_rows[row_block_counter + j];
-    const auto row_block_size = row.block.size;
-    const Cell& e_cell = row.cells[ 0 ];
+  for (int j = 0; j < chunk.size; ++j) {
+    const CompressedRow& row = bs->rows[row_block_counter + j];
+    const Cell& e_cell = row.cells.front();
 
     typename EigenTypes<kRowBlockSize>::Vector sj =
-      typename EigenTypes<kRowBlockSize>::ConstVectorRef
-        (b + b_pos, row_block_size);
+        typename EigenTypes<kRowBlockSize>::ConstVectorRef
+        (b + b_pos, row.block.size);
 
-    sbhOuter.A_ = values + e_cell.position;
-    sbhOuter.num_row_a_ = row_block_size;
-    sbhOuter.C_ = sj.data();
+    MatrixVectorMultiply<kRowBlockSize, kEBlockSize, -1>(
+        values + e_cell.position, row.block.size, e_block_size,
+        inverse_ete_g, sj.data());
 
-    sbhInner.num_row_a_ = row_block_size;
-    sbhInner.B_ = sj.data();
-
-    MatrixVectorMultiply2<kRowBlockSize, kEBlockSize, -1>(sbhOuter);
-
-    for (int c = 1, cnt2 = row.num_cells; c < cnt2; ++c) {
-      const auto& row_cell_c = row.cells[c];
-      const int block_id = row_cell_c.block_id;
-      sbhInner.num_col_a_ = bs_cols_sizes[block_id];
+    for (int c = 1; c < row.cells.size(); ++c) {
+      const int block_id = row.cells[c].block_id;
+      const int block_size = bs->cols[block_id].size;
       const int block = block_id - num_eliminate_blocks_;
-      sbhInner.A_ = values + row_cell_c.position;
-      sbhInner.C_ = rhs + lhs_row_layout_[block];
-
-      auto& lock = rhs_locks_[block];
-      if (num_threads_ > 1) {
-        lock.Lock();
-      }
-
-      MatrixTransposeVectorMultiply2<kRowBlockSize, kFBlockSize, 1>(sbhInner);
-
-      if (num_threads_ > 1) {
-        lock.Unlock();
-      }
+      CeresMutexLock l(rhs_locks_[block]);
+      MatrixTransposeVectorMultiply<kRowBlockSize, kFBlockSize, 1>(
+          values + row.cells[c].position,
+          row.block.size, block_size,
+          sj.data(), rhs + lhs_row_layout_[block]);
     }
-    b_pos += row_block_size;
+    b_pos += row.block.size;
   }
 }
 
@@ -553,104 +449,111 @@ ChunkDiagonalBlockAndGradient(
     typename EigenTypes<kEBlockSize, kEBlockSize>::Matrix* ete,
     double* g,
     double* buffer,
-    BlockRandomAccessMatrix* lhs,
-    MatrixType lhsType) {
+    BlockRandomAccessMatrix* lhs) {
   const CompressedRowBlockStructure* bs = A->block_structure();
-  const double* values = A->values();
-  const auto& bs_rows = bs->rows;
-  const auto& bs_cols_sizes = bs->col_sizes;
-  int b_pos = bs_rows[row_block_counter].block.position;
+
+  int b_pos = bs->rows[row_block_counter].block.position;
   const int e_block_size = ete->rows();
-  auto chunk_buffer_layout_start = std::begin(chunk.buffer_layout);
-  auto chunk_buffer_layout_end = std::end(chunk.buffer_layout);
-  std::pair<int, int> tmp;
-  SmallBiasHelper sbhOuter;
-  sbhOuter.num_col_a_ = e_block_size;
-  sbhOuter.num_col_b_ = e_block_size;
-  sbhOuter.C_ = ete->data();
-  sbhOuter.cih_.r_ = 0;
-  sbhOuter.cih_.c_ = 0;
-  sbhOuter.cih_.row_stride_ = e_block_size;
-  sbhOuter.cih_.col_stride_ = e_block_size;
-
-  SmallBiasHelper sbhOuterVector;
-  sbhOuterVector.num_col_a_ = e_block_size;
-  sbhOuterVector.C_ = g;
-
-  SmallBiasHelper sbhInner;
-  sbhInner.num_col_a_ = e_block_size;
-  sbhInner.cih_.r_ = 0;
-  sbhInner.cih_.c_ = 0;
-  sbhInner.cih_.row_stride_ = e_block_size;
 
   // Iterate over the rows in this chunk, for each row, compute the
   // contribution of its F blocks to the Schur complement, the
   // contribution of its E block to the matrix EE' (ete), and the
   // corresponding block in the gradient vector.
-  for (int j = 0, cnt = chunk.size; j < cnt; ++j) {
-    const CompressedRow& row = bs_rows[row_block_counter + j];
-    const auto& row_cells = row.cells;
-    const auto cnt2 = row.num_cells;
-    const auto row_block_size = row.block.size;
-    sbhOuter.num_row_a_ = row_block_size;
-    sbhOuter.num_row_b_ = row_block_size;
-    sbhOuterVector.num_row_a_ = row_block_size;
+  const double* values = A->values();
+  for (int j = 0; j < chunk.size; ++j) {
+    const CompressedRow& row = bs->rows[row_block_counter + j];
 
-    sbhInner.num_row_a_ = row_block_size;
-    sbhInner.num_row_b_ = row_block_size;
-    const Cell& e_cell = row_cells[0];
-
-    if (cnt2 > 1) {
-      if (eDense == lhsType) {
-        EBlockRowOuterProduct<BlockRandomAccessDenseMatrix>(bs, values, row_block_counter + j, (BlockRandomAccessDenseMatrix*) lhs);
-      } else if (eDiagonal == lhsType) {
-        EBlockRowOuterProduct<BlockRandomAccessDiagonalMatrix>(bs, values, row_block_counter + j, (BlockRandomAccessDiagonalMatrix*) lhs);
-      } else {
-        EBlockRowOuterProduct<BlockRandomAccessSparseMatrix>(bs, values, row_block_counter + j, (BlockRandomAccessSparseMatrix*) lhs);
-      }
+    if (row.cells.size() > 1) {
+      EBlockRowOuterProduct(A, row_block_counter + j, lhs);
     }
 
-    const auto* e_cell_values = values + e_cell.position;
-
-    sbhOuter.A_ = e_cell_values;
-    sbhOuter.B_ = e_cell_values;
-    sbhOuterVector.A_ = e_cell_values;
-    sbhOuterVector.B_ = b + b_pos;
-    sbhInner.A_ = e_cell_values;
-
     // Extract the e_block, ETE += E_i' E_i
-    MatrixTransposeMatrixMultiply2
-      <kRowBlockSize, kEBlockSize, kRowBlockSize, kEBlockSize, 1>(sbhOuter);
+    const Cell& e_cell = row.cells.front();
+    MatrixTransposeMatrixMultiply
+        <kRowBlockSize, kEBlockSize, kRowBlockSize, kEBlockSize, 1>(
+            values + e_cell.position, row.block.size, e_block_size,
+            values + e_cell.position, row.block.size, e_block_size,
+            ete->data(), 0, 0, e_block_size, e_block_size);
 
     // g += E_i' b_i
-    MatrixTransposeVectorMultiply2<kRowBlockSize, kEBlockSize, 1>(sbhOuterVector);
+    MatrixTransposeVectorMultiply<kRowBlockSize, kEBlockSize, 1>(
+        values + e_cell.position, row.block.size, e_block_size,
+        b + b_pos,
+        g);
+
 
     // buffer = E'F. This computation is done by iterating over the
     // f_blocks for each row in the chunk.
-    for (size_t c = 1; c < cnt2; ++c) {
-      const auto& row_cell_c = row_cells[c];
-      const int f_block_id = row_cell_c.block_id;
-      const int f_block_size = bs_cols_sizes[f_block_id];
-      tmp.first = f_block_id;
-      const auto it = std::lower_bound(
-        chunk_buffer_layout_start,
-        chunk_buffer_layout_end,
-        tmp,
-        [](const auto& lhs, const auto& rhs)
-        {
-          return lhs.first < rhs.first;
-        }
-      );
-
-      sbhInner.B_ = values + row_cell_c.position;
-      sbhInner.num_col_b_ = f_block_size;
-      sbhInner.C_ = buffer + it->second;
-      sbhInner.cih_.col_stride_ = f_block_size;
-
-      MatrixTransposeMatrixMultiply2
-        <kRowBlockSize, kEBlockSize, kRowBlockSize, kFBlockSize, 1>(sbhInner);
+    for (int c = 1; c < row.cells.size(); ++c) {
+      const int f_block_id = row.cells[c].block_id;
+      const int f_block_size = bs->cols[f_block_id].size;
+      double* buffer_ptr =
+          buffer +  FindOrDie(chunk.buffer_layout, f_block_id);
+      MatrixTransposeMatrixMultiply
+          <kRowBlockSize, kEBlockSize, kRowBlockSize, kFBlockSize, 1>(
+          values + e_cell.position, row.block.size, e_block_size,
+          values + row.cells[c].position, row.block.size, f_block_size,
+          buffer_ptr, 0, 0, e_block_size, f_block_size);
     }
-    b_pos += row_block_size;
+    b_pos += row.block.size;
+  }
+}
+
+// Compute the outer product F'E(E'E)^{-1}E'F and subtract it from the
+// Schur complement matrix, i.e
+//
+//  S -= F'E(E'E)^{-1}E'F.
+template <int kRowBlockSize, int kEBlockSize, int kFBlockSize>
+void
+SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::
+ChunkOuterProduct(const CompressedRowBlockStructure* bs,
+                  const Matrix& inverse_ete,
+                  const double* buffer,
+                  const BufferLayoutType& buffer_layout,
+                  BlockRandomAccessMatrix* lhs) {
+  // This is the most computationally expensive part of this
+  // code. Profiling experiments reveal that the bottleneck is not the
+  // computation of the right-hand matrix product, but memory
+  // references to the left hand side.
+  const int e_block_size = inverse_ete.rows();
+  BufferLayoutType::const_iterator it1 = buffer_layout.begin();
+
+#ifdef CERES_USE_OPENMP
+  int thread_id = omp_get_thread_num();
+#else
+  int thread_id = 0;
+#endif
+  double* b1_transpose_inverse_ete =
+      chunk_outer_product_buffer_.get() + thread_id * buffer_size_;
+
+  // S(i,j) -= bi' * ete^{-1} b_j
+  for (; it1 != buffer_layout.end(); ++it1) {
+    const int block1 = it1->first - num_eliminate_blocks_;
+    const int block1_size = bs->cols[it1->first].size;
+    MatrixTransposeMatrixMultiply
+        <kEBlockSize, kFBlockSize, kEBlockSize, kEBlockSize, 0>(
+        buffer + it1->second, e_block_size, block1_size,
+        inverse_ete.data(), e_block_size, e_block_size,
+        b1_transpose_inverse_ete, 0, 0, block1_size, e_block_size);
+
+    BufferLayoutType::const_iterator it2 = it1;
+    for (; it2 != buffer_layout.end(); ++it2) {
+      const int block2 = it2->first - num_eliminate_blocks_;
+
+      int r, c, row_stride, col_stride;
+      CellInfo* cell_info = lhs->GetCell(block1, block2,
+                                         &r, &c,
+                                         &row_stride, &col_stride);
+      if (cell_info != NULL) {
+        const int block2_size = bs->cols[it2->first].size;
+        CeresMutexLock l(&cell_info->m);
+        MatrixMatrixMultiply
+            <kFBlockSize, kEBlockSize, kEBlockSize, kFBlockSize, -1>(
+                b1_transpose_inverse_ete, block1_size, e_block_size,
+                buffer  + it2->second, e_block_size, block2_size,
+                cell_info->values, r, c, row_stride, col_stride);
+      }
+    }
   }
 }
 
@@ -667,33 +570,18 @@ NoEBlockRowsUpdate(const BlockSparseMatrix* A,
                    double* rhs) {
   const CompressedRowBlockStructure* bs = A->block_structure();
   const double* values = A->values();
-  const auto& bs_rows = bs->rows;
-  const auto& bs_cols_sizes = bs->col_sizes;
-
-  SmallBiasHelper sbh;
-
-  for (int cnt = (int) bs_rows.size(); row_block_counter < cnt; ++row_block_counter) {
-    NoEBlockRowOuterProduct(A, row_block_counter, lhs);
-
-    const CompressedRow& row = bs_rows[row_block_counter];
-    const auto* row_cells = row.cells;
-    sbh.num_row_a_ = row.block.size;
-    sbh.B_ = b + row.block.position;
-
-    for (size_t c = 0, cnt2 = row.num_cells; c < cnt2; ++c) {
-      const auto& row_cell_c = row_cells[c];
-      const int block_id = row_cell_c.block_id;
-      const auto block_size = bs_cols_sizes[block_id];
-
-      sbh.A_ = values + row_cell_c.position;
-      sbh.num_col_a_ = block_size;
-
+  for (; row_block_counter < bs->rows.size(); ++row_block_counter) {
+    const CompressedRow& row = bs->rows[row_block_counter];
+    for (int c = 0; c < row.cells.size(); ++c) {
+      const int block_id = row.cells[c].block_id;
+      const int block_size = bs->cols[block_id].size;
       const int block = block_id - num_eliminate_blocks_;
-
-      sbh.C_ = rhs + lhs_row_layout_[block];
-
-      MatrixTransposeVectorMultiply2<Eigen::Dynamic, Eigen::Dynamic, 1>(sbh);
+      MatrixTransposeVectorMultiply<Eigen::Dynamic, Eigen::Dynamic, 1>(
+          values + row.cells[c].position, row.block.size, block_size,
+          b + row.block.position,
+          rhs + lhs_row_layout_[block]);
     }
+    NoEBlockRowOuterProduct(A, row_block_counter, lhs);
   }
 }
 
@@ -705,7 +593,7 @@ NoEBlockRowsUpdate(const BlockSparseMatrix* A,
 // one difference. It does not use any of the template
 // parameters. This is because the algorithm used for detecting the
 // static structure of the matrix A only pays attention to rows with
-// e_blocks. This is because rows without e_blocks are rare and
+// e_blocks. This is becase rows without e_blocks are rare and
 // typically arise from regularization terms in the original
 // optimization problem, and have a very different structure than the
 // rows with e_blocks. Including them in the static structure
@@ -720,80 +608,96 @@ NoEBlockRowOuterProduct(const BlockSparseMatrix* A,
                         BlockRandomAccessMatrix* lhs) {
   const CompressedRowBlockStructure* bs = A->block_structure();
   const CompressedRow& row = bs->rows[row_block_index];
-  const auto& bs_col_sizes = bs->col_sizes;
-  const auto row_block_size = row.block.size;
   const double* values = A->values();
-  const auto& row_cells = row.cells;
-
-  SmallBiasHelper sbhOuter;
-  sbhOuter.num_row_a_ = row_block_size;
-  sbhOuter.num_row_b_ = row_block_size;
-
-  SmallBiasHelper sbhInner;
-  sbhInner.num_row_a_ = row_block_size;
-  sbhInner.num_row_b_ = row_block_size;
-
-  for (size_t i = 0, cnt = row.num_cells; i < cnt; ++i) {
-    const auto& row_cell_i = row_cells[i];
-    const double* row_cell_i_values_position = values + row_cell_i.position;
-    const int block1 = row_cell_i.block_id - num_eliminate_blocks_;
+  for (int i = 0; i < row.cells.size(); ++i) {
+    const int block1 = row.cells[i].block_id - num_eliminate_blocks_;
     DCHECK_GE(block1, 0);
 
-    const int block1_size = bs_col_sizes[row_cell_i.block_id];
-    sbhInner.num_col_a_ = block1_size;
-    sbhInner.A_ = row_cell_i_values_position;
-
-    CellInfo* __restrict cell_info = lhs->GetCell(block1, block1,
-                                                  &sbhOuter.cih_.r_, &sbhOuter.cih_.c_,
-                                                  &sbhOuter.cih_.row_stride_, &sbhOuter.cih_.col_stride_);
-    if (cell_info) {
-      sbhOuter.A_ = row_cell_i_values_position;
-      sbhOuter.num_col_a_ = block1_size;
-      sbhOuter.B_ = row_cell_i_values_position;
-      sbhOuter.num_col_b_ = block1_size;
-      sbhOuter.C_ = cell_info->values;
-
-      auto& lock = cell_info->m;
-      if (num_threads_ > 1) {
-        lock.Lock();
-      }
-
+    const int block1_size = bs->cols[row.cells[i].block_id].size;
+    int r, c, row_stride, col_stride;
+    CellInfo* cell_info = lhs->GetCell(block1, block1,
+                                       &r, &c,
+                                       &row_stride, &col_stride);
+    if (cell_info != NULL) {
+      CeresMutexLock l(&cell_info->m);
       // This multiply currently ignores the fact that this is a
       // symmetric outer product.
-      MatrixTransposeMatrixMultiply2
-          <Eigen::Dynamic, Eigen::Dynamic, Eigen::Dynamic, Eigen::Dynamic, 1>(sbhOuter);
-
-      if (num_threads_ > 1) {
-        lock.Unlock();
-      }
+      MatrixTransposeMatrixMultiply
+          <Eigen::Dynamic, Eigen::Dynamic, Eigen::Dynamic, Eigen::Dynamic, 1>(
+              values + row.cells[i].position, row.block.size, block1_size,
+              values + row.cells[i].position, row.block.size, block1_size,
+              cell_info->values, r, c, row_stride, col_stride);
     }
 
-    lhs->PrepareGetCellHelper(sbhInner.cih_, block1);
-
-    for (size_t j = i + 1; j < cnt; ++j) {
-      const auto& row_cell_j = row_cells[j];
-
-      const int block2 = row_cell_j.block_id - num_eliminate_blocks_;
+    for (int j = i + 1; j < row.cells.size(); ++j) {
+      const int block2 = row.cells[j].block_id - num_eliminate_blocks_;
       DCHECK_GE(block2, 0);
       DCHECK_LT(block1, block2);
-      CellInfo* __restrict cell_info = lhs->GetCellHelped(sbhInner.cih_, block2);
+      int r, c, row_stride, col_stride;
+      CellInfo* cell_info = lhs->GetCell(block1, block2,
+                                         &r, &c,
+                                         &row_stride, &col_stride);
+      if (cell_info != NULL) {
+        const int block2_size = bs->cols[row.cells[j].block_id].size;
+        CeresMutexLock l(&cell_info->m);
+        MatrixTransposeMatrixMultiply
+            <Eigen::Dynamic, Eigen::Dynamic, Eigen::Dynamic, Eigen::Dynamic, 1>(
+                values + row.cells[i].position, row.block.size, block1_size,
+                values + row.cells[j].position, row.block.size, block2_size,
+                cell_info->values, r, c, row_stride, col_stride);
+      }
+    }
+  }
+}
 
-      if (cell_info) {
-        sbhInner.B_ = values + row_cell_j.position;
-        sbhInner.num_col_b_ = bs_col_sizes[row_cell_j.block_id];
-        sbhInner.C_ = cell_info->values;
+// For a row with an e_block, compute the contribition S += F'F. This
+// function has the same structure as NoEBlockRowOuterProduct, except
+// that this function uses the template parameters.
+template <int kRowBlockSize, int kEBlockSize, int kFBlockSize>
+void
+SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::
+EBlockRowOuterProduct(const BlockSparseMatrix* A,
+                      int row_block_index,
+                      BlockRandomAccessMatrix* lhs) {
+  const CompressedRowBlockStructure* bs = A->block_structure();
+  const CompressedRow& row = bs->rows[row_block_index];
+  const double* values = A->values();
+  for (int i = 1; i < row.cells.size(); ++i) {
+    const int block1 = row.cells[i].block_id - num_eliminate_blocks_;
+    DCHECK_GE(block1, 0);
 
-        auto& lock = cell_info->m;
-        if (num_threads_ > 1) {
-          lock.Lock();
-        }
+    const int block1_size = bs->cols[row.cells[i].block_id].size;
+    int r, c, row_stride, col_stride;
+    CellInfo* cell_info = lhs->GetCell(block1, block1,
+                                       &r, &c,
+                                       &row_stride, &col_stride);
+    if (cell_info != NULL) {
+      CeresMutexLock l(&cell_info->m);
+      // block += b1.transpose() * b1;
+      MatrixTransposeMatrixMultiply
+          <kRowBlockSize, kFBlockSize, kRowBlockSize, kFBlockSize, 1>(
+          values + row.cells[i].position, row.block.size, block1_size,
+          values + row.cells[i].position, row.block.size, block1_size,
+          cell_info->values, r, c, row_stride, col_stride);
+    }
 
-        MatrixTransposeMatrixMultiply2
-            <Eigen::Dynamic, Eigen::Dynamic, Eigen::Dynamic, Eigen::Dynamic, 1>(sbhInner);
-
-        if (num_threads_ > 1) {
-          lock.Unlock();
-        }
+    for (int j = i + 1; j < row.cells.size(); ++j) {
+      const int block2 = row.cells[j].block_id - num_eliminate_blocks_;
+      DCHECK_GE(block2, 0);
+      DCHECK_LT(block1, block2);
+      const int block2_size = bs->cols[row.cells[j].block_id].size;
+      int r, c, row_stride, col_stride;
+      CellInfo* cell_info = lhs->GetCell(block1, block2,
+                                         &r, &c,
+                                         &row_stride, &col_stride);
+      if (cell_info != NULL) {
+        // block += b1.transpose() * b2;
+        CeresMutexLock l(&cell_info->m);
+        MatrixTransposeMatrixMultiply
+            <kRowBlockSize, kFBlockSize, kRowBlockSize, kFBlockSize, 1>(
+                values + row.cells[i].position, row.block.size, block1_size,
+                values + row.cells[j].position, row.block.size, block2_size,
+                cell_info->values, r, c, row_stride, col_stride);
       }
     }
   }

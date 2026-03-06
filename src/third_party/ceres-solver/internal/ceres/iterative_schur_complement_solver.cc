@@ -81,7 +81,7 @@ LinearSolver::Summary IterativeSchurComplementSolver::SolveImpl(
   schur_complement_->Init(*A, per_solve_options.D, b);
 
   const int num_schur_complement_blocks =
-      A->block_structure()->col_sizes.size() - num_eliminate_blocks;
+      A->block_structure()->cols.size() - num_eliminate_blocks;
   if (num_schur_complement_blocks == 0) {
     VLOG(2) << "No parameter blocks left in the schur complement.";
     LinearSolver::Summary summary;

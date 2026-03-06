@@ -33,7 +33,6 @@ namespace radial_distortion
 * @param epsilon Error driven threshold
 * @return Best radius
 */
-
 template <class Disto_Functor>
 double bisection_Radius_Solve(
   const std::vector<double> & params, // radial distortion parameters
@@ -58,43 +57,6 @@ double bisection_Radius_Solve(
   {
     const double mid = .5 * ( lowerbound + upbound );
     if ( functor( params, mid ) > r2 )
-    {
-      upbound = mid;
-    }
-    else
-    {
-      lowerbound = mid;
-    }
-  }
-  return .5 * ( lowerbound + upbound );
-}
-
-template <class Disto_Functor>
-double bisection_Radius_Solve2(
-  double k1, // radial distortion parameters
-  double k2,
-  double k3,
-  double r2, // targeted radius
-  Disto_Functor & functor,
-  double epsilon = 1e-5 // Was 1e-10 10 // criteria to stop the bisection
-)
-{
-  // Guess plausible upper and lower bound
-  double lowerbound = r2, upbound = r2;
-  while ( functor( k1, k2, k3, lowerbound ) > r2 )
-  {
-    lowerbound /= 1.05;
-  }
-  while ( functor( k1, k2, k3, upbound ) < r2 )
-  {
-    upbound *= 1.05;
-  }
-
-  // Perform a bisection until epsilon accuracy is not reached
-  while ( epsilon < upbound - lowerbound )
-  {
-    const double mid = .5 * ( lowerbound + upbound );
-    if ( functor( k1, k2, k3, mid ) > r2 )
     {
       upbound = mid;
     }
@@ -325,9 +287,7 @@ class Pinhole_Intrinsic_Radial_K3 : public Pinhole_Intrinsic
   protected:
     // center of distortion is applied by the Intrinsics class
     /// K1, K2, K3
-    double K1_;
-    double K2_;
-    double K3_;
+    std::vector<double> params_;
 
   public:
 
@@ -347,9 +307,7 @@ class Pinhole_Intrinsic_Radial_K3 : public Pinhole_Intrinsic
       double focal = 0.0, double ppx = 0, double ppy = 0,
       double k1 = 0.0, double k2 = 0.0, double k3 = 0.0 )
       : Pinhole_Intrinsic( w, h, focal, ppx, ppy ),
-        K1_{ k1 },
-        K2_{ k2 },
-        K3_{ k3 }
+        params_({k1, k2, k3})
     {
     }
 
@@ -380,10 +338,12 @@ class Pinhole_Intrinsic_Radial_K3 : public Pinhole_Intrinsic
     */
     Vec2 add_disto( const Vec2 & p ) const override
     {
+      const double & k1 = params_[0], & k2 = params_[1], & k3 = params_[2];
+
       const double r2 = p( 0 ) * p( 0 ) + p( 1 ) * p( 1 );
       const double r4 = r2 * r2;
       const double r6 = r4 * r2;
-      const double r_coeff = ( 1. + K1_ * r2 + K2_ * r4 + K3_ * r6 );
+      const double r_coeff = ( 1. + k1 * r2 + k2 * r4 + k3 * r6 );
 
       return ( p * r_coeff );
     }
@@ -401,7 +361,7 @@ class Pinhole_Intrinsic_Radial_K3 : public Pinhole_Intrinsic
       const double r2 = p( 0 ) * p( 0 ) + p( 1 ) * p( 1 );
       const double radius = ( r2 == 0 ) ? //1. : ::sqrt(bisectionSolve(_params, r2) / r2);
                             1. :
-                            ::sqrt( radial_distortion::bisection_Radius_Solve2( K1_, K2_, K3_, r2, distoFunctor ) / r2 );
+                            ::sqrt( radial_distortion::bisection_Radius_Solve( params_, r2, distoFunctor ) / r2 );
       return radius * p;
     }
 
@@ -411,8 +371,9 @@ class Pinhole_Intrinsic_Radial_K3 : public Pinhole_Intrinsic
     */
     std::vector<double> getParams() const override
     {
-      const auto& pp = Pinhole_Intrinsic::principal_point();
-      return { Pinhole_Intrinsic::focal(), pp[ 0 ], pp[ 1 ], K1_, K2_, K3_ };
+      std::vector<double> params = Pinhole_Intrinsic::getParams();
+      params.insert( params.end(), std::begin(params_), std::end(params_));
+      return params;
     }
 
     /**
@@ -517,8 +478,9 @@ class Pinhole_Intrinsic_Radial_K3 : public Pinhole_Intrinsic
     * @param r2 square distance (relative to center)
     * @return distance
     */
-    static inline double distoFunctor( double k1, double k2, double k3, double r2 )
+    static inline double distoFunctor( const std::vector<double> & params, double r2 )
     {
+      const double & k1 = params[0], & k2 = params[1], & k3 = params[2];
       return r2 * Square( 1. + r2 * ( k1 + r2 * ( k2 + r2 * k3 ) ) );
     }
 };

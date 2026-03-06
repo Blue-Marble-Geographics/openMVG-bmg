@@ -78,7 +78,7 @@ LinearSolver::Summary SparseNormalCholeskySolver::SolveImpl(
     // it before returning the matrix to the user.
     scoped_ptr<BlockSparseMatrix> regularizer;
     regularizer.reset(BlockSparseMatrix::CreateDiagonalMatrix(
-        per_solve_options.D, A->block_structure()->col_sizes, A->block_structure()->col_positions));
+        per_solve_options.D, A->block_structure()->cols));
     event_logger.AddEvent("Diagonal");
     A->AppendRows(*regularizer);
     event_logger.AddEvent("Append");
@@ -98,7 +98,7 @@ LinearSolver::Summary SparseNormalCholeskySolver::SolveImpl(
   // TODO(sameeragarwal):
 
   if (per_solve_options.D != NULL) {
-    A->DeleteRowBlocks(A->block_structure()->col_sizes.size());
+    A->DeleteRowBlocks(A->block_structure()->cols.size());
   }
   summary.termination_type = sparse_cholesky_->FactorAndSolve(
       inner_product_computer_->mutable_result(), x, x, &summary.message);

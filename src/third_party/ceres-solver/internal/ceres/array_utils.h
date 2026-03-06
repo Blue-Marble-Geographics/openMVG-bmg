@@ -45,25 +45,13 @@
 
 #include <string>
 #include "ceres/internal/port.h"
-#include "ceres/types.h"
 
 namespace ceres {
 namespace internal {
 
-static double fill_value = kImpossibleValue;
 // Fill the array x with an impossible value that the user code is
 // never expected to compute.
-enum eIAChecking : bool { eUnsafe = false, eSafe = true };
-template<eIAChecking T = eSafe>
-void InvalidateArray(const int size, double* const __restrict x) {
-  if ((T == eSafe) && !x) {
-    return;
-  }
-
-  for (int i = 0; i < size; ++i) {
-    x[i] = kImpossibleValue;
-  }
-}
+void InvalidateArray(int size, double* x);
 
 // Check if all the entries of the array x are valid, i.e. all the
 // values in the array should be finite and none of them should be

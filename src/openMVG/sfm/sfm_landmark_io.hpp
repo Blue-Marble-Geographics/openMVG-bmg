@@ -34,39 +34,11 @@ void openMVG::sfm::Observation::load( Archive & ar)
 
 
 template <class Archive>
-void openMVG::sfm::ObservationKeyValue_t::save(Archive& ar) const
-{
-  ar(cereal::make_nvp("key", first));
-  ar(cereal::make_nvp("value", second));
-}
-
-template <class Archive>
-void openMVG::sfm::ObservationKeyValue_t::load(Archive& ar)
-{
-  ar(cereal::make_nvp("key", first));
-  ar(cereal::make_nvp("value", second));
-}
-
-template <class Archive>
-void openMVG::sfm::Observations::save(Archive& ar) const
-{
-  ar(cereal::make_nvp("sorted", sorted));
-  ar(cereal::make_nvp("obs", obs));
-}
-
-template <class Archive>
-void openMVG::sfm::Observations::load( Archive & ar)
-{
-  ar(cereal::make_nvp("sorted", sorted ));
-  ar(cereal::make_nvp("obs", obs));
-}
-
-template <class Archive>
 void openMVG::sfm::Landmark::save( Archive & ar) const
 {
   const std::vector<double> point { X(0), X(1), X(2) };
   ar(cereal::make_nvp("X", point ));
-  ar(cereal::make_nvp("obs", obs));
+  ar(cereal::make_nvp("observations", obs));
 }
 
 
@@ -76,7 +48,7 @@ void openMVG::sfm::Landmark::load( Archive & ar)
   std::vector<double> point(3);
   ar(cereal::make_nvp("X", point ));
   X = Eigen::Map<const Vec3>(&point[0]);
-  ar(cereal::make_nvp("obs", obs));
+  ar(cereal::make_nvp("observations", obs));
 }
 
 #endif // OPENMVG_SFM_SFM_LANDMARK_IO_HPP

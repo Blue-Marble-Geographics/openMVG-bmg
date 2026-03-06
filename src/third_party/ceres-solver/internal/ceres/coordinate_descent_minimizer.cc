@@ -67,9 +67,6 @@ bool CoordinateDescentMinimizer::Init(
     const ProblemImpl::ParameterMap& parameter_map,
     const ParameterBlockOrdering& ordering,
     string* error) {
-#if 1 // JPB WIP BUG
-  throw std::runtime_error("Unsupported");
-#else
   parameter_blocks_.clear();
   independent_set_offsets_.clear();
   independent_set_offsets_.push_back(0);
@@ -77,8 +74,8 @@ bool CoordinateDescentMinimizer::Init(
   // Serialize the OrderedGroups into a vector of parameter block
   // offsets for parallel access.
   map<ParameterBlock*, int> parameter_block_index;
-  auto group_to_elements = ordering.group_to_elements();
-  for (auto it = group_to_elements.begin();
+  map<int, set<double*> > group_to_elements = ordering.group_to_elements();
+  for (map<int, set<double*> >::const_iterator it = group_to_elements.begin();
        it != group_to_elements.end();
        ++it) {
     for (set<double*>::const_iterator ptr_it = it->second.begin();
@@ -123,7 +120,6 @@ bool CoordinateDescentMinimizer::Init(
   evaluator_options_.linear_solver_type = DENSE_QR;
   evaluator_options_.num_eliminate_blocks = 0;
   evaluator_options_.num_threads = 1;
-#endif
 
   return true;
 }
@@ -249,14 +245,11 @@ bool CoordinateDescentMinimizer::IsOrderingValid(
     const Program& program,
     const ParameterBlockOrdering& ordering,
     string* message) {
-#if 1 // JPB WIP BUG
-  throw std::runtime_error("Unsupported");
-#else
-  const auto& group_to_elements =
+  const map<int, set<double*> >& group_to_elements =
       ordering.group_to_elements();
 
   // Verify that each group is an independent set
-  auto it = group_to_elements.begin();
+  map<int, set<double*> >::const_iterator it = group_to_elements.begin();
   for (; it != group_to_elements.end(); ++it) {
     if (!program.IsParameterBlockSetIndependent(it->second)) {
       *message =
@@ -266,7 +259,6 @@ bool CoordinateDescentMinimizer::IsOrderingValid(
       return false;
     }
   }
-#endif
   return true;
 }
 

@@ -96,17 +96,6 @@ struct CellInfo {
   Mutex m;
 };
 
-struct CellInfoHelper
-{
-  int r_;
-  int c_;
-  int row_stride_;
-  int col_stride_;
-  int row_block_id_;
-  int64_t addr_;
-  CellInfo* cell_info_;
-};
-
 class BlockRandomAccessMatrix {
  public:
   virtual ~BlockRandomAccessMatrix();
@@ -126,12 +115,6 @@ class BlockRandomAccessMatrix {
                             int* col,
                             int* row_stride,
                             int* col_stride) = 0;
-
-  virtual CellInfo* GetCellHelped(CellInfoHelper& cih,
-                                  int col_block_id) = 0;
-
-  virtual void PrepareGetCellHelper(CellInfoHelper& cih,
-                                    const int row_block_id) = 0;
 
   // Zero out the values of the array. The structure of the matrix
   // (size and sparsity) is preserved.

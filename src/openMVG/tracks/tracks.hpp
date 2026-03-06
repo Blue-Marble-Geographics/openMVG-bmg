@@ -42,8 +42,6 @@
 #include <map>
 #include <memory>
 #include <set>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -51,192 +49,15 @@
 #include "openMVG/tracks/flat_pair_map.hpp"
 #include "openMVG/tracks/union_find.hpp"
 
-template<class T>
-struct Mallocator2
-{
-  Mallocator2* copyAllocator = nullptr;
-  Mallocator2<T>* rebindAllocator = nullptr;
-
-  typedef T value_type;
-
-  template <typename U>
-  struct rebind
-  {
-    using other = Mallocator2<U>;
-  };
-  Mallocator2() = default;
-
-  Mallocator2(Mallocator2& allocator) :
-    copyAllocator(&Mallocator2)
-  {
-  }
-
-  template <class U>
-  Mallocator2(const Mallocator2<U>& other)
-  {
-    if (!std::is_same<T, U>::value)
-      rebindAllocator = new Mallocator2<T>();
-  }
-
-  bool operator==(const Mallocator2&) const noexcept
-  {
-    return true;
-  }
-  bool operator!=(const Mallocator2&) const noexcept
-  {
-    return false;
-  }
-
-  template <typename T>
-  std::unique_ptr<T> make_unique_uninitialized(const std::size_t size) {
-    return std::unique_ptr<T>(new typename std::remove_extent<T>::type[size]);
-  }
-
-  enum { kChunkSize = 4096 };
-  T* allocate(std::size_t n)
-  {
-    if (copyAllocator)
-      return copyAllocator->allocate(n);
-
-    if (rebindAllocator)
-      return rebindAllocator->allocate(n);
-
-    size_t num_bytes = sizeof(T)* n;
-
-    if (chunks.empty() || ( space_used + num_bytes ) > kChunkSize) {
-      //cerr << "alloc " << kChunkSize << " calls\n";
-      chunks.push_back(make_unique_uninitialized<uint8_t[]>(kChunkSize));
-      space_used = 0;
-    }
-
-    T* addr = (T*)&chunks.back()[space_used];
-    space_used += num_bytes;
-
-    return reinterpret_cast<typename std::allocator<T>::pointer>( addr );
-  }
-
-  void deallocate(T* p, std::size_t n) noexcept
-  {
-    if (copyAllocator) {
-      copyAllocator->deallocate(p, n);
-      return;
-    }
-
-    if (rebindAllocator) {
-      rebindAllocator->deallocate(p, n);
-      return;
-    }
-  }
-
-private:
-  // Can't use deque... it invalidates.
-  size_t space_used = 0;
-  std::list<std::unique_ptr<uint8_t[]>> chunks;
-};
-
-using Track_t = std::set<uint32_t, std::less<uint32_t>, Mallocator2<uint32_t> >;
-
 namespace openMVG  {
 
 namespace tracks  {
 
 // Data structure to store a track: collection of {ImageId,FeatureId}
 //  The corresponding image points with their imageId and FeatureId.
-struct submapTrack
-{
-  using iterator = std::pair<uint32_t, uint32_t>*;
-  using const_iterator = const std::pair<uint32_t, uint32_t>*;
-
-  const_iterator cbegin() const noexcept { return data.data(); }
-  const_iterator cend() const noexcept { return data.data() + data.size(); }
-  const_iterator begin() const noexcept { return cbegin(); }
-  const_iterator end() const noexcept { return cend(); }
-  iterator begin() noexcept { return data.data(); }
-  iterator end() noexcept { return data.data() + data.size(); }
-
-  void clear() noexcept { data.clear(); }
-  bool empty() const noexcept { return data.empty(); }
-  auto size() const noexcept { return data.size(); }
-
-  const uint32_t& at( IndexT i ) const
-  {
-    for ( auto& ob : data ) {
-      if ( i == ob.first ) {
-        return ob.second;
-      }
-    }
-
-    throw std::out_of_range( "submapTrack" );
-  }
-
-  std::pair<iterator, bool> insert( const std::pair<uint32_t, uint32_t>& value )
-  {
-    for ( auto& ob : data ) {
-      if ( value.first == ob.first ) {
-        ob.second = value.second;
-        return { &ob, false };
-      }
-    }
-
-    data.emplace_back( value.first, value.second );
-
-    sorted = false;
-
-    return { &data.back(), true };
-  }
-
-  std::pair<iterator, bool> insert( const_iterator hint, const std::pair<uint32_t, uint32_t>& value )
-  {
-    for ( auto& ob : data ) {
-      if ( value.first == ob.first ) {
-        ob.second = value.second;
-        return { &ob, false };
-      }
-    }
-
-    data.emplace_back( value.first, value.second );
-
-    sorted = false;
-
-    return { &data.back(), true };
-  }
-
-  const_iterator find( IndexT ob ) const noexcept
-  {
-    return std::find_if(
-      begin(),
-      end(),
-      [ob](const auto& it)
-      {
-        return it.first == ob;
-      }
-    );
-  }
-
-  uint32_t& operator[]( IndexT i )
-  {
-    for ( auto& ob : data ) {
-      if ( i == ob.first ) {
-        return ob.second;
-      }
-    }
-
-    data.emplace_back( i, uint32_t() );
-
-    sorted = false;
-
-    return data.back().second;
-  }
-
-
-  bool sorted = false;
-  std::vector<std::pair<uint32_t, uint32_t>> data;
-};
-
-
-//using submapTrack = std::map<uint32_t, uint32_t>;
+using submapTrack = std::map<uint32_t, uint32_t>;
 // A track is a collection of {trackId, submapTrack}
-using STLMAPTracks = std::unordered_map<uint32_t, submapTrack>;
+using STLMAPTracks = std::map<uint32_t, submapTrack>;
 
 struct TracksBuilder
 {
@@ -250,10 +71,8 @@ struct TracksBuilder
   {
     // 1. We need to know how much single set we will have.
     //   i.e each set is made of a tuple : (imageIndex, featureIndex)
-    // JPB Fails as unordered_set
     std::set<indexedFeaturePair> allFeatures;
     // For each couple of images list the used features
-
     for ( const auto & iter : map_pair_wise_matches )
     {
       const auto & I = iter.first.first;
@@ -301,156 +120,11 @@ struct TracksBuilder
     }
   }
 
-  // Not a drop-in replacement for Set.
-  // Not fully featured.
-  template<class T, int N>
-  class SmallSet_t
-  {
-    int cnt_ = 0;
-    union HybridSet_t
-    {
-      std::unordered_set<T>* asSet_;
-      std::array<T, N>       asArray_;
-    } impl_;
-
-public:
-    ~SmallSet_t()
-    {
-      if (cnt_ > N)
-      {
-        delete impl_.asSet_;
-      }
-    }
-
-    int size() const { return cnt_; }
-
-    // Return false if element already exists.
-    std::pair<const T*, bool> insert( const T& item )
-    {
-      if (cnt_ <= N)
-      {
-        for (int i = 0; i < cnt_; ++i)
-        {
-          if (impl_.asArray_[ i ] == item)
-          {
-            return { &impl_.asArray_[ i ], false };
-          }
-        }
-
-        if (N == cnt_)
-        {
-          // Item is guaranteed to not be in set.
-          // Size will become N+1
-          PromoteToSet();
-
-          auto tmp = impl_.asSet_->insert(item);
-          cnt_ = impl_.asSet_->size();
-
-          return { &*tmp.first, tmp.second };
-        }
-        else
-        {
-          auto* ptr = &impl_.asArray_[cnt_++];
-          *ptr = item;
-          return { ptr, true };
-
-          // cnt_ may be N
-        }
-      }
-      else
-      {
-        // Size > N
-        auto tmp = impl_.asSet_->insert(item);
-        cnt_ = impl_.asSet_->size();
-
-        return std::make_pair(&*tmp.first, tmp.second);
-      }
-    }
-
-    void remove( const T& item )
-    {
-
-    }
-
-  private:
-    void PromoteToSet()
-    {
-      impl_.asSet_ = new std::unordered_set<T>();
-      for (const auto& i : impl_.asArray_)
-      {
-        impl_.asSet_->insert(i);
-      }
-    }
-
-    void DemoteToArray()
-    {
-    }
-  };
-
-  // Not a drop-in replacement for Map.
-  // Not fully featured.
-  template<class T>
-  class HashMap
-  {
-  public:
-    HashMap( size_t cnt )
-    {
-      nodes_.resize( cnt, std::make_pair( 0xFFFFFFFF, T() ) );
-    }
-
-    auto& operator[]( size_t index )
-    {
-      const auto numNodes = nodes_.size();
-
-      auto hashIndex = hash(index) % numNodes;
-      while (1)
-      {
-        auto& node = nodes_[hashIndex];
-        if (node.first == index)
-        {
-          return nodes_[hashIndex].second;
-        }
-        else if (0xFFFFFFFF == node.first)
-        {
-          node.first = index;
-          return nodes_[hashIndex].second;
-        }
-        ++hashIndex;
-        if (hashIndex >= numNodes) {
-          hashIndex = 0;
-        }
-      }
-    }
-
-    auto begin() const
-    {
-      return std::begin(nodes_);
-    }
-
-    auto end() const
-    {
-      return std::end(nodes_);
-    }
-
-  private:
-    unsigned int hash(unsigned int x) {
-      x = ((x >> 16) ^ x) * 0x45d9f3b;
-      x = ((x >> 16) ^ x) * 0x45d9f3b;
-      x = (x >> 16) ^ x;
-      return x;
-    }
-
-    std::vector<std::pair<uint32_t, T>> nodes_; // uint32_t and small set
-  };
-
-
-  // Remove bad tracks (too short or track with ids collision)
+  /// Remove bad tracks (too short or track with ids collision)
   bool Filter(uint32_t nLengthSupTo = 2)
   {
     // Build the Track observations & mark tracks that have id collision:
-    //std::map<uint32_t, std::set<uint32_t>> tracks; // {track_id, {image_id, image_id, ...}}
-
-    HashMap<SmallSet_t<uint32_t,8>> tracks(map_node_to_index.size()*2); // {track_id, {image_id, image_id, ...}}
+    std::map<uint32_t, std::set<uint32_t>> tracks; // {track_id, {image_id, image_id, ...}}
     std::set<uint32_t> problematic_track_id; // {track_id, ...}
 
     // For each node retrieve its track id from the UF tree and add the node to the track
@@ -471,7 +145,7 @@ public:
     // Reject tracks that have too few observations
     for (const auto & val : tracks)
     {
-      if (val.first != 0xFFFFFFFF && val.second.size() < nLengthSupTo)
+      if (val.second.size() < nLengthSupTo)
       {
         problematic_track_id.insert(val.first);
       }
@@ -504,7 +178,7 @@ public:
   void ExportToSTL(STLMAPTracks & map_tracks)
   {
     map_tracks.clear();
-    for (uint32_t k = 0, cnt = map_node_to_index.size(); k < cnt; ++k)
+    for (uint32_t k = 0; k < map_node_to_index.size(); ++k)
     {
       const auto & feat = map_node_to_index[k];
       const uint32_t & track_id = uf_tree.m_cc_parent[k];
@@ -529,7 +203,7 @@ public:
 struct SharedTrackVisibilityHelper
 {
 private:
-  using TrackIdsPerView = std::map<uint32_t, Track_t>;
+  using TrackIdsPerView = std::map<uint32_t, std::set<uint32_t>>;
 
   TrackIdsPerView track_ids_per_view_;
   const STLMAPTracks & tracks_;
@@ -567,79 +241,6 @@ public:
     if (image_ids.empty())
       return false;
 
-#if 1
-    Track_t new_common_track_ids;
-    Track_t* common_track_ids = nullptr;
-    bool merged = false;
-    {
-      // Compute the intersection of all the track ids of the view's track ids.
-      // 1. Initialize the track_id with the view first tracks
-      // 2. Iteratively collect the common id of the remaining requested view
-      auto image_index_it = image_ids.cbegin();
-      if (track_ids_per_view_.count(*image_index_it))
-      {
-        common_track_ids = &track_ids_per_view_[*image_index_it];
-      }
-
-      std::advance(image_index_it, 1);
-      while (image_index_it != image_ids.cend())
-      {
-        if (track_ids_per_view_.count(*image_index_it))
-        {
-          const auto ids_per_view_it = track_ids_per_view_.find(*image_index_it);
-          const auto& track_ids = ids_per_view_it->second;
-
-          if (!merged)
-          {
-            if (common_track_ids)
-            {
-              new_common_track_ids = *common_track_ids;
-            }
-            else
-            {
-              // new_common_track_ids remains empty
-            }
-          }
-
-          Track_t tmp;
-          std::set_intersection(
-            new_common_track_ids.cbegin(), new_common_track_ids.cend(),
-            track_ids.cbegin(), track_ids.cend(),
-            std::inserter(tmp, tmp.begin()));
-          new_common_track_ids = tmp;
-          merged = true;
-        }
-        std::advance(image_index_it, 1);
-      }
-
-      if (image_ids.size() > 1 && !merged)
-      {
-        // If more than one image id is required and no merge operation have been done
-        //  we need to reset the common track id
-        return !tracks.empty();
-      }
-    }
-
-
-    // Collect the selected {img id, feat id} data for the shared track ids
-    if (merged || ( !merged && common_track_ids ))
-    {
-      for (const auto track_ids_it : merged ? new_common_track_ids : *common_track_ids)
-      {
-        const auto track_it = tracks_.find(track_ids_it);
-        const auto& track = track_it->second;
-        // Find the corresponding output track and update it
-        submapTrack& trackFeatsOut = tracks[track_it->first];
-        for (const auto img_index: image_ids)
-        {
-          const auto track_view_info = track.find(img_index);
-          trackFeatsOut[img_index] = track_view_info->second;
-        }
-      }
-    }
-    return !tracks.empty();
-  }
-#else
     // Collect the shared tracks ids by the views
     std::set<uint32_t> common_track_ids;
     {
@@ -693,7 +294,6 @@ public:
     }
     return !tracks.empty();
   }
-#endif
 };
 
 struct TracksUtilsMap
@@ -751,11 +351,10 @@ struct TracksUtilsMap
   }
 
   /// Get feature index PerView and TrackId
-  template<class T>
   static bool GetFeatIndexPerViewAndTrackId
   (
     const STLMAPTracks & tracks,
-    T & track_ids,
+    const std::set<uint32_t> & track_ids,
     uint32_t nImageIndex,
     std::vector<uint32_t> * feat_ids
   )

@@ -49,7 +49,6 @@
 #include "ceres/internal/port.h"
 #include "ceres/types.h"
 #include "ceres/internal/disable_warnings.h"
-#include "ceres/internal/fixed_array.h"
 
 namespace ceres {
 
@@ -64,7 +63,7 @@ namespace ceres {
 // when added with AddResidualBlock().
 class CERES_EXPORT CostFunction {
  public:
-  CostFunction() : parameter_block_count_(0), num_residuals_(0) {}
+  CostFunction() : num_residuals_(0) {}
 
   virtual ~CostFunction() {}
 
@@ -116,12 +115,8 @@ class CERES_EXPORT CostFunction {
                         double* residuals,
                         double** jacobians) const = 0;
 
-  int num_parameter_block_sizes() const {
-    return parameter_block_count_;
-  }
-
-  const int32* parameter_block_sizes() const {
-    return (int32*) parameter_block_sizes_.data();
+  const std::vector<int32>& parameter_block_sizes() const {
+    return parameter_block_sizes_;
   }
 
   int num_residuals() const {
@@ -129,14 +124,9 @@ class CERES_EXPORT CostFunction {
   }
 
  protected:
-
-   void copy_parameter_block_sizes(const int32* parameter_block_sizes, int cnt)
-   {
-     std::copy(parameter_block_sizes, parameter_block_sizes+cnt, std::begin(parameter_block_sizes_));
-     parameter_block_count_ = cnt;
+  std::vector<int32>* mutable_parameter_block_sizes() {
+    return &parameter_block_sizes_;
   }
-
-  void add_parameter_block_sizes(int32 v) { parameter_block_sizes_[parameter_block_count_++] = v; }
 
   void set_num_residuals(int num_residuals) {
     num_residuals_ = num_residuals;
@@ -145,34 +135,9 @@ class CERES_EXPORT CostFunction {
  private:
   // Cost function signature metadata: number of inputs & their sizes,
   // number of outputs (residuals).
-  struct no_init
-  {
-    no_init() {}
-
-    int32& operator=(const int32 v)
-    {
-      value = v;
-      return value;
-    }
-
-    operator int32() { return value; }
-
-    const int32* operator& () const
-    {
-      return &value;
-    }
-
-    int32* operator& ()
-    {
-      return &value;
-    }
-
-    int32 value;
-  };
-  std::array<no_init, 10> parameter_block_sizes_;
-  int parameter_block_count_;
+  std::vector<int32> parameter_block_sizes_;
   int num_residuals_;
-  //CERES_DISALLOW_COPY_AND_ASSIGN(CostFunction);
+  CERES_DISALLOW_COPY_AND_ASSIGN(CostFunction);
 };
 
 }  // namespace ceres

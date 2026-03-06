@@ -177,10 +177,7 @@ struct Jet {
   // (where T is a Jet<T, N>). This usually only happens in opt mode. Note that
   // the C++ standard mandates that e.g. default constructed doubles are
   // initialized to 0.0; see sections 8.5 of the C++03 standard.
-  // Make a Jet uninitialized by default.
-  enum JetInitialize_t { eNoInitialize = 0, eInitialize = 1 };
-  Jet(JetInitialize_t init = eNoInitialize) : a() {
-    if (eInitialize == init)
+  Jet() : a() {
     v.setZero();
   }
 

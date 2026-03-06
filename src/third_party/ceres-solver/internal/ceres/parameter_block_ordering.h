@@ -76,7 +76,7 @@ void ComputeRecursiveIndependentSetOrdering(const Program& program,
 // vertex corresponds to a parameter block in the Problem except for
 // parameter blocks that are marked constant. An edge connects two
 // parameter blocks, if they co-occur in a residual block.
-Graph<ParameterBlock*> CreateHessianGraph(const Program& program);
+Graph<ParameterBlock*>* CreateHessianGraph(const Program& program);
 
 // Iterate over each of the groups in order of their priority and fill
 // summary with their sizes.

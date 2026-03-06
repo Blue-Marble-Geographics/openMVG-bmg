@@ -169,15 +169,19 @@ class ProgramEvaluator : public Evaluator {
       }
     }
 
-    // Let all iterations complete instead of breaking early.
-    // Just need to detect that an abort occurred.
     // This bool is used to disable the loop if an error is encountered
     // without breaking out of it. The remaining loop iterations are still run,
     // but with an empty body, and so will finish quickly.
-    volatile bool abort = false;
+    bool abort = false;
     int num_residual_blocks = program_->NumResidualBlocks();
 #pragma omp parallel for num_threads(options_.num_threads)
     for (int i = 0; i < num_residual_blocks; ++i) {
+// Disable the loop instead of breaking, as required by OpenMP.
+#pragma omp flush(abort)
+      if (abort) {
+        continue;
+      }
+
 #ifdef CERES_USE_OPENMP
       int thread_id = omp_get_thread_num();
 #else
@@ -214,6 +218,11 @@ class ProgramEvaluator : public Evaluator {
               block_jacobians,
               scratch->residual_block_evaluate_scratch.get())) {
         abort = true;
+// This ensures that the OpenMP threads have a consistent view of 'abort'. Do
+// the flush inside the failure case so that there is usually only one
+// synchronization point per loop iteration instead of two.
+#pragma omp flush(abort)
+        continue;
       }
 
       scratch->cost += block_cost;
@@ -228,12 +237,11 @@ class ProgramEvaluator : public Evaluator {
 
       // Compute and store the gradient, if it was requested.
       if (gradient != NULL) {
-        auto* scratch_gradient = scratch->gradient.get();
         int num_residuals = residual_block->NumResiduals();
         int num_parameter_blocks = residual_block->NumParameterBlocks();
-        const auto& pbs = residual_block->parameter_blocks();
         for (int j = 0; j < num_parameter_blocks; ++j) {
-          const ParameterBlock* __restrict parameter_block = pbs[j];
+          const ParameterBlock* parameter_block =
+              residual_block->parameter_blocks()[j];
           if (parameter_block->IsConstant()) {
             continue;
           }
@@ -243,7 +251,7 @@ class ProgramEvaluator : public Evaluator {
               num_residuals,
               parameter_block->LocalSize(),
               block_residuals,
-              scratch_gradient + parameter_block->delta_offset());
+              scratch->gradient.get() + parameter_block->delta_offset());
         }
       }
     }

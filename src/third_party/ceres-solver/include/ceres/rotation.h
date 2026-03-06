@@ -560,12 +560,8 @@ T DotProduct(const T x[3], const T y[3]) {
 }
 
 template<typename T> inline
-void AngleAxisRotatePoint(const T* __restrict angle_axis, const T* __restrict pt, T* __restrict result) {
-#if 1
-  const T theta2 = angle_axis[0] * angle_axis[0] + angle_axis[1] * angle_axis[1] + angle_axis[2] * angle_axis[2];
-#else
+void AngleAxisRotatePoint(const T angle_axis[3], const T pt[3], T result[3]) {
   const T theta2 = DotProduct(angle_axis, angle_axis);
-#endif
   if (theta2 > T(std::numeric_limits<double>::epsilon())) {
     // Away from zero, use the rodriguez formula
     //

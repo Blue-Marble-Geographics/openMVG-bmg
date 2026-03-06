@@ -52,14 +52,17 @@ namespace internal {
 ResidualBlock::ResidualBlock(
     const CostFunction* cost_function,
     const LossFunction* loss_function,
-    const FixedArray<ParameterBlock*, 10, 0 /* No init */>& parameter_blocks,
+    const std::vector<ParameterBlock*>& parameter_blocks,
     int index)
     : cost_function_(cost_function),
       loss_function_(loss_function),
+      parameter_blocks_(
+          new ParameterBlock* [
+              cost_function->parameter_block_sizes().size()]),
       index_(index) {
   std::copy(parameter_blocks.begin(),
             parameter_blocks.end(),
-            parameter_blocks_);
+            parameter_blocks_.get());
 }
 
 bool ResidualBlock::Evaluate(const bool apply_loss_function,
@@ -72,16 +75,16 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
 
   // Collect the parameters from their blocks. This will rarely allocate, since
   // residuals taking more than 8 parameter block arguments are rare.
-  FixedArray<const double*, 10, 0 /* No init */> parameters(num_parameter_blocks);
+  FixedArray<const double*, 8> parameters(num_parameter_blocks);
   for (int i = 0; i < num_parameter_blocks; ++i) {
     parameters[i] = parameter_blocks_[i]->state();
   }
 
   // Put pointers into the scratch space into global_jacobians as appropriate.
-  FixedArray<double*, 10, 0 /* No init */> global_jacobians(num_parameter_blocks);
+  FixedArray<double*, 8> global_jacobians(num_parameter_blocks);
   if (jacobians != NULL) {
     for (int i = 0; i < num_parameter_blocks; ++i) {
-      const ParameterBlock* __restrict parameter_block = parameter_blocks_[i];
+      const ParameterBlock* parameter_block = parameter_blocks_[i];
       if (jacobians[i] != NULL &&
           parameter_block->LocalParameterizationJacobian() != NULL) {
         global_jacobians[i] = scratch;
@@ -129,20 +132,13 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
     return false;
   }
 
-#if 1// Much faster than Eigen for small num_residuals
-  double squared_norm = 0.;
-  for (int i = 0; i != num_residuals; ++i) {
-    squared_norm += residuals[i]*residuals[i];
-  }
-#else
   double squared_norm = VectorRef(residuals, num_residuals).squaredNorm();
-#endif
 
   // Update the jacobians with the local parameterizations.
   if (jacobians != NULL) {
     for (int i = 0; i < num_parameter_blocks; ++i) {
       if (jacobians[i] != NULL) {
-        const ParameterBlock* __restrict parameter_block = parameter_blocks_[i];
+        const ParameterBlock* parameter_block = parameter_blocks_[i];
 
         // Apply local reparameterization to the jacobians.
         if (parameter_block->LocalParameterizationJacobian() != NULL) {
@@ -209,10 +205,10 @@ int ResidualBlock::NumScratchDoublesForEvaluate() const {
   int num_parameters = NumParameterBlocks();
   int scratch_doubles = 1;
   for (int i = 0; i < num_parameters; ++i) {
-    const ParameterBlock& parameter_block = *parameter_blocks_[i];
-    if (!parameter_block.IsConstant() &&
-        parameter_block.LocalParameterizationJacobian() != NULL) {
-      scratch_doubles += parameter_block.Size();
+    const ParameterBlock* parameter_block = parameter_blocks_[i];
+    if (!parameter_block->IsConstant() &&
+        parameter_block->LocalParameterizationJacobian() != NULL) {
+      scratch_doubles += parameter_block->Size();
     }
   }
   scratch_doubles *= NumResiduals();

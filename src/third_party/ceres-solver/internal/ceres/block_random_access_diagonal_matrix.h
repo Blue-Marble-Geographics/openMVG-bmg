@@ -66,38 +66,6 @@ class BlockRandomAccessDiagonalMatrix : public BlockRandomAccessMatrix {
                             int* row_stride,
                             int* col_stride);
 
-  CellInfo* GetCellHelped(CellInfoHelper& cih,
-                          const int col_block_id) override {
-    if (cih.row_block_id_ != col_block_id) {
-      return NULL;
-    }
-  
-    // r_ is constant
-    // c_ constant
-    // row_stride_ constant
-    // col_stride_ constant
-  
-    // Each cell is stored contiguously as its own little dense matrix.
-    return cih.cell_info_;
-  }
-
-  void PrepareGetCellHelper(CellInfoHelper& cih,
-                            const int row_block_id) override
-  {
-    int stride = 0;
-    cih.row_block_id_ = row_block_id;
-    if (row_block_id < blocks_.size()) {
-      stride = blocks_[row_block_id]; // Technically invalid unless row_block_id == col_block_id
-      cih.cell_info_ = layout_[row_block_id];
-    } else {
-      cih.cell_info_ = NULL;
-    }
-    cih.r_ = 0;
-    cih.c_ = 0;
-    cih.row_stride_ = stride;
-    cih.col_stride_ = stride;
-  }
-  
   // This is not a thread safe method, it assumes that no cell is
   // locked.
   virtual void SetZero();

@@ -83,7 +83,6 @@ class BlockSparseMatrix : public SparseMatrix {
 
   void ToTripletSparseMatrix(TripletSparseMatrix* matrix) const;
   const CompressedRowBlockStructure* block_structure() const;
-  CompressedRowBlockStructure* block_structure();
 
   // Append the contents of m to the bottom of this matrix. m must
   // have the same column blocks structure as this matrix.
@@ -94,8 +93,7 @@ class BlockSparseMatrix : public SparseMatrix {
 
   static BlockSparseMatrix* CreateDiagonalMatrix(
       const double* diagonal,
-      const std::vector<int>& col_sizes,
-      const std::vector<int>& col_positions);
+      const std::vector<Block>& column_blocks);
 
   struct RandomMatrixOptions {
     RandomMatrixOptions()

@@ -31,95 +31,11 @@
 #ifndef CERES_PUBLIC_ORDERED_GROUPS_H_
 #define CERES_PUBLIC_ORDERED_GROUPS_H_
 
-#include <list>
 #include <map>
 #include <set>
 #include <vector>
 #include "ceres/internal/port.h"
 #include "glog/logging.h"
-
-template<class T>
-struct Mallocator
-{
-  Mallocator* copyAllocator = nullptr;
-  Mallocator<T>* rebindAllocator = nullptr;
-
-  typedef T value_type;
-
-  template <typename U>
-  struct rebind
-  {
-    using other = Mallocator<U>;
-  };
-  Mallocator() = default;
-
-  Mallocator(Mallocator& allocator) :
-    copyAllocator(&Mallocator)
-  {
-  }
-
-  template <class U>
-  Mallocator(const Mallocator<U>& other)
-  {
-    if (!std::is_same<T, U>::value)
-      rebindAllocator = new Mallocator<T>();
-  }
-
-  bool operator==(const Mallocator&) const noexcept
-  {
-    return true;
-  }
-  bool operator!=(const Mallocator&) const noexcept
-  {
-    return false;
-  }
-
-  template <typename T>
-  std::unique_ptr<T> make_unique_uninitialized(const std::size_t size) {
-    return std::unique_ptr<T>(new typename std::remove_extent<T>::type[size]);
-  }
-
-  enum { kChunkSize = 4096 };
-  T* allocate(std::size_t n)
-  {
-    if (copyAllocator)
-      return copyAllocator->allocate(n);
-
-    if (rebindAllocator)
-      return rebindAllocator->allocate(n);
-
-    size_t num_bytes = sizeof(T)* n;
-
-    if (chunks.empty() || ( space_used + num_bytes ) > kChunkSize) {
-      //cerr << "alloc " << kChunkSize << " calls\n";
-      chunks.push_back(make_unique_uninitialized<uint8_t[]>(kChunkSize));
-      space_used = 0;
-    }
-
-    T* addr = (T*)&chunks.back()[space_used];
-    space_used += num_bytes;
-
-    return reinterpret_cast<typename std::allocator<T>::pointer>( addr );
-  }
-
-  void deallocate(T* p, std::size_t n) noexcept
-  {
-    if (copyAllocator) {
-      copyAllocator->deallocate(p, n);
-      return;
-    }
-
-    if (rebindAllocator) {
-      rebindAllocator->deallocate(p, n);
-      return;
-    }
-  }
-
-private:
-  // Can't use deque... it invalidates.
-  size_t space_used = 0;
-  std::list<std::unique_ptr<uint8_t[]>> chunks;
-};
 
 namespace ceres {
 
@@ -142,34 +58,12 @@ class OrderedGroups {
   // numbers.
   //
   // Return value indicates if adding the element was a success.
-  // JPB Note group is always 0 or 1.
   bool AddElementToGroup(const T element, const int group) {
     if (group < 0) {
       return false;
     }
-#if 1 // JPB WIP
-    const auto result = element_to_group_.try_emplace(element, group);
-    // result.first has an iterator pair to where it is inserted.
-    // result.second is false if insertion occurred, true if element already present.
-    if (!result.second) { // Element was already there (try_emplace did nothing but locate the element).
-      // Is it in the same group?
-      auto stored_group = result.first->second;
-      if (stored_group == group) {
-        // current_group matches nothing to do.
-        return true;
-      }
 
-      // Replace the stored group.
-      result.first->second = group;
-
-      // Remove the element from the stored group's reference.
-      group_to_elements_[stored_group].erase(element);
-      }
-    else {
-    	group_to_elements_[group].insert(element);
-    }
-#else
-    auto it =
+    typename std::map<T, int>::const_iterator it =
         element_to_group_.find(element);
     if (it != element_to_group_.end()) {
       if (it->second == group) {
@@ -185,13 +79,11 @@ class OrderedGroups {
 
     element_to_group_[element] = group;
     group_to_elements_[group].insert(element);
-#endif
     return true;
   }
 
   void Clear() {
-    group_to_elements_[0].clear();
-    group_to_elements_[1].clear();
+    group_to_elements_.clear();
     element_to_group_.clear();
   }
 
@@ -204,6 +96,12 @@ class OrderedGroups {
     }
 
     group_to_elements_[current_group].erase(element);
+
+    if (group_to_elements_[current_group].size() == 0) {
+      // If the group is empty, then get rid of it.
+      group_to_elements_.erase(current_group);
+    }
+
     element_to_group_.erase(element);
     return true;
   }
@@ -224,21 +122,18 @@ class OrderedGroups {
 
   // Reverse the order of the groups in place.
   void Reverse() {
-#if 1 // JPB WIP BUG
-    throw std::runtime_error("Unsupported");
-#else
     if (NumGroups() == 0) {
       return;
     }
 
-    typename std::map<int, std::set<T, std::less<T>, Mallocator<T>>, std::less<int>, Mallocator<T> >::reverse_iterator it =
+    typename std::map<int, std::set<T> >::reverse_iterator it =
         group_to_elements_.rbegin();
-    std::map<int, std::set<T, std::less<T>, Mallocator<T>>, std::less<int>, Mallocator<T> > new_group_to_elements;
+    std::map<int, std::set<T> > new_group_to_elements;
     new_group_to_elements[it->first] = it->second;
 
     int new_group_id = it->first + 1;
     for (++it; it != group_to_elements_.rend(); ++it) {
-      for (auto element_it = it->second.begin();
+      for (typename std::set<T>::const_iterator element_it = it->second.begin();
            element_it != it->second.end();
            ++element_it) {
         element_to_group_[*element_it] = new_group_id;
@@ -248,13 +143,12 @@ class OrderedGroups {
     }
 
     group_to_elements_.swap(new_group_to_elements);
-#endif
   }
 
   // Return the group id for the element. If the element is not a
   // member of any group, return -1.
   int GroupId(const T element) const {
-    auto it =
+    typename std::map<T, int>::const_iterator it =
         element_to_group_.find(element);
     if (it == element_to_group_.end()) {
       return -1;
@@ -263,9 +157,17 @@ class OrderedGroups {
   }
 
   bool IsMember(const T element) const {
-    auto it =
+    typename std::map<T, int>::const_iterator it =
         element_to_group_.find(element);
     return (it != element_to_group_.end());
+  }
+
+  // This function always succeeds, i.e., implicitly there exists a
+  // group for every integer.
+  int GroupSize(const int group) const {
+    typename std::map<int, std::set<T> >::const_iterator it =
+        group_to_elements_.find(group);
+    return (it ==  group_to_elements_.end()) ? 0 : it->second.size();
   }
 
   int NumElements() const {
@@ -274,7 +176,7 @@ class OrderedGroups {
 
   // Number of groups with one or more elements.
   int NumGroups() const {
-    return (!group_to_elements_[0].empty()) + (!group_to_elements_[1].empty());
+    return group_to_elements_.size();
   }
 
   // The first group with one or more elements. Calling this when
@@ -282,20 +184,20 @@ class OrderedGroups {
   // crash.
   int MinNonZeroGroup() const {
     CHECK_NE(NumGroups(), 0);
-    return (!group_to_elements_[0].empty()) ? group_to_elements_[0].size() : group_to_elements_[1].size();
+    return group_to_elements_.begin()->first;
   }
 
-  const auto& group_to_elements() const {
+  const std::map<int, std::set<T> >& group_to_elements() const {
     return group_to_elements_;
   }
 
-  const auto& element_to_group() const {
+  const std::map<T, int>& element_to_group() const {
     return element_to_group_;
   }
 
  private:
-  std::array<std::set<T, std::less<T>, Mallocator<T>>, 2> group_to_elements_;
-  std::map<T, int, std::less<T>, Mallocator<int>> element_to_group_;
+  std::map<int, std::set<T> > group_to_elements_;
+  std::map<T, int> element_to_group_;
 };
 
 // Typedef for the most commonly used version of OrderedGroups.

@@ -73,31 +73,6 @@ class BlockRandomAccessSparseMatrix : public BlockRandomAccessMatrix {
                             int* row_stride,
                             int* col_stride);
 
-  CellInfo* GetCellHelped(CellInfoHelper& cih,
-                          const int col_block_id) override {
-    // r_ is constant
-    // c_ constant
-    // row_stride_ constant
-    const LayoutType::iterator it =
-      layout_.find(cih.addr_ + col_block_id);
-    if (it == layout_.end()) {
-      return NULL;
-    }
-
-    // Each cell is stored contiguously as its own little dense matrix.
-    cih.col_stride_ = blocks_[col_block_id];
-    return &it->second;
-  }
-
-  void PrepareGetCellHelper(CellInfoHelper& cih,
-                            const int row_block_id) override
-  {
-    cih.addr_ = row_block_id * kMaxRowBlocks;
-    cih.row_stride_ = blocks_[row_block_id]; // Technically invalid unless row_block_id == col_block_id
-    cih.r_ = 0;
-    cih.c_ = 0;
-  }
-
   // This is not a thread safe method, it assumes that no cell is
   // locked.
   virtual void SetZero();
@@ -134,7 +109,7 @@ class BlockRandomAccessSparseMatrix : public BlockRandomAccessMatrix {
 
   // A mapping from <row_block_id, col_block_id> to the position in
   // the values array of tsm_ where the block is stored.
-  typedef HashMap<long int, CellInfo > LayoutType;
+  typedef HashMap<long int, CellInfo* > LayoutType;
   LayoutType layout_;
 
   // In order traversal of contents of the matrix. This allows us to

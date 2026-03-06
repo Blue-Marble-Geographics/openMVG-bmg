@@ -49,14 +49,14 @@ SchurJacobiPreconditioner::SchurJacobiPreconditioner(
     : options_(options) {
   CHECK_GT(options_.elimination_groups.size(), 1);
   CHECK_GT(options_.elimination_groups[0], 0);
-  const int num_blocks = bs.col_sizes.size() - options_.elimination_groups[0];
+  const int num_blocks = bs.cols.size() - options_.elimination_groups[0];
   CHECK_GT(num_blocks, 0)
       << "Jacobian should have atleast 1 f_block for "
       << "SCHUR_JACOBI preconditioner.";
 
   std::vector<int> blocks(num_blocks);
   for (int i = 0; i < num_blocks; ++i) {
-    blocks[i] = bs.col_sizes[i + options_.elimination_groups[0]];
+    blocks[i] = bs.cols[i + options_.elimination_groups[0]].size;
   }
 
   m_.reset(new BlockRandomAccessDiagonalMatrix(blocks));

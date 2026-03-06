@@ -65,9 +65,8 @@ void BlockEvaluatePreparer::Prepare(const ResidualBlock* residual_block,
 
   const int* jacobian_block_offset = jacobian_layout_[residual_block_index];
   const int num_parameter_blocks = residual_block->NumParameterBlocks();
-  const auto pbb = residual_block->parameter_blocks();
   for (int j = 0; j < num_parameter_blocks; ++j) {
-    if (!pbb[j]->IsConstant()) {
+    if (!residual_block->parameter_blocks()[j]->IsConstant()) {
       jacobians[j] = jacobian_values + *jacobian_block_offset;
 
       // The jacobian_block_offset can't be indexed with 'j' since the code

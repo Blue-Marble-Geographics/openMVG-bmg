@@ -110,7 +110,7 @@ class ImplicitSchurComplement : public LinearOperator {
   // is important that the matrix A have a BlockStructure object
   // associated with it and has a block structure that is compatible
   // with the SchurComplement solver.
-  void Init(BlockSparseMatrix& A, const double* D, const double* b);
+  void Init(const BlockSparseMatrix& A, const double* D, const double* b);
 
   // y += Sx, where S is the Schur complement.
   virtual void RightMultiply(const double* x, double* y) const;

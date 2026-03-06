@@ -53,10 +53,10 @@ class VertexTotalOrdering {
       : graph_(graph) {}
 
   bool operator()(const Vertex& lhs, const Vertex& rhs) const {
-    if (graph_.NumNeighbors(lhs) == graph_.NumNeighbors(rhs)) {
+    if (graph_.Neighbors(lhs).size() == graph_.Neighbors(rhs).size()) {
       return lhs < rhs;
     }
-    return graph_.NumNeighbors(lhs) < graph_.NumNeighbors(rhs);
+    return graph_.Neighbors(lhs).size() < graph_.Neighbors(rhs).size();
   }
 
  private:
@@ -70,7 +70,7 @@ class VertexDegreeLessThan {
       : graph_(graph) {}
 
   bool operator()(const Vertex& lhs, const Vertex& rhs) const {
-    return graph_.NumNeighbors(lhs) < graph_.NumNeighbors(rhs);
+    return graph_.Neighbors(lhs).size() < graph_.Neighbors(rhs).size();
   }
 
  private:
@@ -96,8 +96,8 @@ class VertexDegreeLessThan {
 template <typename Vertex>
 int IndependentSetOrdering(const Graph<Vertex>& graph,
                            std::vector<Vertex>* ordering) {
-  const auto& vertices = graph.vertices();
-  int num_vertices = 0;
+  const HashSet<Vertex>& vertices = graph.vertices();
+  const int num_vertices = vertices.size();
 
   CHECK_NOTNULL(ordering);
   ordering->clear();
@@ -111,12 +111,11 @@ int IndependentSetOrdering(const Graph<Vertex>& graph,
   // Mark all vertices white.
   HashMap<Vertex, char> vertex_color;
   std::vector<Vertex> vertex_queue;
-  for (const auto& v : vertices) {
-    if (v) {
-      ++num_vertices;
-      vertex_color[v] = kWhite;
-      vertex_queue.push_back(v);
-    }
+  for (typename HashSet<Vertex>::const_iterator it = vertices.begin();
+       it != vertices.end();
+       ++it) {
+    vertex_color[*it] = kWhite;
+    vertex_queue.push_back(*it);
   }
 
 
@@ -133,10 +132,11 @@ int IndependentSetOrdering(const Graph<Vertex>& graph,
 
     ordering->push_back(vertex);
     vertex_color[vertex] = kBlack;
-    for (const auto& i : graph.Neighbors(vertex)) {
-      if (i) {
-        vertex_color[i] = kGrey;
-      }
+    const HashSet<Vertex>& neighbors = graph.Neighbors(vertex);
+    for (typename HashSet<Vertex>::const_iterator it = neighbors.begin();
+         it != neighbors.end();
+         ++it) {
+      vertex_color[*it] = kGrey;
     }
   }
 
@@ -171,32 +171,44 @@ int IndependentSetOrdering(const Graph<Vertex>& graph,
 // ordering algorithm over all.
 template <typename Vertex>
 int StableIndependentSetOrdering(const Graph<Vertex>& graph,
-                                 std::vector<Vertex>* ordering) {
+  std::vector<Vertex>* ordering) {
   CHECK_NOTNULL(ordering);
-  const auto& vertices = graph.vertices();
-  int num_vertices = 0;
-  for (const auto &i : graph.vertices()) {
-    num_vertices += !!i;
-  }
-
-  CHECK_EQ( num_vertices, ordering->size());
+  const HashSet<Vertex>& vertices = graph.vertices();
+  const int num_vertices = vertices.size();
+  CHECK_EQ(vertices.size(), ordering->size());
 
   // Colors for labeling the graph during the BFS.
   const char kWhite = 0;
   const char kGrey = 1;
   const char kBlack = 2;
 
-  std::vector<Vertex> vertex_queue(*ordering);
+  // Cache each vertex alongside its degree so that stable_sort
+  // compares plain integers instead of performing repeated hash-map
+  // lookups via graph.Neighbors(v).size().
+  struct VertexDegree {
+    Vertex v;
+    int degree;
+  };
+
+  std::vector<VertexDegree> vertex_queue;
+  vertex_queue.reserve(num_vertices);
+  for (const auto& v : *ordering) {
+    vertex_queue.push_back(
+      { v, static_cast<int>(graph.Neighbors(v).size()) });
+  }
 
   std::stable_sort(vertex_queue.begin(), vertex_queue.end(),
-                  VertexDegreeLessThan<Vertex>(graph));
+    [](const VertexDegree& lhs, const VertexDegree& rhs) {
+      return lhs.degree < rhs.degree;
+    });
 
   // Mark all vertices white.
   HashMap<Vertex, char> vertex_color;
-  for (const auto& it : vertices) {
-    if (it) {
-      vertex_color[it] = kWhite;
-    }
+  vertex_color.reserve(num_vertices);
+  for (typename HashSet<Vertex>::const_iterator it = vertices.begin();
+    it != vertices.end();
+    ++it) {
+    vertex_color[*it] = kWhite;
   }
 
   ordering->clear();
@@ -204,17 +216,18 @@ int StableIndependentSetOrdering(const Graph<Vertex>& graph,
   // Iterate over vertex_queue. Pick the first white vertex, add it
   // to the independent set. Mark it black and its neighbors grey.
   for (int i = 0; i < vertex_queue.size(); ++i) {
-    const Vertex& vertex = vertex_queue[i];
+    const Vertex& vertex = vertex_queue[i].v;
     if (vertex_color[vertex] != kWhite) {
       continue;
     }
 
     ordering->push_back(vertex);
     vertex_color[vertex] = kBlack;
-    for (const auto& it : graph.Neighbors( vertex )) {
-      if (it) {
-        vertex_color[it] = kGrey;
-      }
+    const HashSet<Vertex>& neighbors = graph.Neighbors(vertex);
+    for (typename HashSet<Vertex>::const_iterator it = neighbors.begin();
+      it != neighbors.end();
+      ++it) {
+      vertex_color[*it] = kGrey;
     }
   }
 
@@ -223,10 +236,8 @@ int StableIndependentSetOrdering(const Graph<Vertex>& graph,
   // Iterate over the vertices and add all the grey vertices to the
   // ordering. At this stage there should only be black or grey
   // vertices in the graph.
-  for (typename std::vector<Vertex>::const_iterator it = vertex_queue.begin();
-       it != vertex_queue.end();
-       ++it) {
-    const Vertex vertex = *it;
+  for (int i = 0; i < vertex_queue.size(); ++i) {
+    const Vertex vertex = vertex_queue[i].v;
     DCHECK(vertex_color[vertex] != kWhite);
     if (vertex_color[vertex] != kBlack) {
       ordering->push_back(vertex);
@@ -236,101 +247,6 @@ int StableIndependentSetOrdering(const Graph<Vertex>& graph,
   CHECK_EQ(ordering->size(), num_vertices);
   return independent_set_size;
 }
-
-template <typename Vertex>
-int StableIndependentSetOrderingFaster(const Graph<Vertex>& graph,
-  std::vector<Vertex>* ordering) {
-  CHECK_NOTNULL(ordering);
-  const auto& vertices = graph.vertices(); // Raw vertices
-  size_t num_vertices = 0;
-  // JPB WIP BUG CHECK_EQ(vertices.size(), ordering->size());
-
-  // Colors for labeling the graph during the BFS.
-  const char kWhite = 0;
-  const char kGrey = 1;
-  const char kBlack = 2;
-
-  struct Queue_t
-  {
-    Queue_t() = default;
-
-    Queue_t(const std::vector<Vertex>* neighbors, Vertex v) :
-      v_(v),
-      numNeighbors_(neighbors->size()),
-      neighbors_(neighbors)
-    {}
-
-    int operator<(const Queue_t& other) const
-    {
-      return numNeighbors_ < other.numNeighbors_;
-    }
-
-    Vertex v_ = nullptr;
-    uint32_t numNeighbors_ = 0;
-    mutable const std::vector<Vertex>* neighbors_ = nullptr;
-  };
-
-  const int cnt = (int)ordering->size();
-  std::vector<Queue_t> vertex_queue;
-  vertex_queue.reserve(cnt);
-  for (const auto v : *ordering) {
-    const auto& neighbors = graph.Neighbors(v);
-    vertex_queue.emplace_back(&neighbors, v);
-  }
-
-  std::stable_sort(
-    std::begin(vertex_queue),
-    std::end(vertex_queue)
-  );
-
-  // Mark all vertices white.
-  //HashMap<Vertex, char> vertex_color;
-  FixedHashMap<Vertex, char> vertex_color;
-  vertex_color.resize(vertices.size()*4);
-  for (const auto& v : vertices) {
-    if (v) {
-      ++num_vertices;
-      vertex_color[v] = kWhite;
-    }
-  }
-
-  ordering->clear();
-  ordering->reserve(num_vertices);
-  // Iterate over vertex_queue. Pick the first white vertex, add it
-  // to the independent set. Mark it black and its neighbors grey.
-  for (const auto& i : vertex_queue) {
-    const Vertex vertex = i.v_;
-    if (vertex_color[vertex] != kWhite) {
-      continue;
-    }
-
-    ordering->push_back(vertex);
-    vertex_color[vertex] = kBlack;
-    for (const auto& i : *i.neighbors_) {
-      if (i) {
-        vertex_color[ i ] = kGrey;
-      }
-    }
-  }
-
-  int independent_set_size = ordering->size();
-
-  // Iterate over the vertices and add all the grey vertices to the
-  // ordering. At this stage there should only be black or grey
-  // vertices in the graph.
-  for (const auto& i : vertex_queue) {
-    const Vertex vertex = i.v_;
-    
-    DCHECK(vertex_color[vertex] != kWhite);
-    if (vertex_color[vertex] != kBlack) {
-      ordering->push_back(vertex);
-    }
-  }
-
-  // JPB WIP BUG CHECK_EQ(ordering->size(), num_vertices);
-  return independent_set_size;
-}
-
 
 // Find the connected component for a vertex implemented using the
 // find and update operation for disjoint-set. Recursively traverse

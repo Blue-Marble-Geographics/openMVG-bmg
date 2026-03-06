@@ -58,18 +58,17 @@ void ComputeVisibility(const CompressedRowBlockStructure& block_structure,
   // Clear the visibility vector and resize it to hold a
   // vector for each camera.
   visibility->resize(0);
-  visibility->resize(block_structure.col_sizes.size() - num_eliminate_blocks);
+  visibility->resize(block_structure.cols.size() - num_eliminate_blocks);
 
   for (int i = 0; i < block_structure.rows.size(); ++i) {
-    const Cell* cells = block_structure.rows[i].cells;
-    size_t cnt = block_structure.rows[i].num_cells;
+    const vector<Cell>& cells = block_structure.rows[i].cells;
     int block_id = cells[0].block_id;
     // If the first block is not an e_block, then skip this row block.
     if (block_id >= num_eliminate_blocks) {
       continue;
     }
 
-    for (int j = 1; j < cnt; ++j) {
+    for (int j = 1; j < cells.size(); ++j) {
       int camera_block_id = cells[j].block_id - num_eliminate_blocks;
       DCHECK_GE(camera_block_id, 0);
       DCHECK_LT(camera_block_id, visibility->size());

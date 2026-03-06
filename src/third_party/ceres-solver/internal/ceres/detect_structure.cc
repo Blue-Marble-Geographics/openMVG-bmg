@@ -51,7 +51,7 @@ void DetectStructure(const CompressedRowBlockStructure& bs,
     const CompressedRow& row = bs.rows[r];
     // We do not care about the sizes of the blocks in rows which do
     // not contain e_blocks.
-    if (row.cells[0].block_id >= num_eliminate_blocks) {
+    if (row.cells.front().block_id >= num_eliminate_blocks) {
       break;
     }
 
@@ -67,34 +67,34 @@ void DetectStructure(const CompressedRowBlockStructure& bs,
     }
 
     // Detect fixed or dynamic e-block size.
-    const int e_block_id = row.cells[0].block_id;
+    const int e_block_id = row.cells.front().block_id;
     if (*e_block_size == 0) {
-      *e_block_size = bs.col_sizes[e_block_id];
+      *e_block_size = bs.cols[e_block_id].size;
     } else if (*e_block_size != Eigen::Dynamic &&
-               *e_block_size != bs.col_sizes[e_block_id]) {
+               *e_block_size != bs.cols[e_block_id].size) {
       VLOG(2) << "Dynamic e block size because the block size changed from "
               << *e_block_size << " to "
-              << bs.col_sizes[e_block_id];
+              << bs.cols[e_block_id].size;
       *e_block_size = Eigen::Dynamic;
     }
 
     // Detect fixed or dynamic f-block size. We are only interested in
     // rows with e-blocks, and the e-block is always the first block,
     // so only rows of size greater than 1 are of interest.
-    if (row.num_cells > 1) {
+    if (row.cells.size() > 1) {
       if (*f_block_size == 0) {
         const int f_block_id = row.cells[1].block_id;
-        *f_block_size = bs.col_sizes[f_block_id];
+        *f_block_size = bs.cols[f_block_id].size;
       }
 
       for (int c = 1;
-           (c < row.num_cells) && (*f_block_size != Eigen::Dynamic);
+           (c < row.cells.size()) && (*f_block_size != Eigen::Dynamic);
            ++c) {
         const int f_block_id = row.cells[c].block_id;
-        if (*f_block_size != bs.col_sizes[f_block_id]) {
+        if (*f_block_size != bs.cols[f_block_id].size) {
           VLOG(2) << "Dynamic f block size because the block size "
                   << "changed from " << *f_block_size << " to "
-                  << bs.col_sizes[f_block_id];
+                  << bs.cols[f_block_id].size;
           *f_block_size = Eigen::Dynamic;
         }
       }

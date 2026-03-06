@@ -40,8 +40,17 @@ class Bundle_Adjustment_Ceres : public Bundle_Adjustment
     int preconditioner_type_;
     int sparse_linear_algebra_library_type_;
     double parameter_tolerance_;
+    double function_tolerance_;
+    double gradient_tolerance_;
     bool bUse_loss_function_;
     int max_num_iterations_;
+    int max_linear_solver_iterations_;
+    bool use_nonmonotonic_steps_;
+    int max_consecutive_nonmonotonic_steps_;
+    double initial_trust_region_radius_;
+    double max_trust_region_radius_;
+    double min_trust_region_radius_;
+    int max_num_consecutive_invalid_steps_;
 
     BA_Ceres_options(const bool bVerbose = true, bool bmultithreaded = true);
   };

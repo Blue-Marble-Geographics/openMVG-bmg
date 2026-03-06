@@ -239,13 +239,12 @@ bool SetupEvaluator(PreprocessedProblem* pp) {
   pp->evaluator_options = Evaluator::Options();
   pp->evaluator_options.linear_solver_type = options.linear_solver_type;
   pp->evaluator_options.num_eliminate_blocks = 0;
-
-  const auto& first_elimination_group = ( !options.linear_solver_ordering->group_to_elements()[0].empty() ) ?
-    options.linear_solver_ordering->group_to_elements()[0] : options.linear_solver_ordering->group_to_elements()[1];
-
   if (IsSchurType(options.linear_solver_type)) {
     pp->evaluator_options.num_eliminate_blocks =
-      first_elimination_group.size();
+        options
+        .linear_solver_ordering
+        ->group_to_elements().begin()
+        ->second.size();
   }
 
   pp->evaluator_options.num_threads = options.num_threads;

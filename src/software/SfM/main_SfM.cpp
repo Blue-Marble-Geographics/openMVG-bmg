@@ -467,7 +467,6 @@ int main(int argc, char **argv)
 
     // Configure reconstruction parameters
     engine->SetUnknownCameraType(EINTRINSIC(user_camera_model));
-    engine->Set_Use_Motion_Prior(b_use_motion_priors);
     engine->SetTriangulationMethod(static_cast<ETriangulationMethod>(triangulation_method));
     engine->SetResectionMethod(static_cast<resection::SolverType>(resection_method));
 
@@ -503,7 +502,6 @@ int main(int argc, char **argv)
     // Configure reconstruction parameters
     engine->Set_Intrinsics_Refinement_Type(intrinsic_refinement_options);
     engine->SetUnknownCameraType(EINTRINSIC(user_camera_model));
-    engine->Set_Use_Motion_Prior(b_use_motion_priors);
     engine->SetTriangulationMethod(static_cast<ETriangulationMethod>(triangulation_method));
     engine->SetResectionMethod(static_cast<resection::SolverType>(resection_method));
 
@@ -521,10 +519,6 @@ int main(int argc, char **argv)
     // Configuration:
     engine->SetFeaturesProvider(feats_provider.get());
     engine->SetMatchesProvider(matches_provider.get());
-
-    // Configure reconstruction parameters
-    engine->Set_Intrinsics_Refinement_Type(intrinsic_refinement_options);
-    engine->Set_Use_Motion_Prior(b_use_motion_priors);
 
     // Configure motion averaging method
     engine->SetRotationAveragingMethod(ERotationAveragingMethod(rotation_averaging_method));

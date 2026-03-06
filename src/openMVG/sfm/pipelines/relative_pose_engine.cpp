@@ -131,14 +131,12 @@ bool Relative_Pose_Engine::Relative_Pose_Engine::Process(
       size_t number_matches = matches.size();
       Mat2X x1(2, number_matches), x2(2, number_matches);
       number_matches = 0;
-      const auto& feats_per_view_I = features_provider_->feats_per_view.at(I);
-      const auto& feats_per_view_J = features_provider_->feats_per_view.at(J);
       for (const auto & match : matches)
       {
         x1.col(number_matches) = cam_I->get_ud_pixel(
-          feats_per_view_I[match.i_].coords().cast<double>());
+          features_provider_->feats_per_view.at(I)[match.i_].coords().cast<double>());
         x2.col(number_matches++) = cam_J->get_ud_pixel(
-          feats_per_view_J[match.j_].coords().cast<double>());
+          features_provider_->feats_per_view.at(J)[match.j_].coords().cast<double>());
       }
 
       RelativePose_Info relativePose_info;
@@ -170,14 +168,10 @@ bool Relative_Pose_Engine::Relative_Pose_Engine::Process(
         for (Mat::Index k = 0; k < x1.cols(); ++k)
         {
           Vec3 X;
-
-          const Vec3 a = (*cam_I).oneBearing(x1.col(k));
-          const Vec3 b = (*cam_I).oneBearing(x2.col(k));
-
           if (Triangulate2View
           (
-            pose_I.rotation(), pose_I.translation(), a,
-            pose_J.rotation(), pose_J.translation(), b,
+            pose_I.rotation(), pose_I.translation(), (*cam_I)(x1.col(k)),
+            pose_J.rotation(), pose_J.translation(), (*cam_J)(x2.col(k)),
             X,
             triangulation_method_
           ))
@@ -227,7 +221,7 @@ bool Relative_Pose_Engine::Relative_Pose_Engine::Process(
       }
     }
   }
-  OPENMVG_LOG_INFO << "Relative motion computation took: " << t.elapsedMs() << "(ms)";
+  OPENMVG_LOG_INFO << "Relative motion computation took: " << t.elapsed() << " (s)";
   return !relative_poses_.empty();
 }
 

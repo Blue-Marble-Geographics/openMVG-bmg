@@ -52,7 +52,7 @@ ImplicitSchurComplement::ImplicitSchurComplement(
 ImplicitSchurComplement::~ImplicitSchurComplement() {
 }
 
-void ImplicitSchurComplement::Init(BlockSparseMatrix& A,
+void ImplicitSchurComplement::Init(const BlockSparseMatrix& A,
                                    const double* D,
                                    const double* b) {
   // Since initialization is reasonably heavy, perhaps we can save on

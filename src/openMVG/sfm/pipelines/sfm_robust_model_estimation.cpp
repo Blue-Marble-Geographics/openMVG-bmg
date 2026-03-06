@@ -42,9 +42,9 @@ bool robustRelativePose
     return false;
 
   // Compute the bearing vectors
-  Mat3X bearing1, bearing2;
-  intrinsics1->allBearings(bearing1, x1);
-  intrinsics2->allBearings(bearing2, x2);
+  const Mat3X
+    bearing1 = (*intrinsics1)(x1),
+    bearing2 = (*intrinsics2)(x2);
 
   if (isPinhole(intrinsics1->getType())
       && isPinhole(intrinsics2->getType()))

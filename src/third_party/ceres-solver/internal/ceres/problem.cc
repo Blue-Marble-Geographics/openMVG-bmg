@@ -47,20 +47,10 @@ Problem::~Problem() {}
 ResidualBlockId Problem::AddResidualBlock(
     CostFunction* cost_function,
     LossFunction* loss_function,
-    std::initializer_list<double*> parameter_blocks) {
+    const vector<double*>& parameter_blocks) {
   return problem_impl_->AddResidualBlock(cost_function,
                                          loss_function,
                                          parameter_blocks);
-}
-
-ResidualBlockId Problem::AddResidualBlock(
-    CostFunction* cost_function,
-    LossFunction* loss_function,
-    std::vector<double*>::iterator first, std::vector<double*>::iterator last) {
-  return problem_impl_->AddResidualBlock(cost_function,
-                                         loss_function,
-                                         first,
-                                         last);
 }
 
 ResidualBlockId Problem::AddResidualBlock(
@@ -283,11 +273,5 @@ void Problem::GetResidualBlocksForParameterBlock(
   problem_impl_->GetResidualBlocksForParameterBlock(values,
                                                     residual_blocks);
 }
-
-void Problem::Reserve(int num_parameter_blocks, int num_residual_blocks)
-{
-  problem_impl_->Reserve(num_parameter_blocks, num_residual_blocks);
-}
-
 
 }  // namespace ceres

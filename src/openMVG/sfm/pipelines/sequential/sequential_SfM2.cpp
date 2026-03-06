@@ -116,7 +116,7 @@ bool SequentialSfMReconstructionEngine2::Process() {
       const bool bTriangulation = Triangulation();
       Save(sfm_data_, stlplus::create_filespec(sOut_directory_, "Initialization", ".ply"), ESfM_Data(ALL));
       RemoveOutliers_AngleError(sfm_data_, Square(2.0));
-      RemoveOutliers_PixelResidualErrorWithoutCount(sfm_data_, Square(4.0));
+      RemoveOutliers_PixelResidualError(sfm_data_, Square(4.0));
 
       //-- Display some statistics
       OPENMVG_LOG_INFO
@@ -164,7 +164,7 @@ bool SequentialSfMReconstructionEngine2::Process() {
       BundleAdjustment();
       // Remove unstable triangulations and camera poses
       RemoveOutliers_AngleError(sfm_data_, 2.0);
-      RemoveOutliers_PixelResidualErrorWithoutCount(sfm_data_, 4.0);
+      RemoveOutliers_PixelResidualError(sfm_data_, 4.0);
       eraseUnstablePosesAndObservations(sfm_data_);
 
       std::ostringstream os;
@@ -325,25 +325,6 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
     return tracks_ids;
   }();
 
-#ifdef OPENMVG_USE_OPENMP
-  struct ParallelData_t
-  {
-    openMVG::tracks::STLMAPTracks view_tracks;
-    std::vector<IndexT> feature_id_for_resection;
-    Image_Localizer_Match_Data resection_data;
-    Mat2X pt2D_original;
-    std::vector<IndexT> track_id_for_resection;
-
-    ParallelData_t()
-    {
-      resection_data.pt2D.resize(2, Eigen::NoChange);
-      resection_data.pt3D.resize(3, Eigen::NoChange);
-    }
-  };
-
-  std::vector<ParallelData_t> parallelDataPool(omp_get_max_threads());
-#endif
-
   // List the view that have a sufficient 2D-3D coverage for robust pose estimation
 #pragma omp parallel
   for (const auto & view_id : view_with_no_pose)
@@ -353,33 +334,20 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
 #endif
     {
       // List the track related to the current view_id
-
-#ifdef OPENMVG_USE_OPENMP
-      size_t current_thread = omp_get_thread_num();
-      auto& view_tracks = parallelDataPool[current_thread].view_tracks; // Will be cleared
-#else
       openMVG::tracks::STLMAPTracks view_tracks;
-#endif
-
       shared_track_visibility_helper_->GetTracksInImages({view_id}, view_tracks);
       std::set<IndexT> view_tracks_ids;
       tracks::TracksUtilsMap::GetTracksIdVector(view_tracks, &view_tracks_ids);
 
       // Get the ids of the already reconstructed tracks
-#ifdef OPENMVG_USE_OPENMP
-      auto& track_id_for_resection = parallelDataPool[current_thread].track_id_for_resection;
-      track_id_for_resection.clear();
-      track_id_for_resection.reserve(std::min(view_tracks_ids.size(), reconstructed_trackId.size()));
-#else
-      openMVG::tracks::STLMAPTracks view_tracks;
-#endif
-      std::set_intersection(
-        view_tracks_ids.cbegin(),
-        view_tracks_ids.cend(),
-        reconstructed_trackId.cbegin(),
-        reconstructed_trackId.cend(),
-        std::back_inserter(track_id_for_resection)
-      );
+      const std::set<IndexT> track_id_for_resection = [&]
+      {
+        std::set<IndexT> track_id;
+        std::set_intersection(view_tracks_ids.cbegin(), view_tracks_ids.cend(),
+          reconstructed_trackId.cbegin(), reconstructed_trackId.cend(),
+          std::inserter(track_id, track_id.begin()));
+        return track_id;
+      }();
 
       const double track_ratio = track_id_for_resection.size() / static_cast<float>(view_tracks_ids.size() + 1);
       OPENMVG_LOG_INFO
@@ -390,12 +358,7 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
       if (!track_id_for_resection.empty() && track_ratio > track_inlier_ratio)
       {
         // Get feat_id for the 2D/3D associations
-#ifdef OPENMVG_USE_OPENMP
-        auto& feature_id_for_resection = parallelDataPool[current_thread].feature_id_for_resection;
-        feature_id_for_resection.clear();
-#else
         std::vector<IndexT> feature_id_for_resection;
-#endif
         tracks::TracksUtilsMap::GetFeatIndexPerViewAndTrackId(
           view_tracks,
           track_id_for_resection,
@@ -403,16 +366,9 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
           &feature_id_for_resection);
 
         // Localize the image inside the SfM reconstruction
-#ifdef OPENMVG_USE_OPENMP
-        auto& resection_data = parallelDataPool[current_thread].resection_data;
-        resection_data.vec_inliers.clear();
-#else
         Image_Localizer_Match_Data resection_data;
-#endif
-        // JPB WIP OPT This is always allocating memory.  Change so it only
-        // allocates larger.
-        resection_data.pt2D.resize( Eigen::NoChange, track_id_for_resection.size() );
-        resection_data.pt3D.resize( Eigen::NoChange, track_id_for_resection.size() );
+        resection_data.pt2D.resize(2, track_id_for_resection.size());
+        resection_data.pt3D.resize(3, track_id_for_resection.size());
 
         // Look if the intrinsic data is known or not
         const View * view = sfm_data_.GetViews().at(view_id).get();
@@ -423,21 +379,14 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
         }
 
         // Collect the feature observation
-#ifdef OPENMVG_USE_OPENMP
-        Mat2X& pt2D_original = parallelDataPool[current_thread].pt2D_original;
-        pt2D_original.resize(2, track_id_for_resection.size());
-#else
         Mat2X pt2D_original(2, track_id_for_resection.size());
-#endif
         auto track_it = track_id_for_resection.cbegin();
         auto feat_it = feature_id_for_resection.cbegin();
-        const auto& landmarks = sfm_data_.GetLandmarks();
-        const auto& feats = features_provider_->feats_per_view;
         for (size_t cpt = 0; cpt < track_id_for_resection.size(); ++cpt, ++track_it, ++feat_it)
         {
-          resection_data.pt3D.col(cpt) = landmarks.find(*track_it)->second.X;
+          resection_data.pt3D.col(cpt) = sfm_data_.GetLandmarks().at(*track_it).X;
           resection_data.pt2D.col(cpt) = pt2D_original.col(cpt) =
-            feats.find(view_id)->second[*feat_it].coords().cast<double>();
+            features_provider_->feats_per_view.at(view_id)[*feat_it].coords().cast<double>();
           // Handle image distortion if intrinsic is known (to ease the resection)
           if (intrinsic && intrinsic->have_disto())
           {

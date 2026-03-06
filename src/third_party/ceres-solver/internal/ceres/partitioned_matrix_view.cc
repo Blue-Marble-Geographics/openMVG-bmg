@@ -48,7 +48,7 @@ namespace internal {
 
 PartitionedMatrixViewBase*
 PartitionedMatrixViewBase::Create(const LinearSolver::Options& options,
-                                  BlockSparseMatrix& matrix) {
+                                  const BlockSparseMatrix& matrix) {
 #ifndef CERES_RESTRICT_SCHUR_SPECIALIZATION
  if ((options.row_block_size == 2) &&
      (options.e_block_size == 2) &&

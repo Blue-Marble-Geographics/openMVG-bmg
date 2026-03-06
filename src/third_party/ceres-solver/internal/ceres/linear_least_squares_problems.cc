@@ -287,9 +287,6 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem1() {
 
 // BlockSparseMatrix version
 LinearLeastSquaresProblem* LinearLeastSquaresProblem2() {
-  
-  throw std::runtime_error( "Unsupported" );
-#if 0
   int num_rows = 6;
   int num_cols = 5;
 
@@ -303,8 +300,9 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem2() {
   scoped_array<double> values(new double[num_rows * num_cols]);
 
   for (int c = 0; c < num_cols; ++c) {
-    bs->col_sizes.push_back(1);
-    bs->col_positions.push_back(c);
+    bs->cols.push_back(Block());
+    bs->cols.back().size = 1;
+    bs->cols.back().position = c;
   }
 
   int nnz = 0;
@@ -403,9 +401,6 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem2() {
   problem->A.reset(A);
 
   return problem;
-#else
-  return nullptr;
-#endif
 }
 
 
@@ -426,9 +421,6 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem2() {
 */
 // BlockSparseMatrix version
 LinearLeastSquaresProblem* LinearLeastSquaresProblem3() {
-#if 1 
-  return nullptr;
-#else
   int num_rows = 5;
   int num_cols = 2;
 
@@ -442,8 +434,9 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem3() {
   scoped_array<double> values(new double[num_rows * num_cols]);
 
   for (int c = 0; c < num_cols; ++c) {
-    bs->col_sizes.back() = 1;
-    bs->col_positions.back() = c;
+    bs->cols.push_back(Block());
+    bs->cols.back().size = 1;
+    bs->cols.back().position = c;
   }
 
   int nnz = 0;
@@ -512,7 +505,6 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem3() {
   problem->A.reset(A);
 
   return problem;
-#endif
 }
 
 /*
@@ -536,9 +528,6 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem3() {
 // NOTE: This problem is too small and rank deficient to be solved without
 // the diagonal regularization.
 LinearLeastSquaresProblem* LinearLeastSquaresProblem4() {
-#if 1
-  return nullptr;
-#else
   int num_rows = 3;
   int num_cols = 7;
 
@@ -552,14 +541,17 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem4() {
   scoped_array<double> values(new double[num_rows * num_cols]);
 
   // Column block structure
-  bs->col_sizes.back() = 2;
-  bs->col_positions.back() = 0;
+  bs->cols.push_back(Block());
+  bs->cols.back().size = 2;
+  bs->cols.back().position = 0;
 
-  bs->col_sizes.back() = 3;
-  bs->col_positions.back() = 2;
+  bs->cols.push_back(Block());
+  bs->cols.back().size = 3;
+  bs->cols.back().position = 2;
 
-  bs->col_sizes.back() = 2;
-  bs->col_positions.back() = 5;
+  bs->cols.push_back(Block());
+  bs->cols.back().size = 2;
+  bs->cols.back().position = 5;
 
   int nnz = 0;
 
@@ -613,7 +605,6 @@ LinearLeastSquaresProblem* LinearLeastSquaresProblem4() {
 
   problem->A.reset(A);
   return problem;
-#endif
 }
 
 namespace {

@@ -56,7 +56,7 @@ struct Block {
 };
 
 struct Cell {
-  Cell() {}
+  Cell() : block_id(-1), position(-1) {}
   Cell(int block_id_, int position_)
       : block_id(block_id_), position(position_) {}
 
@@ -79,33 +79,18 @@ struct CompressedList {
   std::vector<Cell> cells;
 };
 
-struct CompressedList2 {
-  CompressedList2() {}
-
-  // Construct a CompressedList with the cells containing num_cells
-  // entries.
-  CompressedList2(std::vector<Cell>& parent_cells) : cells(parent_cells.data()), num_cells(parent_cells.size()) {}
-  Block block;
-  Cell* cells = nullptr;
-  int num_cells = 0;
-};
-
+typedef CompressedList CompressedRow;
 typedef CompressedList CompressedColumn;
-typedef CompressedList2 CompressedRow;
 
 struct CompressedRowBlockStructure {
-  std::vector<BlockSize> col_sizes;
-  std::vector<int> col_positions;
+  std::vector<Block> cols;
   std::vector<CompressedRow> rows;
-  std::vector<Cell> all_cells;
 };
 
-#if 0
 struct CompressedColumnBlockStructure {
   std::vector<Block> rows;
   std::vector<CompressedColumn> cols;
 };
-#endif
 
 }  // namespace internal
 }  // namespace ceres

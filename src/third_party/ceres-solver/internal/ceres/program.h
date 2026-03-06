@@ -35,7 +35,6 @@
 #include <string>
 #include <vector>
 #include "ceres/internal/port.h"
-#include "ceres/ordered_groups.h"
 
 namespace ceres {
 namespace internal {
@@ -122,7 +121,7 @@ class Program {
   // parameter_blocks as that would violate the assumption that it
   // is an independent set in the Hessian matrix.
   bool IsParameterBlockSetIndependent(
-    const std::set<double*, std::less<double*>, Mallocator<double*>>& independent_set) const;
+      const std::set<double*>& independent_set) const;
 
   // Create a TripletSparseMatrix which contains the zero-one
   // structure corresponding to the block sparsity of the transpose of
@@ -163,12 +162,6 @@ class Program {
   // A human-readable dump of the parameter blocks for debugging.
   // TODO(keir): If necessary, also dump the residual blocks.
   std::string ToString() const;
-
-  void Reserve(int num_parameter_blocks, int num_residual_blocks)
-  {
-    parameter_blocks_.reserve(num_parameter_blocks);
-    residual_blocks_.reserve(num_residual_blocks);
-  }
 
  private:
   // Remove constant parameter blocks and residual blocks with no

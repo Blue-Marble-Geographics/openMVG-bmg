@@ -95,7 +95,8 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
     const int col_block_size = blocks_[it->second];
     cell_values_.push_back(make_pair(make_pair(it->first, it->second),
                                      values + pos));
-    layout_.emplace(IntPairToLong(it->first, it->second), values + pos);
+    layout_[IntPairToLong(it->first, it->second)] =
+        new CellInfo(values + pos);
     pos += row_block_size * col_block_size;
   }
 
@@ -108,7 +109,7 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
     const int row_block_size = blocks_[row_block_id];
     const int col_block_size = blocks_[col_block_id];
     int pos =
-        layout_[IntPairToLong(row_block_id, col_block_id)].values - values;
+        layout_[IntPairToLong(row_block_id, col_block_id)]->values - values;
     for (int r = 0; r < row_block_size; ++r) {
       for (int c = 0; c < col_block_size; ++c, ++pos) {
           rows[pos] = block_positions_[row_block_id] + r;
@@ -124,6 +125,11 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
 // Assume that the user does not hold any locks on any cell blocks
 // when they are calling SetZero.
 BlockRandomAccessSparseMatrix::~BlockRandomAccessSparseMatrix() {
+  for (LayoutType::iterator it = layout_.begin();
+       it != layout_.end();
+       ++it) {
+    delete it->second;
+  }
 }
 
 CellInfo* BlockRandomAccessSparseMatrix::GetCell(int row_block_id,
@@ -143,7 +149,7 @@ CellInfo* BlockRandomAccessSparseMatrix::GetCell(int row_block_id,
   *col = 0;
   *row_stride = blocks_[row_block_id];
   *col_stride = blocks_[col_block_id];
-  return &it->second;
+  return it->second;
 }
 
 // Assume that the user does not hold any locks on any cell blocks

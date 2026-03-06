@@ -35,10 +35,7 @@
 #include <vector>
 #include "ceres/mutex.h"
 #include "ceres/block_random_access_matrix.h"
-#include "ceres/block_random_access_dense_matrix.h"
-#include "ceres/block_random_access_diagonal_matrix.h"
 #include "ceres/block_sparse_matrix.h"
-#include "ceres/block_random_access_sparse_matrix.h"
 #include "ceres/block_structure.h"
 #include "ceres/linear_solver.h"
 #include "ceres/internal/eigen.h"
@@ -46,8 +43,6 @@
 
 namespace ceres {
 namespace internal {
-
-enum MatrixType { eDense, eDiagonal, eSparse };
 
 // Classes implementing the SchurEliminatorBase interface implement
 // variable elimination for linear least squares problems. Assuming
@@ -276,7 +271,7 @@ class SchurEliminator : public SchurEliminatorBase {
   // buffer_layout[z1] = 0
   // buffer_layout[z5] = y1 * z1
   // buffer_layout[z2] = y1 * z1 + y1 * z5
-  typedef std::vector<std::pair<int, int>> BufferLayoutType;
+  typedef std::map<int, int> BufferLayoutType;
   struct Chunk {
     Chunk() : size(0) {}
     int size;
@@ -292,8 +287,7 @@ class SchurEliminator : public SchurEliminatorBase {
       typename EigenTypes<kEBlockSize, kEBlockSize>::Matrix* eet,
       double* g,
       double* buffer,
-      BlockRandomAccessMatrix* lhs,
-      MatrixType lhsType);
+      BlockRandomAccessMatrix* lhs);
 
   void UpdateRhs(const Chunk& chunk,
                  const BlockSparseMatrix* A,
@@ -302,181 +296,21 @@ class SchurEliminator : public SchurEliminatorBase {
                  const double* inverse_ete_g,
                  double* rhs);
 
-  // Compute the outer product F'E(E'E)^{-1}E'F and subtract it from the
-  // Schur complement matrix, i.e
-  //
-  //  S -= F'E(E'E)^{-1}E'F.
-  template<class T>
   void ChunkOuterProduct(const CompressedRowBlockStructure* bs,
-                         const typename EigenTypes<kEBlockSize, kEBlockSize>::Matrix& inverse_ete,
+                         const Matrix& inverse_eet,
                          const double* buffer,
                          const BufferLayoutType& buffer_layout,
-                         T* lhs,
-                         int thread_id) {
-    // This is the most computationally expensive part of this
-    // code. Profiling experiments reveal that the bottleneck is not the
-    // computation of the right-hand matrix product, but memory
-    // references to the left hand side.
-    const int e_block_size = inverse_ete.rows();
+                         BlockRandomAccessMatrix* lhs);
+  void EBlockRowOuterProduct(const BlockSparseMatrix* A,
+                             int row_block_index,
+                             BlockRandomAccessMatrix* lhs);
 
-    double* __restrict b1_transpose_inverse_ete =
-      chunk_outer_product_buffer_.get() + thread_id * buffer_size_;
-    const auto& bs_cols_sizes = bs->col_sizes;
-
-    SmallBiasHelper sbhOuter;
-    sbhOuter.num_row_a_ = e_block_size;
-    sbhOuter.B_ = inverse_ete.data();
-    sbhOuter.num_row_b_ = e_block_size;
-    sbhOuter.num_col_b_ = e_block_size;
-    sbhOuter.C_ = b1_transpose_inverse_ete;
-    sbhOuter.cih_.r_ = 0;
-    sbhOuter.cih_.c_ = 0;
-    sbhOuter.cih_.col_stride_ = e_block_size;
-
-    SmallBiasHelper sbhInner;
-    sbhInner.A_ = b1_transpose_inverse_ete;
-    sbhInner.num_col_a_ = e_block_size;
-    sbhInner.num_row_b_ = e_block_size;
-
-    // S(i,j) -= bi' * ete^{-1} b_j
-
-    const int cnt = buffer_layout.size();
-    for (auto i = 0; i < cnt; ++i) {
-      const auto& layout_i = buffer_layout[i];
-      const int block1 = layout_i.first - num_eliminate_blocks_;
-
-      sbhOuter.A_ = buffer + layout_i.second;
-
-      lhs->T::PrepareGetCellHelper(sbhInner.cih_, block1);
-
-      const int block1_size = bs_cols_sizes[layout_i.first];
-      sbhOuter.num_col_a_ = block1_size;
-      sbhInner.num_row_a_ = block1_size;
-      sbhOuter.cih_.row_stride_ = block1_size;
-
-      MatrixTransposeMatrixMultiply2
-        <kEBlockSize, kFBlockSize, kEBlockSize, kEBlockSize, 0>(sbhOuter);
-
-      for (auto j = i; j < cnt; ++j) {
-        const auto& layout_j = buffer_layout[j];
-        const int block2 = layout_j.first - num_eliminate_blocks_;
-
-        CellInfo* __restrict cell_info = lhs->T::GetCellHelped(sbhInner.cih_, block2);
-        if (cell_info) {
-          const int block2_size = bs_cols_sizes[layout_j.first];
-          sbhInner.B_ = buffer + layout_j.second;
-          sbhInner.num_col_b_ = block2_size;
-          sbhInner.C_ = cell_info->values;
-
-          auto& lock = cell_info->m;
-          if (num_threads_ > 1) {
-            lock.Lock();
-          }
-
-          MatrixMatrixMultiply2
-            <kFBlockSize, kEBlockSize, kEBlockSize, kFBlockSize, -1>(sbhInner);
-
-          if (num_threads_ > 1) {
-            lock.Unlock();
-          }
-        }
-      }
-    }
-  }
-
-
-
-  // For a row with an e_block, compute the contribution S += F'F. This
-  // function has the same structure as NoEBlockRowOuterProduct, except
-  // that this function uses the template parameters.
-  template<class T>
-  void EBlockRowOuterProduct(const CompressedRowBlockStructure* bs,
-                            const double* values,
-                            int row_block_index,
-                            T* lhs) {
-    const CompressedRow& row = bs->rows[row_block_index];
-    const auto row_block_size = row.block.size;
-    const auto& bs_col_sizes = bs->col_sizes;
-
-    SmallBiasHelper sbhOuter;
-    sbhOuter.num_row_a_ = row_block_size;
-    sbhOuter.num_row_b_ = row_block_size;
-
-    SmallBiasHelper sbhInner;
-    sbhInner.num_row_a_ = row_block_size;
-    sbhInner.num_row_b_ = row_block_size;
-
-    for (int i = 1, cnt = row.num_cells; i < cnt; ++i) {
-      const auto& row_cell_i = row.cells[i];
-      const auto* /* restrict? */ row_cell_i_values_position = values + row_cell_i.position;
-
-      sbhInner.A_ = row_cell_i_values_position;
-
-      const int block1 = row_cell_i.block_id - num_eliminate_blocks_;
-      DCHECK_GE(block1, 0);
-
-      const int block1_size = bs_col_sizes[row_cell_i.block_id];
-      sbhInner.num_col_a_ = block1_size;
-      CellInfo* __restrict cell_info = lhs->GetCell(block1, block1,
-                                                    &sbhOuter.cih_.r_, &sbhOuter.cih_.c_,
-                                                    &sbhOuter.cih_.row_stride_, &sbhOuter.cih_.col_stride_);
-      if (cell_info) {
-        sbhOuter.A_ = row_cell_i_values_position;
-        sbhOuter.B_ = row_cell_i_values_position;
-        sbhOuter.num_col_a_ = block1_size;
-        sbhOuter.num_col_b_ = block1_size;
-        sbhOuter.C_ = cell_info->values;
-        auto& lock = cell_info->m;
-        if (num_threads_ > 1) {
-          lock.Lock();
-        }
-
-        // block += b1.transpose() * b1;
-        MatrixTransposeMatrixMultiply2
-          <kRowBlockSize, kFBlockSize, kRowBlockSize, kFBlockSize, 1>(sbhOuter);
-
-        if (num_threads_ > 1) {
-          lock.Unlock();
-        }
-      }
-
-      lhs->T::PrepareGetCellHelper(sbhInner.cih_, block1);
-
-      for (int j = i + 1; j < cnt; ++j) {
-        const auto& row_cell_j = row.cells[j];
-        const int block2 = row_cell_j.block_id - num_eliminate_blocks_;
-        DCHECK_GE(block2, 0);
-        DCHECK_LT(block1, block2);
-        CellInfo* __restrict cell_info = lhs->T::GetCellHelped(sbhInner.cih_, block2);
-
-        if (cell_info) {
-          // block += b1.transpose() * b2;
-          const int block2_size = bs_col_sizes[row_cell_j.block_id];
-          sbhInner.B_ = values + row_cell_j.position;
-          sbhInner.num_col_b_ = block2_size;
-          sbhInner.C_ = cell_info->values;
-
-          auto& lock = cell_info->m;
-          if (num_threads_ > 1) {
-            lock.Lock();
-          }
-
-          MatrixTransposeMatrixMultiply2
-            <kRowBlockSize, kFBlockSize, kRowBlockSize, kFBlockSize, 1>(sbhInner);
-
-          if (num_threads_ > 1) {
-            lock.Unlock();
-          }
-        }
-      }
-    }
-  }
 
   void NoEBlockRowsUpdate(const BlockSparseMatrix* A,
-                          const double* b,
-                          int row_block_counter,
-                          BlockRandomAccessMatrix* lhs,
-                          double* rhs);
+                             const double* b,
+                             int row_block_counter,
+                             BlockRandomAccessMatrix* lhs,
+                             double* rhs);
 
   void NoEBlockRowOuterProduct(const BlockSparseMatrix* A,
                                int row_block_index,
@@ -521,7 +355,7 @@ class SchurEliminator : public SchurEliminatorBase {
 
   // Locks for the blocks in the right hand side of the reduced linear
   // system.
-  std::vector<Mutex> rhs_locks_;
+  std::vector<Mutex*> rhs_locks_;
 };
 
 }  // namespace internal
