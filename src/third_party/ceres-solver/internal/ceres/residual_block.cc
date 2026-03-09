@@ -52,17 +52,14 @@ namespace internal {
 ResidualBlock::ResidualBlock(
     const CostFunction* cost_function,
     const LossFunction* loss_function,
-    const std::vector<ParameterBlock*>& parameter_blocks,
+    const FixedArray<ParameterBlock*, 10>& parameter_blocks,
     int index)
     : cost_function_(cost_function),
       loss_function_(loss_function),
-      parameter_blocks_(
-          new ParameterBlock* [
-              cost_function->parameter_block_sizes().size()]),
       index_(index) {
   std::copy(parameter_blocks.begin(),
             parameter_blocks.end(),
-            parameter_blocks_.get());
+            parameter_blocks_);
 }
 
 bool ResidualBlock::Evaluate(const bool apply_loss_function,
@@ -75,13 +72,13 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
 
   // Collect the parameters from their blocks. This will rarely allocate, since
   // residuals taking more than 8 parameter block arguments are rare.
-  FixedArray<const double*, 8> parameters(num_parameter_blocks);
+  FixedArray<const double*, 10> parameters(num_parameter_blocks);
   for (int i = 0; i < num_parameter_blocks; ++i) {
     parameters[i] = parameter_blocks_[i]->state();
   }
 
   // Put pointers into the scratch space into global_jacobians as appropriate.
-  FixedArray<double*, 8> global_jacobians(num_parameter_blocks);
+  FixedArray<double*, 10> global_jacobians(num_parameter_blocks);
   if (jacobians != NULL) {
     for (int i = 0; i < num_parameter_blocks; ++i) {
       const ParameterBlock* parameter_block = parameter_blocks_[i];
@@ -132,7 +129,14 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
     return false;
   }
 
+#if 1// Much faster than Eigen for small num_residuals
+  double squared_norm = 0.;
+  for (int i = 0; i != num_residuals; ++i) {
+    squared_norm += residuals[i]*residuals[i];
+  }
+#else
   double squared_norm = VectorRef(residuals, num_residuals).squaredNorm();
+#endif
 
   // Update the jacobians with the local parameterizations.
   if (jacobians != NULL) {

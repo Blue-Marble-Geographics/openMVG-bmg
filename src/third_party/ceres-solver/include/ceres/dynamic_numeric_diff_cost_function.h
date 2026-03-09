@@ -94,12 +94,13 @@ class DynamicNumericDiffCostFunction : public DynamicCostFunction {
                         double* residuals,
                         double** jacobians) const {
     using internal::NumericDiff;
-    CHECK_GT(num_residuals(), 0)
+    DCHECK_GT(num_residuals(), 0)
         << "You must call DynamicNumericDiffCostFunction::SetNumResiduals() "
         << "before DynamicNumericDiffCostFunction::Evaluate().";
 
-    const std::vector<int32>& block_sizes = parameter_block_sizes();
-    CHECK(!block_sizes.empty())
+    const int32* block_sizes = parameter_block_sizes();
+    const auto cnt = num_parameter_block_sizes();
+    DCHECK(cnt)
         << "You must call DynamicNumericDiffCostFunction::AddParameterBlock() "
         << "before DynamicNumericDiffCostFunction::Evaluate().";
 
@@ -109,23 +110,23 @@ class DynamicNumericDiffCostFunction : public DynamicCostFunction {
     }
 
     // Create local space for a copy of the parameters which will get mutated.
-    int parameters_size = accumulate(block_sizes.begin(), block_sizes.end(), 0);
+    int parameters_size = std::accumulate(block_sizes, block_sizes+cnt, 0);
     std::vector<double> parameters_copy(parameters_size);
-    std::vector<double*> parameters_references_copy(block_sizes.size());
+    std::vector<double*> parameters_references_copy(cnt);
     parameters_references_copy[0] = &parameters_copy[0];
-    for (size_t block = 1; block < block_sizes.size(); ++block) {
+    for (size_t block = 1; block < cnt; ++block) {
       parameters_references_copy[block] = parameters_references_copy[block - 1]
           + block_sizes[block - 1];
     }
 
     // Copy the parameters into the local temp space.
-    for (size_t block = 0; block < block_sizes.size(); ++block) {
+    for (size_t block = 0; block < cnt; ++block) {
       memcpy(parameters_references_copy[block],
              parameters[block],
              block_sizes[block] * sizeof(*parameters[block]));
     }
 
-    for (size_t block = 0; block < block_sizes.size(); ++block) {
+    for (size_t block = 0; block < cnt; ++block) {
       if (jacobians[block] != NULL &&
           !NumericDiff<CostFunctor, method, DYNAMIC,
                        DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC,

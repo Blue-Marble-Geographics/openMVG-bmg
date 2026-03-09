@@ -47,6 +47,203 @@ using std::map;
 using std::set;
 using std::vector;
 
+#if 1
+int ComputeStableSchurOrdering(const Program& program,
+  vector<ParameterBlock*>* ordering) {
+  CHECK_NOTNULL(ordering)->clear();
+  EventLogger eventLogger("ComputeStableSchurOrdering");
+
+  const vector<ParameterBlock*>& parameterBlocks = program.parameter_blocks();
+  const vector<ResidualBlock*>& residualBlocks = program.residual_blocks();
+
+  const int numParameterBlocks = static_cast<int>(parameterBlocks.size());
+  const int numResidualBlocks = static_cast<int>(residualBlocks.size());
+
+  int numNonConstant = 0;
+  for (int i = 0; i < numParameterBlocks; ++i) {
+    if (!parameterBlocks[i]->IsConstant()) {
+      ++numNonConstant;
+    }
+  }
+
+  if (numNonConstant == 0) {
+    for (int i = 0; i < numParameterBlocks; ++i) {
+      if (parameterBlocks[i]->IsConstant()) {
+        ordering->push_back(parameterBlocks[i]);
+      }
+    }
+    return 0;
+  }
+
+  HashMap<ParameterBlock*, int> blockToIndex;
+  blockToIndex.reserve(numNonConstant);
+
+  vector<ParameterBlock*> nonConstantBlocks;
+  nonConstantBlocks.reserve(numNonConstant);
+
+  for (int i = 0; i < numParameterBlocks; ++i) {
+    ParameterBlock* const pb = parameterBlocks[i];
+    if (pb->IsConstant()) {
+      continue;
+    }
+
+    const int idx = static_cast<int>(nonConstantBlocks.size());
+    nonConstantBlocks.push_back(pb);
+    blockToIndex.emplace(pb, idx);
+  }
+
+  struct ResidualAdj {
+    int offset;
+    int count;
+  };
+
+  vector<ResidualAdj> residualAdj;
+  residualAdj.reserve(numResidualBlocks);
+
+  vector<int> residualBlockIds;
+  residualBlockIds.reserve(numResidualBlocks * 2);
+
+  vector<vector<int> > residualsForBlock(numNonConstant);
+
+  for (int r = 0; r < numResidualBlocks; ++r) {
+    const ResidualBlock* residualBlock = residualBlocks[r];
+    ParameterBlock* const* pb = residualBlock->parameter_blocks();
+    const int numPb = residualBlock->NumParameterBlocks();
+
+    const int start = static_cast<int>(residualBlockIds.size());
+    int count = 0;
+
+    if (numPb == 2) {
+      if (!pb[0]->IsConstant() && !pb[1]->IsConstant()) {
+        residualBlockIds.push_back(blockToIndex.find(pb[0])->second);
+        residualBlockIds.push_back(blockToIndex.find(pb[1])->second);
+        count = 2;
+      }
+    }
+    else {
+      for (int j = 0; j < numPb; ++j) {
+        if (pb[j]->IsConstant()) {
+          continue;
+        }
+
+        residualBlockIds.push_back(blockToIndex.find(pb[j])->second);
+        ++count;
+      }
+    }
+
+    if (count < 2) {
+      residualBlockIds.resize(start);
+      continue;
+    }
+
+    const int residualIndex = static_cast<int>(residualAdj.size());
+    ResidualAdj adj;
+    adj.offset = start;
+    adj.count = count;
+    residualAdj.push_back(adj);
+
+    for (int j = 0; j < count; ++j) {
+      residualsForBlock[residualBlockIds[start + j]].push_back(residualIndex);
+    }
+  }
+  eventLogger.AddEvent("BuildInverseIncidence");
+
+  vector<int> degree(numNonConstant, 0);
+  vector<int> mark(numNonConstant, -1);
+
+  for (int i = 0; i < numNonConstant; ++i) {
+    int deg = 0;
+    const vector<int>& incidentResiduals = residualsForBlock[i];
+
+    for (int rr = 0; rr < static_cast<int>(incidentResiduals.size()); ++rr) {
+      const ResidualAdj& adj = residualAdj[incidentResiduals[rr]];
+      const int begin = adj.offset;
+      const int end = begin + adj.count;
+
+      for (int p = begin; p < end; ++p) {
+        const int nbr = residualBlockIds[p];
+        if (nbr == i) {
+          continue;
+        }
+        if (mark[nbr] == i) {
+          continue;
+        }
+
+        mark[nbr] = i;
+        ++deg;
+      }
+    }
+
+    degree[i] = deg;
+  }
+  eventLogger.AddEvent("ComputeDegrees");
+
+  vector<int> vertexQueue(numNonConstant);
+  for (int i = 0; i < numNonConstant; ++i) {
+    vertexQueue[i] = i;
+  }
+
+  std::stable_sort(vertexQueue.begin(), vertexQueue.end(),
+    [&](int lhs, int rhs) {
+      return degree[lhs] < degree[rhs];
+    });
+  eventLogger.AddEvent("DegreeSort");
+
+  const char kWhite = 0;
+  const char kGrey = 1;
+  const char kBlack = 2;
+
+  vector<char> color(numNonConstant, kWhite);
+
+  ordering->reserve(numParameterBlocks);
+
+  for (int q = 0; q < numNonConstant; ++q) {
+    const int v = vertexQueue[q];
+    if (color[v] != kWhite) {
+      continue;
+    }
+
+    ordering->push_back(nonConstantBlocks[v]);
+    color[v] = kBlack;
+
+    const vector<int>& incidentResiduals = residualsForBlock[v];
+    for (int rr = 0; rr < static_cast<int>(incidentResiduals.size()); ++rr) {
+      const ResidualAdj& adj = residualAdj[incidentResiduals[rr]];
+      const int begin = adj.offset;
+      const int end = begin + adj.count;
+
+      for (int p = begin; p < end; ++p) {
+        const int nbr = residualBlockIds[p];
+        if (nbr != v) {
+          color[nbr] = kGrey;
+        }
+      }
+    }
+  }
+
+  const int independentSetSize = static_cast<int>(ordering->size());
+  eventLogger.AddEvent("StableIndependentSet");
+
+  for (int q = 0; q < numNonConstant; ++q) {
+    const int v = vertexQueue[q];
+    DCHECK(color[v] != kWhite);
+    if (color[v] != kBlack) {
+      ordering->push_back(nonConstantBlocks[v]);
+    }
+  }
+  eventLogger.AddEvent("RemainingNonConstantParameterBlocks");
+
+  for (int i = 0; i < numParameterBlocks; ++i) {
+    ParameterBlock* const pb = parameterBlocks[i];
+    if (pb->IsConstant()) {
+      ordering->push_back(pb);
+    }
+  }
+  eventLogger.AddEvent("ConstantParameterBlocks");
+
+  return independentSetSize;
+}
+#else
 int ComputeStableSchurOrdering(const Program& program,
                          vector<ParameterBlock*>* ordering) {
   CHECK_NOTNULL(ordering)->clear();
@@ -77,6 +274,7 @@ int ComputeStableSchurOrdering(const Program& program,
 
   return independent_set_size;
 }
+#endif
 
 int ComputeSchurOrdering(const Program& program,
                          vector<ParameterBlock*>* ordering) {

@@ -163,6 +163,12 @@ class Program {
   // TODO(keir): If necessary, also dump the residual blocks.
   std::string ToString() const;
 
+  void Reserve(int num_parameter_blocks, int num_residual_blocks)
+  {
+    parameter_blocks_.reserve(num_parameter_blocks);
+    residual_blocks_.reserve(num_residual_blocks);
+  }
+
  private:
   // Remove constant parameter blocks and residual blocks with no
   // varying parameter blocks while preserving their relative order.

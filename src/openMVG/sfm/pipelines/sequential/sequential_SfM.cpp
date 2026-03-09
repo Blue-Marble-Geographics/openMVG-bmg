@@ -796,18 +796,16 @@ bool SequentialSfMReconstructionEngine::FindImagesWithPossibleResection(
       const uint32_t viewId = *iter;
 
       // Compute 2D - 3D possible content
-      openMVG::tracks::STLMAPTracks map_tracksCommon;
-      shared_track_visibility_helper_->GetTracksInImages({viewId}, map_tracksCommon);
+      std::vector<uint32_t> view_track_ids;
+      std::vector<uint32_t> view_feat_ids;
+      shared_track_visibility_helper_->GetTracksInImages({viewId}, view_track_ids, view_feat_ids);
 
-      if (!map_tracksCommon.empty())
+      if (!view_track_ids.empty())
       {
-        std::set<uint32_t> set_tracksIds;
-        tracks::TracksUtilsMap::GetTracksIdVector(map_tracksCommon, &set_tracksIds);
-
         // Count the common possible putative point
         //  with the already 3D reconstructed trackId
         std::vector<uint32_t> vec_trackIdForResection;
-        std::set_intersection(set_tracksIds.cbegin(), set_tracksIds.cend(),
+        std::set_intersection(view_track_ids.cbegin(), view_track_ids.cend(),
           reconstructed_trackId.cbegin(), reconstructed_trackId.cend(),
           std::back_inserter(vec_trackIdForResection));
 
@@ -868,8 +866,10 @@ bool SequentialSfMReconstructionEngine::Resection(const uint32_t viewIndex)
   // A1. list tracks ids used by the view
   openMVG::tracks::STLMAPTracks map_tracksCommon;
   shared_track_visibility_helper_->GetTracksInImages({viewIndex}, map_tracksCommon);
-  std::set<uint32_t> set_tracksIds;
-  TracksUtilsMap::GetTracksIdVector(map_tracksCommon, &set_tracksIds);
+
+  std::vector<uint32_t> view_track_ids;
+  std::vector<uint32_t> view_feat_ids;
+  shared_track_visibility_helper_->GetTracksInImages({viewIndex}, view_track_ids, view_feat_ids);
 
   // A2. intersects the track list with the reconstructed
   std::set<uint32_t> reconstructed_trackId;
@@ -879,7 +879,7 @@ bool SequentialSfMReconstructionEngine::Resection(const uint32_t viewIndex)
 
   // Get the ids of the already reconstructed tracks
   std::set<uint32_t> set_trackIdForResection;
-  std::set_intersection(set_tracksIds.cbegin(), set_tracksIds.cend(),
+  std::set_intersection(view_track_ids.cbegin(), view_track_ids.cend(),
     reconstructed_trackId.cbegin(), reconstructed_trackId.cend(),
     std::inserter(set_trackIdForResection, set_trackIdForResection.begin()));
 
@@ -893,11 +893,20 @@ bool SequentialSfMReconstructionEngine::Resection(const uint32_t viewIndex)
 
   // Get back featId associated to a tracksID already reconstructed.
   // These 2D/3D associations will be used for the resection.
+  // Build a lookup from track_id -> feat_id using the flat vectors
   std::vector<uint32_t> vec_featIdForResection;
-  TracksUtilsMap::GetFeatIndexPerViewAndTrackId(map_tracksCommon,
-    set_trackIdForResection,
-    viewIndex,
-    &vec_featIdForResection);
+  vec_featIdForResection.reserve(set_trackIdForResection.size());
+  {
+    // view_track_ids and view_feat_ids are parallel sorted vectors
+    for (const uint32_t & trackId : set_trackIdForResection)
+    {
+      auto it = std::lower_bound(view_track_ids.begin(), view_track_ids.end(), trackId);
+      if (it != view_track_ids.end() && *it == trackId)
+      {
+        vec_featIdForResection.push_back(view_feat_ids[std::distance(view_track_ids.begin(), it)]);
+      }
+    }
+  }
 
   // Localize the image inside the SfM reconstruction
   Image_Localizer_Match_Data resection_data;
@@ -1225,8 +1234,21 @@ bool SequentialSfMReconstructionEngine::BundleAdjustment()
  */
 bool SequentialSfMReconstructionEngine::badTrackRejector(double dPrecision, size_t count)
 {
+  const size_t pointcount_before = sfm_data_.GetLandmarks().size();
   const size_t nbOutliers_residualErr = RemoveOutliers_PixelResidualError(sfm_data_, dPrecision, 2);
+  const size_t pointcount_after_pixel = sfm_data_.GetLandmarks().size();
   const size_t nbOutliers_angleErr = RemoveOutliers_AngleError(sfm_data_, 2.0);
+  const size_t pointcount_after_angle = sfm_data_.GetLandmarks().size();
+
+  OPENMVG_LOG_INFO
+    << "-- badTrackRejector: "
+    << "#poses: " << sfm_data_.GetPoses().size()
+    << " | #tracks before: " << pointcount_before
+    << " | pixel_outliers: " << nbOutliers_residualErr
+    << " (#tracks: " << pointcount_after_pixel << ")"
+    << " | angle_outliers: " << nbOutliers_angleErr
+    << " (#tracks: " << pointcount_after_angle << ")"
+    << " | threshold: " << count;
 
   return (nbOutliers_residualErr + nbOutliers_angleErr) > count;
 }

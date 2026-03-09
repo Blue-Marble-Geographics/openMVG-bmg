@@ -15,6 +15,40 @@
 
 #include <vector>
 
+template <class Archive, typename Key, typename Value, size_t InlineCapacity>
+void save(Archive& ar, const SmallMap<Key, Value, InlineCapacity>& map)
+{
+  const size_t count = map.size();
+  ar(cereal::make_nvp("size", count));
+
+  for (typename SmallMap<Key, Value, InlineCapacity>::const_iterator it = map.begin();
+    it != map.end();
+    ++it)
+  {
+    ar(cereal::make_nvp("key", it->first));
+    ar(cereal::make_nvp("value", it->second));
+  }
+}
+
+template <class Archive, typename Key, typename Value, size_t InlineCapacity>
+void load(Archive& ar, SmallMap<Key, Value, InlineCapacity>& map)
+{
+  size_t count = 0;
+  ar(cereal::make_nvp("size", count));
+
+  map.clear();
+  map.reserve(count);
+
+  for (size_t i = 0; i < count; ++i)
+  {
+    Key key;
+    Value value;
+    ar(cereal::make_nvp("key", key));
+    ar(cereal::make_nvp("value", value));
+    map.insert(std::make_pair(key, value));
+  }
+}
+
 template <class Archive>
 void openMVG::sfm::Observation::save( Archive & ar) const
 {

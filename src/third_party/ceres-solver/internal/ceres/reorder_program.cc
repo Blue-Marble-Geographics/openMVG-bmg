@@ -386,56 +386,67 @@ void MaybeReorderSchurComplementColumnsUsingSuiteSparse(
 }
 
 void MaybeReorderSchurComplementColumnsUsingEigen(
-    const int size_of_first_elimination_group,
-    const ProblemImpl::ParameterMap& parameter_map,
-    Program* program) {
+  const int size_of_first_elimination_group,
+  const ProblemImpl::ParameterMap& parameter_map,
+  Program* program) {
 #if !EIGEN_VERSION_AT_LEAST(3, 2, 2) || !defined(CERES_USE_EIGEN_SPARSE)
   return;
 #else
+  (void)parameter_map;
 
   scoped_ptr<TripletSparseMatrix> tsm_block_jacobian_transpose(
-      program->CreateJacobianBlockSparsityTranspose());
+    program->CreateJacobianBlockSparsityTranspose());
 
-  typedef Eigen::SparseMatrix<int> SparseMatrix;
+  typedef Eigen::SparseMatrix<int, Eigen::ColMajor, int> SparseMatrix;
+  typedef Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> Permutation;
+
   const SparseMatrix block_jacobian =
-      CreateBlockJacobian(*tsm_block_jacobian_transpose);
+    CreateBlockJacobian(*tsm_block_jacobian_transpose);
+
   const int num_rows = block_jacobian.rows();
   const int num_cols = block_jacobian.cols();
-
-  // Vertically partition the jacobian in parameter blocks of type E
-  // and F.
-  const SparseMatrix E =
-      block_jacobian.block(0,
-                           0,
-                           num_rows,
-                           size_of_first_elimination_group);
-  const SparseMatrix F =
-      block_jacobian.block(0,
-                           size_of_first_elimination_group,
-                           num_rows,
-                           num_cols - size_of_first_elimination_group);
-
-  // Block sparsity pattern of the schur complement.
-  const SparseMatrix block_schur_complement =
-      F.transpose() * F - F.transpose() * E * E.transpose() * F;
-
-  Eigen::AMDOrdering<int> amd_ordering;
-  Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> perm;
-  amd_ordering(block_schur_complement, perm);
+  const int num_f_cols = num_cols - size_of_first_elimination_group;
 
   const vector<ParameterBlock*>& parameter_blocks = program->parameter_blocks();
   vector<ParameterBlock*> ordering(num_cols);
 
-  // The ordering of the first size_of_first_elimination_group does
-  // not matter, so we preserve the existing ordering.
+  // Preserve E ordering exactly as before.
   for (int i = 0; i < size_of_first_elimination_group; ++i) {
     ordering[i] = parameter_blocks[i];
   }
 
-  // For the rest of the blocks, use the ordering computed using AMD.
-  for (int i = 0; i < block_schur_complement.cols(); ++i) {
+  // Nothing meaningful to reorder.
+  if (num_f_cols <= 1) {
+    for (int i = 0; i < num_f_cols; ++i) {
+      ordering[size_of_first_elimination_group + i] =
+        parameter_blocks[size_of_first_elimination_group + i];
+    }
+    swap(*program->mutable_parameter_blocks(), ordering);
+    program->SetParameterOffsetsAndIndex();
+    return;
+  }
+
+  // For AMD ordering we only need the sparsity pattern. F'F is a
+  // superset of the Schur complement sparsity (S = F'F - F'E(E'E)^{-1}E'F,
+  // the subtraction can only remove entries). Using F'F avoids the
+  // cost of computing E'F and (E'F)'(E'F) which are expensive sparse
+  // matrix multiplications for large SfM problems.
+  const SparseMatrix F =
+    block_jacobian.block(0,
+      size_of_first_elimination_group,
+      num_rows,
+      num_f_cols);
+
+  const SparseMatrix FtF = F.transpose() * F;
+
+  Eigen::AMDOrdering<int> amd_ordering;
+  Permutation perm;
+  amd_ordering(FtF, perm);
+
+  const int* perm_indices = perm.indices().data();
+  for (int i = 0; i < num_f_cols; ++i) {
     ordering[size_of_first_elimination_group + i] =
-        parameter_blocks[size_of_first_elimination_group + perm.indices()[i]];
+      parameter_blocks[size_of_first_elimination_group + perm_indices[i]];
   }
 
   swap(*program->mutable_parameter_blocks(), ordering);

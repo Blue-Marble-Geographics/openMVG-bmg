@@ -74,7 +74,7 @@ class CallbackCostFunction : public ceres::CostFunction {
         user_data_(user_data) {
     set_num_residuals(num_residuals);
     for (int i = 0; i < num_parameter_blocks; ++i) {
-      mutable_parameter_block_sizes()->push_back(parameter_block_sizes[i]);
+      add_parameter_block_sizes(parameter_block_sizes[i]);
     }
   }
 
@@ -163,12 +163,10 @@ ceres_residual_block_id_t* ceres_problem_add_residual_block(
                                                       loss_function_data);
   }
 
-  std::vector<double*> parameter_blocks(parameters,
-                                        parameters + num_parameter_blocks);
   return reinterpret_cast<ceres_residual_block_id_t*>(
       ceres_problem->AddResidualBlock(callback_cost_function,
                                       callback_loss_function,
-                                      parameter_blocks));
+                                      *parameters, *parameters + num_parameter_blocks));
 }
 
 void ceres_solve(ceres_problem_t* c_problem) {

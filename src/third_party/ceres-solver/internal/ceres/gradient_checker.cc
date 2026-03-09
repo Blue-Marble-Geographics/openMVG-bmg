@@ -65,14 +65,14 @@ bool EvaluateCostFunction(
   CHECK_NOTNULL(jacobians);
   CHECK_NOTNULL(local_jacobians);
 
-  const vector<int32>& block_sizes = function->parameter_block_sizes();
-  const int num_parameter_blocks = block_sizes.size();
+  const int* block_sizes = function->parameter_block_sizes();
+  const int num_parameter_blocks = function->num_parameter_block_sizes();
 
   // Allocate Jacobian matrices in local space.
   local_jacobians->resize(num_parameter_blocks);
   vector<double*> local_jacobian_data(num_parameter_blocks);
   for (int i = 0; i < num_parameter_blocks; ++i) {
-    int block_size = block_sizes.at(i);
+    int block_size = block_sizes[i];
     if (local_parameterizations.at(i) != NULL) {
       block_size = local_parameterizations.at(i)->LocalSize();
     }
@@ -85,7 +85,7 @@ bool EvaluateCostFunction(
   jacobians->resize(num_parameter_blocks);
   vector<double*> jacobian_data(num_parameter_blocks);
   for (int i = 0; i < num_parameter_blocks; ++i) {
-    jacobians->at(i).resize(function->num_residuals(), block_sizes.at(i));
+    jacobians->at(i).resize(function->num_residuals(), block_sizes[i]);
     jacobians->at(i).setZero();
     jacobian_data.at(i) = jacobians->at(i).data();
   }
@@ -126,7 +126,7 @@ GradientChecker::GradientChecker(
   if (local_parameterizations != NULL) {
     local_parameterizations_ = *local_parameterizations;
   } else {
-    local_parameterizations_.resize(function->parameter_block_sizes().size(),
+    local_parameterizations_.resize(function->num_parameter_block_sizes(),
                                     NULL);
   }
   DynamicNumericDiffCostFunction<CostFunction, CENTRAL>*
@@ -135,9 +135,9 @@ GradientChecker::GradientChecker(
           function, DO_NOT_TAKE_OWNERSHIP, options);
   finite_diff_cost_function_.reset(finite_diff_cost_function);
 
-  const vector<int32>& parameter_block_sizes =
+  const int32* parameter_block_sizes =
       function->parameter_block_sizes();
-  const int num_parameter_blocks = parameter_block_sizes.size();
+  const int num_parameter_blocks = function->num_parameter_block_sizes();
   for (int i = 0; i < num_parameter_blocks; ++i) {
     finite_diff_cost_function->AddParameterBlock(parameter_block_sizes[i]);
   }
@@ -215,7 +215,7 @@ bool GradientChecker::Probe(double const* const * parameters,
   // Accumulate the error message for all the jacobians, since it won't get
   // output if there are no bad jacobian components.
   string error_log;
-  for (int k = 0; k < function_->parameter_block_sizes().size(); k++) {
+  for (int k = 0; k < function_->num_parameter_block_sizes(); k++) {
     StringAppendF(&error_log,
                   "========== "
                   "Jacobian for " "block %d: (%ld by %ld)) "

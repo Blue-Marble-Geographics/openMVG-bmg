@@ -10,6 +10,11 @@
 
 #include <deque>
 #include <functional>
+#include <vector>
+
+#ifdef OPENMVG_USE_OPENMP
+#include <omp.h>
+#endif
 
 #include "openMVG/geometry/pose3.hpp"
 #include "openMVG/multiview/triangulation_nview.hpp"
@@ -55,6 +60,65 @@ bool track_triangulation
 {
   if (obs.size() >= 2)
   {
+#if 1
+    size_t cnt = obs.size();
+    FixedArray<Vec3, 16> bearing(cnt); // cnt is not the size of the array, but how many elements it can hold before it becomes dynamic.
+    FixedArray<Mat34, 16> poses(cnt);
+    FixedArray<const Pose3*, 16> poses_(cnt);
+
+    int trueCnt = 0;
+
+    auto observation = std::begin(obs);
+    const auto& intrinsics = sfm_data.GetIntrinsics();
+    const auto& allPoses = sfm_data.poses;
+    for (size_t i = 0; i != cnt; ++i, ++observation)
+    {
+      const View* view = sfm_data.views.at(observation->first).get();
+      if (!view) return false;
+      if (view->id_intrinsic == UndefinedIndexT) return false;
+      if (view->id_pose == UndefinedIndexT) return false;
+
+      const auto* cam = intrinsics.at(view->id_intrinsic).get();
+      auto it = intrinsics.find(view->id_intrinsic);
+      if (it == intrinsics.end()) return false;
+      auto itPose = allPoses.find(view->id_pose);
+      if (itPose == allPoses.end()) return false;
+
+      const auto tmp = cam->get_ud_pixel(observation->second.x);
+      bearing[trueCnt] = cam->oneBearing(tmp);
+      poses[trueCnt] = itPose->second.asMatrix();
+      poses_[trueCnt] = &itPose->second;
+      ++trueCnt;
+    }
+    if (trueCnt > 2)
+    {
+      const Eigen::Map<const Mat3X> bearing_matrix(bearing[0].data(), 3, trueCnt);
+      Vec4 Xhomogeneous;
+      if (TriangulateNViewAlgebraic2
+      (
+        bearing_matrix,
+        poses.get(),
+        &Xhomogeneous))
+      {
+        X = Xhomogeneous.hnormalized();
+        return true;
+      }
+    }
+    else
+    {
+      return Triangulate2View
+      (
+        poses_[0]->rotation(),
+        poses_[0]->translation(),
+        bearing[0],
+        poses_[trueCnt - 1]->rotation(),
+        poses_[trueCnt - 1]->translation(),
+        bearing[trueCnt - 1],
+        X,
+        etri_method
+      );
+    }
+#else
     std::vector<Vec3> bearing;
     std::vector<Mat34> poses;
     std::vector<Pose3> poses_;
@@ -99,6 +163,7 @@ bool track_triangulation
         etri_method
       );
     }
+#endif
   }
   return false;
 }
@@ -258,45 +323,54 @@ void SfM_Data_Structure_Computation_Robust::robust_triangulation
 )
 const
 {
-  std::deque<IndexT> rejectedId;
   std::unique_ptr<system::ProgressInterface> my_progress_bar;
   if (bConsole_verbose_)
     my_progress_bar.reset(
       new system::LoggerProgress(
         sfm_data.structure.size(),
         "Robust triangulation" ));
-#ifdef OPENMVG_USE_OPENMP
-  #pragma omp parallel
-#endif
-  for (auto& tracks_it :sfm_data.structure)
+
+  auto& structure = sfm_data.structure;
+  const int num_tracks = static_cast<int>(structure.size());
+
+  // Snapshot keys into a vector for random-access parallel iteration
+  std::vector<IndexT> track_keys;
+  track_keys.reserve(num_tracks);
+  for (const auto& entry : structure)
   {
+    track_keys.push_back(entry.first);
+  }
+
+  // Per-track success flag; failed tracks will be erased after the loop
+  std::vector<bool> succeeded(num_tracks, false);
+
 #ifdef OPENMVG_USE_OPENMP
-  #pragma omp single nowait
+  #pragma omp parallel for schedule(dynamic)
 #endif
+  for (int i = 0; i < num_tracks; ++i)
+  {
+    if (bConsole_verbose_)
     {
-      if (bConsole_verbose_)
-      {
-        ++(*my_progress_bar);
-      }
-      Landmark landmark;
-      if (robust_triangulation(sfm_data, tracks_it.second.obs, landmark))
-      {
-        tracks_it.second = landmark;
-      }
-      else
-      {
-        // Track must be deleted
-#ifdef OPENMVG_USE_OPENMP
-        #pragma omp critical
-#endif
-        rejectedId.push_front(tracks_it.first);
-      }
+      ++(*my_progress_bar);
+    }
+
+    const IndexT key = track_keys[i];
+    Landmark& landmark = structure.at(key);
+    const Observations obs_copy = landmark.obs; // snapshot for RANSAC input
+
+    if (robust_triangulation(sfm_data, obs_copy, landmark))
+    {
+      succeeded[i] = true;
     }
   }
-  // Erase the unsuccessful triangulated tracks
-  for (auto& it : rejectedId)
+
+  // Single-threaded erase of rejected tracks
+  for (int i = 0; i < num_tracks; ++i)
   {
-    sfm_data.structure.erase(it);
+    if (!succeeded[i])
+    {
+      structure.erase(track_keys[i]);
+    }
   }
 }
 
@@ -352,51 +426,14 @@ const
 
   const double dSquared_pixel_threshold = Square(max_reprojection_error_);
 
-  // Predicate to validate a sample (cheirality and residual error)
-  ResidualAndCheiralityPredicate predicate(dSquared_pixel_threshold);
-  auto predicate_binding = std::bind(&ResidualAndCheiralityPredicate::predicate,
-                                     predicate,
-                                     std::placeholders::_1,
-                                     std::placeholders::_2,
-                                     std::placeholders::_3,
-                                     std::placeholders::_4);
-
-  // Handle the case where all observations must be used
-  if (min_required_inliers_ == min_sample_index_ &&
-      obs.size() == min_required_inliers_)
-  {
-    // Generate the 3D point hypothesis by triangulating all the observations
-    Vec3 X;
-    if (track_triangulation(sfm_data, obs, X, etri_method_) &&
-        track_check_predicate(obs, sfm_data, X, predicate_binding))
-    {
-      landmark.X = X;
-      landmark.obs = obs;
-      return true;
-    }
-    return false;
-  }
-
-  // else we perform a robust estimation since
-  //  there is more observations than the minimal number of required sample.
-
-  const IndexT nbIter = obs.size() * 2; // TODO: automatic computation of the number of iterations?
-
-  // - Ransac variables
-  Vec3 best_model = Vec3::Zero();
-  FixedArray<IndexT, 32> best_inlier_set(obs.size()); // Never larger
-  size_t best_inlier_set_size = 0;
-  double best_error = std::numeric_limits<double>::max();
-
-  //--
-  // Random number generation
-  std::mt19937 random_generator(std::mt19937::default_seed);
-
-  // Pre-cache per-observation lookups once (before the RANSAC loop)
+  // Pre-cache per-observation lookups once
   struct ObsCache {
     IndexT obs_key;
+    IndexT id_feat;
     const IntrinsicBase* cam;
     const Pose3* pose;
+    Vec3 bearing;
+    Mat34 pose_matrix;
     Vec2 x;
   };
   const auto& intrinsics = sfm_data.GetIntrinsics();
@@ -415,47 +452,145 @@ const
     auto itPose = poses.find(view->id_pose);
     if (itPose == poses.end()) continue;
 
+    const IntrinsicBase* cam = itCam->second.get();
     ObsCache& c = obs_cache[obs_cache_size++];
     c.obs_key = obs_it.first;
-    c.cam = itCam->second.get();
+    c.id_feat = obs_it.second.id_feat;
+    c.cam = cam;
     c.pose = &itPose->second;
     c.x = obs_it.second.x;
+    const Vec2 ud = cam->get_ud_pixel(obs_it.second.x);
+    c.bearing = cam->oneBearing(ud);
+    c.pose_matrix = itPose->second.asMatrix();
   }
 
-  // - Ransac loop
-  Observations minimal_sample;
-  minimal_sample.reserve(10); // Just a guess
+  if (obs_cache_size < min_required_inliers_ || obs_cache_size < min_sample_index_)
+  {
+    return false;
+  }
+
+  // Handle the case where all observations must be used
+  if (min_required_inliers_ == min_sample_index_ &&
+      obs_cache_size == min_required_inliers_)
+  {
+    Vec3 X;
+    bool tri_ok = false;
+    if (obs_cache_size > 2)
+    {
+      FixedArray<Vec3, 16> bearings(obs_cache_size);
+      FixedArray<Mat34, 16> pm(obs_cache_size);
+      for (size_t k = 0; k < obs_cache_size; ++k)
+      {
+        bearings[k] = obs_cache[k].bearing;
+        pm[k] = obs_cache[k].pose_matrix;
+      }
+      const Eigen::Map<const Mat3X> bearing_matrix(bearings[0].data(), 3, obs_cache_size);
+      Vec4 Xhomogeneous;
+      tri_ok = TriangulateNViewAlgebraic2(bearing_matrix, pm.get(), &Xhomogeneous);
+      if (tri_ok) X = Xhomogeneous.hnormalized();
+    }
+    else
+    {
+      tri_ok = Triangulate2View(
+        obs_cache[0].pose->rotation(), obs_cache[0].pose->translation(), obs_cache[0].bearing,
+        obs_cache[obs_cache_size-1].pose->rotation(), obs_cache[obs_cache_size-1].pose->translation(), obs_cache[obs_cache_size-1].bearing,
+        X, etri_method_);
+    }
+    if (tri_ok)
+    {
+      for (size_t k = 0; k < obs_cache_size; ++k)
+      {
+        const ObsCache& c = obs_cache[k];
+        if (!CheiralityTest(c.bearing, *c.pose, X))
+          return false;
+        const Vec2 residual = c.cam->residual((*c.pose)(X), c.x);
+        if (residual.squaredNorm() >= dSquared_pixel_threshold)
+          return false;
+      }
+      landmark.X = X;
+      landmark.obs = obs;
+      return true;
+    }
+    return false;
+  }
+
+  // Robust estimation: more observations than the minimal required sample.
+
+  const IndexT nbIter = obs_cache_size * 2;
+
+  // Ransac variables
+  Vec3 best_model = Vec3::Zero();
+  FixedArray<IndexT, 32> best_inlier_set(obs_cache_size);
+  size_t best_inlier_set_size = 0;
+  double best_error = std::numeric_limits<double>::max();
+
+  std::mt19937 random_generator(std::mt19937::default_seed);
+
   for (IndexT i = 0; i < nbIter; ++i)
   {
-    FixedArray<uint32_t, 16> samples(obs.size());
-    const size_t numActualSamples = robust::UniformSample2(min_sample_index_, obs.size(), random_generator, samples.get());
+    FixedArray<uint32_t, 16> sample_indices(obs_cache_size);
+    const size_t numSamples = robust::UniformSample2(
+      min_sample_index_, obs_cache_size, random_generator, sample_indices.get());
 
     Vec3 X;
-    // Hypothesis generation
-    ObservationsSampler(minimal_sample, obs, samples.get(), numActualSamples);
+    bool tri_ok = false;
 
-    if (!track_triangulation(sfm_data, minimal_sample, X, etri_method_))
+    // Hypothesis generation directly from obs_cache
+    if (numSamples > 2)
+    {
+      FixedArray<Vec3, 16> sample_bearings(numSamples);
+      FixedArray<Mat34, 16> sample_poses(numSamples);
+      for (size_t s = 0; s < numSamples; ++s)
+      {
+        const ObsCache& c = obs_cache[sample_indices[s]];
+        sample_bearings[s] = c.bearing;
+        sample_poses[s] = c.pose_matrix;
+      }
+      const Eigen::Map<const Mat3X> bearing_matrix(sample_bearings[0].data(), 3, numSamples);
+      Vec4 Xhomogeneous;
+      tri_ok = TriangulateNViewAlgebraic2(bearing_matrix, sample_poses.get(), &Xhomogeneous);
+      if (tri_ok) X = Xhomogeneous.hnormalized();
+    }
+    else if (numSamples == 2)
+    {
+      const ObsCache& c0 = obs_cache[sample_indices[0]];
+      const ObsCache& c1 = obs_cache[sample_indices[1]];
+      tri_ok = Triangulate2View(
+        c0.pose->rotation(), c0.pose->translation(), c0.bearing,
+        c1.pose->rotation(), c1.pose->translation(), c1.bearing,
+        X, etri_method_);
+    }
+
+    if (!tri_ok)
       continue;
 
-    // Test validity of the hypothesis
-    if (!track_check_predicate(minimal_sample, sfm_data, X, predicate_binding))
+    // Validate hypothesis on the sample
+    bool sample_valid = true;
+    for (size_t s = 0; s < numSamples; ++s)
+    {
+      const ObsCache& c = obs_cache[sample_indices[s]];
+      if (!CheiralityTest(c.bearing, *c.pose, X))
+      { sample_valid = false; break; }
+      const Vec2 residual = c.cam->residual((*c.pose)(X), c.x);
+      if (residual.squaredNorm() >= dSquared_pixel_threshold)
+      { sample_valid = false; break; }
+    }
+    if (!sample_valid)
       continue;
 
+    // Inlier/outlier classification — store cache indices, not obs_keys
     FixedArray<IndexT, 32> inlier_set(obs_cache_size);
     size_t inlier_cnt = 0;
     double current_error = 0.0;
-    // inlier/outlier classification according pixel residual errors.
     for (size_t j = 0; j < obs_cache_size; ++j)
     {
       const ObsCache& c = obs_cache[j];
-      const IntrinsicBase& cam = *c.cam;
-      const Pose3& pose = *c.pose;
-      if (!CheiralityTest(cam.oneBearing(c.x), pose, X))
+      if (!CheiralityTest(c.bearing, *c.pose, X))
         continue;
-      const double residual_sq = cam.residual(pose(X), c.x).squaredNorm();
+      const double residual_sq = c.cam->residual((*c.pose)(X), c.x).squaredNorm();
       if (residual_sq < dSquared_pixel_threshold)
       {
-        inlier_set[inlier_cnt++] = c.obs_key;
+        inlier_set[inlier_cnt++] = static_cast<IndexT>(j);
         current_error += residual_sq;
       }
       else
@@ -463,9 +598,7 @@ const
         current_error += dSquared_pixel_threshold;
       }
     }
-    // Does the hypothesis:
-    // - is the best one we have seen so far.
-    // - has sufficient inliers.
+
     if (current_error < best_error &&
       inlier_cnt >= min_required_inliers_)
     {
@@ -478,12 +611,13 @@ const
 
   if (best_inlier_set_size >= min_required_inliers_)
   {
-    // Update information (3D landmark position & valid observations)
     landmark.X = best_model;
+    landmark.obs.clear();
+    landmark.obs.reserve(best_inlier_set_size);
     for (size_t i = 0; i != best_inlier_set_size; ++i)
     {
-      const auto val = best_inlier_set[i];
-      landmark.obs.insert({ val, obs.at(val) }); // JPB WIP BUG  emplace(val, obs.at(val));
+      const ObsCache& c = obs_cache[best_inlier_set[i]];
+      landmark.obs[c.obs_key] = Observation(c.x, c.id_feat);
     }
   }
   return best_inlier_set_size;

@@ -41,6 +41,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <utility>
 #include <vector>
@@ -203,7 +204,9 @@ struct TracksBuilder
 struct SharedTrackVisibilityHelper
 {
 private:
-  using TrackIdsPerView = std::map<uint32_t, std::set<uint32_t>>;
+  // Sorted vectors are much cheaper than std::set for iteration and
+  // binary-search lookups, and avoid per-element heap allocations.
+  using TrackIdsPerView = std::map<uint32_t, std::vector<uint32_t>>;
 
   TrackIdsPerView track_ids_per_view_;
   const STLMAPTracks & tracks_;
@@ -215,13 +218,21 @@ public:
     const STLMAPTracks & tracks
   ): tracks_(tracks)
   {
+    // First pass: collect unsorted
     for (const auto & tracks_it : tracks_)
     {
-      // Add the track id visibility in the corresponding view track list
       for (const auto & track_obs_it : tracks_it.second)
       {
-        track_ids_per_view_[track_obs_it.first].insert(tracks_it.first);
+        track_ids_per_view_[track_obs_it.first].push_back(tracks_it.first);
       }
+    }
+    // Second pass: sort & deduplicate each per-view vector
+    for (auto & per_view : track_ids_per_view_)
+    {
+      auto & vec = per_view.second;
+      std::sort(vec.begin(), vec.end());
+      vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+      vec.shrink_to_fit();
     }
   }
 
@@ -233,66 +244,214 @@ public:
    */
   bool GetTracksInImages
   (
-    const std::set<uint32_t> & image_ids,
-    STLMAPTracks & tracks
+    const std::set<uint32_t>& image_ids,
+    STLMAPTracks& tracks
   )
   {
     tracks.clear();
     if (image_ids.empty())
       return false;
 
-    // Collect the shared tracks ids by the views
-    std::set<uint32_t> common_track_ids;
+    std::vector<const std::vector<uint32_t>*> per_view_vecs;
+    per_view_vecs.reserve(image_ids.size());
+
+    for (const auto & image_id : image_ids)
     {
-      // Compute the intersection of all the track ids of the view's track ids.
-      // 1. Initialize the track_id with the view first tracks
-      // 2. Iteratively collect the common id of the remaining requested view
-      auto image_index_it = image_ids.cbegin();
-      if (track_ids_per_view_.count(*image_index_it))
+      const auto ids_per_view_it = track_ids_per_view_.find(image_id);
+      if (ids_per_view_it == track_ids_per_view_.end())
       {
-        common_track_ids = track_ids_per_view_[*image_index_it];
+        if (image_ids.size() > 1)
+          return false;
+        continue;
       }
-      bool merged = false;
-      std::advance(image_index_it, 1);
-      while (image_index_it != image_ids.cend())
+      per_view_vecs.push_back(&ids_per_view_it->second);
+    }
+
+    if (per_view_vecs.empty())
+      return false;
+
+    // Sort pointers by vector size so the smallest is iterated first
+    std::sort(
+      per_view_vecs.begin(),
+      per_view_vecs.end(),
+      [](const std::vector<uint32_t>* a, const std::vector<uint32_t>* b)
       {
-        if (track_ids_per_view_.count(*image_index_it))
+        return a->size() < b->size();
+      });
+
+    const std::vector<uint32_t>& candidate_track_ids = *per_view_vecs[0];
+
+    for (const uint32_t track_id : candidate_track_ids)
+    {
+      bool present_in_all = true;
+      for (size_t i = 1; i < per_view_vecs.size(); ++i)
+      {
+        if (!std::binary_search(per_view_vecs[i]->begin(), per_view_vecs[i]->end(), track_id))
         {
-          const auto ids_per_view_it = track_ids_per_view_.find(*image_index_it);
-          const auto & track_ids = ids_per_view_it->second;
-
-          std::set<uint32_t> tmp;
-          std::set_intersection(
-            common_track_ids.cbegin(), common_track_ids.cend(),
-            track_ids.cbegin(), track_ids.cend(),
-            std::inserter(tmp, tmp.begin()));
-          common_track_ids.swap(tmp);
-          merged = true;
+          present_in_all = false;
+          break;
         }
-        std::advance(image_index_it, 1);
       }
-      if (image_ids.size() > 1 && !merged)
+
+      if (!present_in_all)
+        continue;
+
+      const auto track_it = tracks_.find(track_id);
+      if (track_it == tracks_.end())
+        continue;
+
+      const auto& track = track_it->second;
+      submapTrack& trackFeatsOut = tracks[track_id];
+
+      for (const auto & img_id : image_ids)
       {
-        // If more than one image id is required and no merge operation have been done
-        //  we need to reset the common track id
-        common_track_ids.clear();
+        const auto track_view_info = track.find(img_id);
+        if (track_view_info != track.end())
+        {
+          trackFeatsOut[img_id] = track_view_info->second;
+        }
       }
     }
 
-    // Collect the selected {img id, feat id} data for the shared track ids
-    for (const auto track_ids_it : common_track_ids)
+    return !tracks.empty();
+  }
+
+  /**
+   * @brief Flat output for single-view or multi-view track queries.
+   *
+   * Instead of building a nested std::map<uint32_t, std::map<...>>
+   * (which does thousands of heap allocations), this returns two
+   * parallel sorted vectors: track_ids and feat_ids.
+   *
+   * For single-view queries this is O(N) with zero heap allocation
+   * beyond the vector growth (which callers can pre-reserve).
+   *
+   * @param[in]  image_ids  images to consider
+   * @param[out] track_ids  sorted track ids visible in all requested images
+   * @param[out] feat_ids   per-image feature ids, interleaved in image_ids order:
+   *                         for single image: feat_ids[i] is the feature for track_ids[i]
+   *                         for N images: feat_ids[i*N + j] is feat for track_ids[i], image j
+   * @return true if any tracks found
+   */
+  bool GetTracksInImages
+  (
+    const std::set<uint32_t>& image_ids,
+    std::vector<uint32_t>& track_ids,
+    std::vector<uint32_t>& feat_ids
+  )
+  {
+    track_ids.clear();
+    feat_ids.clear();
+    if (image_ids.empty())
+      return false;
+
+    const size_t num_images = image_ids.size();
+
+    std::vector<const std::vector<uint32_t>*> per_view_vecs;
+    per_view_vecs.reserve(num_images);
+
+    for (const auto & image_id : image_ids)
     {
-      const auto track_it = tracks_.find(track_ids_it);
-      const auto & track = track_it->second;
-      // Find the corresponding output track and update it
-      submapTrack& trackFeatsOut = tracks[track_it->first];
-      for (const auto img_index: image_ids)
+      const auto it = track_ids_per_view_.find(image_id);
+      if (it == track_ids_per_view_.end())
       {
-        const auto track_view_info = track.find(img_index);
-        trackFeatsOut[img_index] = track_view_info->second;
+        if (num_images > 1)
+          return false;
+        continue;
+      }
+      per_view_vecs.push_back(&it->second);
+    }
+
+    if (per_view_vecs.empty())
+      return false;
+
+    // For single-view queries, just copy the track list and look up features
+    if (num_images == 1)
+    {
+      const auto & candidate_ids = *per_view_vecs[0];
+      const uint32_t image_id = *image_ids.begin();
+      track_ids.reserve(candidate_ids.size());
+      feat_ids.reserve(candidate_ids.size());
+
+      for (const uint32_t track_id : candidate_ids)
+      {
+        const auto track_it = tracks_.find(track_id);
+        if (track_it == tracks_.end())
+          continue;
+        const auto obs_it = track_it->second.find(image_id);
+        if (obs_it == track_it->second.end())
+          continue;
+        track_ids.push_back(track_id);
+        feat_ids.push_back(obs_it->second);
+      }
+      return !track_ids.empty();
+    }
+
+    // Multi-view: find intersection, then collect features
+    // Sort pointers by size
+    // We need to remember which image_id maps to which per_view_vec
+    // Since image_ids is a set (sorted), and we inserted in order,
+    // per_view_vecs[i] corresponds to the i-th element of image_ids.
+    // But we need to sort by size for intersection efficiency.
+    std::vector<size_t> sorted_indices(per_view_vecs.size());
+    std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+    std::sort(sorted_indices.begin(), sorted_indices.end(),
+      [&per_view_vecs](size_t a, size_t b) {
+        return per_view_vecs[a]->size() < per_view_vecs[b]->size();
+      });
+
+    const auto & candidate_ids = *per_view_vecs[sorted_indices[0]];
+    track_ids.reserve(candidate_ids.size());
+    feat_ids.reserve(candidate_ids.size() * num_images);
+
+    // Build a quick lookup: image_ids as a vector for indexed access
+    std::vector<uint32_t> image_ids_vec(image_ids.begin(), image_ids.end());
+
+    for (const uint32_t track_id : candidate_ids)
+    {
+      bool present_in_all = true;
+      for (size_t i = 1; i < sorted_indices.size(); ++i)
+      {
+        if (!std::binary_search(
+              per_view_vecs[sorted_indices[i]]->begin(),
+              per_view_vecs[sorted_indices[i]]->end(),
+              track_id))
+        {
+          present_in_all = false;
+          break;
+        }
+      }
+      if (!present_in_all)
+        continue;
+
+      const auto track_it = tracks_.find(track_id);
+      if (track_it == tracks_.end())
+        continue;
+
+      // Collect feature ids for each requested image
+      bool all_found = true;
+      size_t base = feat_ids.size();
+      for (size_t j = 0; j < num_images; ++j)
+      {
+        const auto obs_it = track_it->second.find(image_ids_vec[j]);
+        if (obs_it != track_it->second.end())
+        {
+          feat_ids.push_back(obs_it->second);
+        }
+        else
+        {
+          all_found = false;
+          feat_ids.resize(base); // rollback
+          break;
+        }
+      }
+      if (all_found)
+      {
+        track_ids.push_back(track_id);
       }
     }
-    return !tracks.empty();
+
+    return !track_ids.empty();
   }
 };
 

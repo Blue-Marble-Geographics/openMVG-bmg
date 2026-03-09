@@ -63,7 +63,7 @@ namespace ceres {
 // when added with AddResidualBlock().
 class CERES_EXPORT CostFunction {
  public:
-  CostFunction() : num_residuals_(0) {}
+  CostFunction() : parameter_block_count_(0), num_residuals_(0) {}
 
   virtual ~CostFunction() {}
 
@@ -115,18 +115,26 @@ class CERES_EXPORT CostFunction {
                         double* residuals,
                         double** jacobians) const = 0;
 
-  const std::vector<int32>& parameter_block_sizes() const {
-    return parameter_block_sizes_;
+  int num_parameter_block_sizes() const {
+    return parameter_block_count_;
   }
 
+  const int32* parameter_block_sizes() const {
+    return (int32*) parameter_block_sizes_;
+  }
   int num_residuals() const {
     return num_residuals_;
   }
 
  protected:
-  std::vector<int32>* mutable_parameter_block_sizes() {
-    return &parameter_block_sizes_;
+
+   void copy_parameter_block_sizes(const int32* parameter_block_sizes, int cnt)
+   {
+     std::copy(parameter_block_sizes, parameter_block_sizes+cnt, std::begin(parameter_block_sizes_));
+     parameter_block_count_ = cnt;
   }
+
+  void add_parameter_block_sizes(int32 v) { parameter_block_sizes_[parameter_block_count_++] = v; }
 
   void set_num_residuals(int num_residuals) {
     num_residuals_ = num_residuals;
@@ -135,7 +143,9 @@ class CERES_EXPORT CostFunction {
  private:
   // Cost function signature metadata: number of inputs & their sizes,
   // number of outputs (residuals).
-  std::vector<int32> parameter_block_sizes_;
+  enum { kMaxBlocks = 10 };
+  int32 parameter_block_sizes_[kMaxBlocks];
+  int parameter_block_count_;
   int num_residuals_;
   CERES_DISALLOW_COPY_AND_ASSIGN(CostFunction);
 };

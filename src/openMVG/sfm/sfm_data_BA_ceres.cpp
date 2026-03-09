@@ -247,6 +247,8 @@ bool Bundle_Adjustment_Ceres::Adjust
   }
 
   ceres::Problem::Options problem_options;
+  problem_options.enable_fast_removal = false;
+  problem_options.disable_all_safety_checks = true;
 
   // Set a LossFunction to be less penalized by false measurements
   //  - set it to nullptr if you don't want use a lossFunction.
@@ -357,64 +359,38 @@ bool Bundle_Adjustment_Ceres::Adjust
     }
   }
 
-  // Build a per-view cache to avoid repeated hash lookups in the residual loop
-  // Maps view_id -> { intrinsic pointer, intrinsic parameter block, pose parameter block }
-  struct ViewResidualCache {
-    IntrinsicBase* intrinsic;
-    double* intrinsic_block;  // nullptr if intrinsic params are empty
-    double* pose_block;
-  };
-  Hash_Map<IndexT, ViewResidualCache> view_residual_cache;
-  view_residual_cache.reserve(sfm_data.views.size());
-  for (const auto& view_it : sfm_data.views)
-  {
-    const View* v = view_it.second.get();
-    const auto pose_map_it = map_poses.find(v->id_pose);
-    if (pose_map_it == map_poses.end())
-      continue;
-    const auto intrinsic_sfm_it = sfm_data.intrinsics.find(v->id_intrinsic);
-    if (intrinsic_sfm_it == sfm_data.intrinsics.end())
-      continue;
-    const auto intrinsic_map_it = map_intrinsics.find(v->id_intrinsic);
-    if (intrinsic_map_it == map_intrinsics.end())
-      continue;
-    view_residual_cache[view_it.first] = {
-      intrinsic_sfm_it->second.get(),
-      intrinsic_map_it->second.empty() ? nullptr : &intrinsic_map_it->second[0],
-      &pose_map_it->second[0]
-    };
-  }
-
   // For all visibility add reprojections errors:
-  for (auto& structure_landmark_it : sfm_data.structure)
+  for (auto & structure_landmark_it : sfm_data.structure)
   {
-    const Observations& obs = structure_landmark_it.second.obs;
+    const Observations & obs = structure_landmark_it.second.obs;
 
-    for (const auto& obs_it : obs)
+    for (const auto & obs_it : obs)
     {
-      const auto cache_it = view_residual_cache.find(obs_it.first);
-      if (cache_it == view_residual_cache.end())
-        continue;
-      const auto& vc = cache_it->second;
+      // Build the residual block corresponding to the track observation:
+      const View * view = sfm_data.views.at(obs_it.first).get();
 
+      // Each Residual block takes a point and a camera as input and outputs a 2
+      // dimensional residual. Internally, the cost function stores the observed
+      // image location and compares the reprojection against the observation.
       ceres::CostFunction* cost_function =
-        IntrinsicsToCostFunction(vc.intrinsic, obs_it.second.x);
+        IntrinsicsToCostFunction(sfm_data.intrinsics.at(view->id_intrinsic).get(),
+                                 obs_it.second.x);
 
       if (cost_function)
       {
-        if (vc.intrinsic_block)
+        if (!map_intrinsics.at(view->id_intrinsic).empty())
         {
           problem.AddResidualBlock(cost_function,
             p_LossFunction.get(),
-            vc.intrinsic_block,
-            vc.pose_block,
+            &map_intrinsics.at(view->id_intrinsic)[0],
+            &map_poses.at(view->id_pose)[0],
             structure_landmark_it.second.X.data());
         }
         else
         {
           problem.AddResidualBlock(cost_function,
             p_LossFunction.get(),
-            vc.pose_block,
+            &map_poses.at(view->id_pose)[0],
             structure_landmark_it.second.X.data());
         }
       }
@@ -430,39 +406,42 @@ bool Bundle_Adjustment_Ceres::Adjust
 
   if (options.control_point_opt.bUse_control_points)
   {
-    for (auto& gcp_landmark_it : sfm_data.control_points)
+    // Use Ground Control Point:
+    // - fixed 3D points with weighted observations
+    for (auto & gcp_landmark_it : sfm_data.control_points)
     {
-      const Observations& obs = gcp_landmark_it.second.obs;
+      const Observations & obs = gcp_landmark_it.second.obs;
 
-      for (const auto& obs_it : obs)
+      for (const auto & obs_it : obs)
       {
-        const auto cache_it = view_residual_cache.find(obs_it.first);
-        if (cache_it == view_residual_cache.end())
-          continue;
-        const auto& vc = cache_it->second;
+        // Build the residual block corresponding to the track observation:
+        const View * view = sfm_data.views.at(obs_it.first).get();
 
+        // Each Residual block takes a point and a camera as input and outputs a 2
+        // dimensional residual. Internally, the cost function stores the observed
+        // image location and compares the reprojection against the observation.
         ceres::CostFunction* cost_function =
           IntrinsicsToCostFunction(
-            vc.intrinsic,
+            sfm_data.intrinsics.at(view->id_intrinsic).get(),
             obs_it.second.x,
             options.control_point_opt.weight);
 
         if (cost_function)
         {
-          if (vc.intrinsic_block)
+          if (!map_intrinsics.at(view->id_intrinsic).empty())
           {
             problem.AddResidualBlock(cost_function,
-              nullptr,
-              vc.intrinsic_block,
-              vc.pose_block,
-              gcp_landmark_it.second.X.data());
+                                     nullptr,
+                                     &map_intrinsics.at(view->id_intrinsic)[0],
+                                     &map_poses.at(view->id_pose)[0],
+                                     gcp_landmark_it.second.X.data());
           }
           else
           {
             problem.AddResidualBlock(cost_function,
-              nullptr,
-              vc.pose_block,
-              gcp_landmark_it.second.X.data());
+                                     nullptr,
+                                     &map_poses.at(view->id_pose)[0],
+                                     gcp_landmark_it.second.X.data());
           }
         }
       }
@@ -474,6 +453,7 @@ bool Bundle_Adjustment_Ceres::Adjust
       }
       else
       {
+        // Set the 3D point as FIXED (it's a valid GCP)
         problem.SetParameterBlockConstant(gcp_landmark_it.second.X.data());
       }
     }

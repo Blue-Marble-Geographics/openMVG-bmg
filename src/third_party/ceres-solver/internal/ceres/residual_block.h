@@ -43,6 +43,8 @@
 #include "ceres/stringprintf.h"
 #include "ceres/types.h"
 
+#include "ceres/internal/fixed_array.h" // Borrow this
+
 namespace ceres {
 
 class LossFunction;
@@ -71,7 +73,7 @@ class ResidualBlock {
   // residual_blocks array.
   ResidualBlock(const CostFunction* cost_function,
                 const LossFunction* loss_function,
-                const std::vector<ParameterBlock*>& parameter_blocks,
+                const FixedArray<ParameterBlock*, 10>& parameter_blocks,
                 int index);
 
   // Evaluates the residual term, storing the scalar cost in *cost, the residual
@@ -109,12 +111,12 @@ class ResidualBlock {
   // Access the parameter blocks for this residual. The array has size
   // NumParameterBlocks().
   ParameterBlock* const* parameter_blocks() const {
-    return parameter_blocks_.get();
+    return parameter_blocks_;
   }
 
   // Number of variable blocks that this residual term depends on.
   int NumParameterBlocks() const {
-    return cost_function_->parameter_block_sizes().size();
+    return cost_function_->num_parameter_block_sizes();
   }
 
   // The size of the residual vector returned by this residual function.
@@ -134,7 +136,9 @@ class ResidualBlock {
  private:
   const CostFunction* cost_function_;
   const LossFunction* loss_function_;
-  scoped_array<ParameterBlock*> parameter_blocks_;
+  // JPB WIP BUG These must remain pointers (we don't own them).
+  enum { kMaxParameterBlocks = 10 };
+  ParameterBlock* parameter_blocks_[ kMaxParameterBlocks ];
 
   // The index of the residual, typically in a Program. This is only to permit
   // switching from a ResidualBlock* to an index in the Program's array, needed

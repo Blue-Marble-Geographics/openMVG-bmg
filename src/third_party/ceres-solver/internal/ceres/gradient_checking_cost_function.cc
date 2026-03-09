@@ -75,9 +75,7 @@ class GradientCheckingCostFunction : public CostFunction {
         extra_info_(extra_info),
         callback_(callback) {
     CHECK_NOTNULL(callback_);
-    const vector<int32>& parameter_block_sizes =
-        function->parameter_block_sizes();
-    *mutable_parameter_block_sizes() = parameter_block_sizes;
+    copy_parameter_block_sizes(function->parameter_block_sizes(), function->num_parameter_block_sizes());
     set_num_residuals(function->num_residuals());
   }
 
@@ -107,8 +105,8 @@ class GradientCheckingCostFunction : public CostFunction {
     MatrixRef(residuals, num_residuals, 1) = results.residuals;
 
     // Copy the original jacobian blocks into the jacobians array.
-    const vector<int32>& block_sizes = function_->parameter_block_sizes();
-    for (int k = 0; k < block_sizes.size(); k++) {
+    const int32* block_sizes = function_->parameter_block_sizes();
+    for (int k = 0, cnt = num_parameter_block_sizes(); k < cnt; k++) {
       if (jacobians[k] != NULL) {
         MatrixRef(jacobians[k],
                   results.jacobians[k].rows(),
@@ -255,7 +253,7 @@ ProblemImpl* CreateGradientCheckingProblemImpl(
     gradient_checking_problem_impl->AddResidualBlock(
         gradient_checking_cost_function,
         const_cast<LossFunction*>(residual_block->loss_function()),
-        parameter_blocks);
+        std::begin(parameter_blocks), std::end(parameter_blocks));
   }
 
   // Normally, when a problem is given to the solver, we guarantee

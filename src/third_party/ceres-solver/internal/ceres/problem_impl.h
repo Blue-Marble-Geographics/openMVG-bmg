@@ -75,7 +75,11 @@ class ProblemImpl {
   ResidualBlockId AddResidualBlock(
       CostFunction* cost_function,
       LossFunction* loss_function,
-      const std::vector<double*>& parameter_blocks);
+      std::initializer_list<double*> parameter_blocks);
+  ResidualBlock* AddResidualBlock(
+    CostFunction* cost_function,
+    LossFunction* loss_function,
+    std::vector<double*>::iterator first, std::vector<double*>::iterator last);
   ResidualBlockId AddResidualBlock(CostFunction* cost_function,
                                    LossFunction* loss_function,
                                    double* x0);
@@ -178,6 +182,8 @@ class ProblemImpl {
         << "Fast removal not enabled, residual_block_set is not maintained.";
     return residual_block_set_;
   }
+
+  void Reserve(int num_parameter_blocks, int num_residual_blocks);
 
  private:
   ParameterBlock* InternalAddParameterBlock(double* values, int size);

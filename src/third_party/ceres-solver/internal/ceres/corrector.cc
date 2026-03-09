@@ -124,7 +124,17 @@ void Corrector::CorrectJacobian(const int num_rows,
 
   // The common case (rho[2] <= 0).
   if (alpha_sq_norm_ == 0.0) {
+    if (1.0 == sqrt_rho1_) {
+      return;
+    }
+#if 1
+    // Much faster than Eigen for a small number of values.
+    for (int i = 0, cnt = num_rows*num_cols; i < cnt; ++i) {
+      jacobian[i] *= sqrt_rho1_;
+    }
+#else
     VectorRef(jacobian, num_rows * num_cols) *= sqrt_rho1_;
+#endif
     return;
   }
 

@@ -174,7 +174,7 @@ class ProgramEvaluator : public Evaluator {
     // but with an empty body, and so will finish quickly.
     bool abort = false;
     int num_residual_blocks = program_->NumResidualBlocks();
-#pragma omp parallel for num_threads(options_.num_threads)
+#pragma omp parallel for num_threads(options_.num_threads) if(options_.num_threads > 1)
     for (int i = 0; i < num_residual_blocks; ++i) {
 // Disable the loop instead of breaking, as required by OpenMP.
 #pragma omp flush(abort)
@@ -239,9 +239,10 @@ class ProgramEvaluator : public Evaluator {
       if (gradient != NULL) {
         int num_residuals = residual_block->NumResiduals();
         int num_parameter_blocks = residual_block->NumParameterBlocks();
+        const auto& pbs = residual_block->parameter_blocks();
         for (int j = 0; j < num_parameter_blocks; ++j) {
-          const ParameterBlock* parameter_block =
-              residual_block->parameter_blocks()[j];
+          const ParameterBlock* parameter_block = pbs[j];
+
           if (parameter_block->IsConstant()) {
             continue;
           }

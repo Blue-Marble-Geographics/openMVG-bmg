@@ -140,14 +140,24 @@ class Pinhole_Intrinsic_Radial_K1 : public Pinhole_Intrinsic
     * @brief Remove the distortion to a camera point (that is in normalized camera frame)
     * @param p Point with distortion
     * @return Point without distortion
+    * @note Uses fixed-point iteration (compensation method) to invert
+    *       r_d = r_u * (1 + k1 * r_u^2)
     */
     Vec2 remove_disto(const Vec2& p) const override
     {
-      const double r2 = p(0) * p(0) + p(1) * p(1);
-      const double radius = (r2 == 0) ?
-        1. :
-        ::sqrt(radial_distortion::bisection_Radius_Solve(params_, r2, distoFunctor) / r2);
-      return radius * p;
+      const double k1 = params_[0];
+
+      // Fixed-point iteration: p_u = p_d / (1 + k1 * |p_u|^2)
+      // Starting from p_u = p_d, converges quadratically for typical distortions.
+      double u = p(0), v = p(1);
+      for (int i = 0; i < 8; ++i)
+      {
+        const double r2 = u * u + v * v;
+        const double inv_coeff = 1. / (1. + k1 * r2);
+        u = p(0) * inv_coeff;
+        v = p(1) * inv_coeff;
+      }
+      return {u, v};
     }
 
     /**
@@ -348,17 +358,26 @@ class Pinhole_Intrinsic_Radial_K3 : public Pinhole_Intrinsic
     * @brief Remove the distortion to a camera point (that is in normalized camera frame)
     * @param p Point with distortion
     * @return Point without distortion
+    * @note Uses fixed-point iteration (compensation method) to invert
+    *       r_d = r_u * (1 + k1*r_u^2 + k2*r_u^4 + k3*r_u^6)
     */
     Vec2 remove_disto( const Vec2& p ) const override
     {
-      // Compute the radius from which the point p comes from thanks to a bisection
-      // Minimize disto(radius(p')^2) == actual Squared(radius(p))
+      const double k1 = params_[0], k2 = params_[1], k3 = params_[2];
 
-      const double r2 = p( 0 ) * p( 0 ) + p( 1 ) * p( 1 );
-      const double radius = ( r2 == 0 ) ? //1. : ::sqrt(bisectionSolve(_params, r2) / r2);
-                            1. :
-                            ::sqrt( radial_distortion::bisection_Radius_Solve( params_, r2, distoFunctor ) / r2 );
-      return radius * p;
+      // Fixed-point iteration: p_u = p_d / (1 + k1*r_u^2 + k2*r_u^4 + k3*r_u^6)
+      // Starting from p_u = p_d, converges rapidly for typical distortions.
+      double u = p(0), v = p(1);
+      for (int i = 0; i < 8; ++i)
+      {
+        const double r2 = u * u + v * v;
+        const double r4 = r2 * r2;
+        const double r6 = r4 * r2;
+        const double inv_coeff = 1. / (1. + k1 * r2 + k2 * r4 + k3 * r6);
+        u = p(0) * inv_coeff;
+        v = p(1) * inv_coeff;
+      }
+      return {u, v};
     }
 
     /**

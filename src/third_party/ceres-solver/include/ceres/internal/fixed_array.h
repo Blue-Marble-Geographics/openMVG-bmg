@@ -75,7 +75,7 @@ namespace internal {
    typedef __int32      ssize_t;
 #endif
 
-template <typename T, ssize_t inline_elements = -1>
+template <typename T, ssize_t inline_elements = -1, int do_init = 1>
 class FixedArray {
  public:
   // For playing nicely with stl:
@@ -160,27 +160,39 @@ class FixedArray {
 
 // Implementation details follow
 
-template <class T, ssize_t S>
-inline FixedArray<T, S>::FixedArray(typename FixedArray<T, S>::size_type n)
-    : size_(n),
-      array_((n <= kInlineElements
-              ? reinterpret_cast<InnerContainer*>(inline_space_)
-              : new InnerContainer[n])) {
+template <class T, ssize_t S, int do_init>
+inline FixedArray<T, S, do_init>::FixedArray(typename FixedArray<T, S, do_init>::size_type n)
+  : size_(n),
+  array_((n <= kInlineElements
+    ? reinterpret_cast<InnerContainer*>(inline_space_)
+    : do_init
+    ? new InnerContainer[n]
+    : reinterpret_cast<InnerContainer*>(::operator new(sizeof(InnerContainer) * n)))) {
   // Construct only the elements actually used.
   if (array_ == reinterpret_cast<InnerContainer*>(inline_space_)) {
     for (size_t i = 0; i != size_; ++i) {
-      inline_space_[i].Init();
+      if (do_init) {
+        inline_space_[i].Init();
+      }
     }
   }
 }
 
-template <class T, ssize_t S>
-inline FixedArray<T, S>::~FixedArray() {
+template <class T, ssize_t S, int do_init>
+inline FixedArray<T, S, do_init>::~FixedArray() {
   if (array_ != reinterpret_cast<InnerContainer*>(inline_space_)) {
-    delete[] array_;
-  } else {
+    if (do_init) {
+      delete[] array_;
+    }
+    else {
+      ::operator delete(array_);
+    }
+  }
+  else {
     for (size_t i = 0; i != size_; ++i) {
-      inline_space_[i].Destroy();
+      if (do_init) {
+        inline_space_[i].Destroy();
+      }
     }
   }
 }

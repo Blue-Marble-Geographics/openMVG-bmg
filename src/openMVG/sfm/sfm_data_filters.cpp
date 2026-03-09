@@ -112,8 +112,15 @@ IndexT RemoveOutliers_AngleError
 {
   IndexT removedTrack_count = 0;
 
-  // Precompute the cosine threshold once (angle decreasing => cosine increasing)
-  const double cosAngleThreshold = cos(D2R(dMinAcceptedAngle));
+  // Precompute the cosine squared threshold
+  // angle >= threshold  <=>  cos(angle) <= cos(threshold)
+  // For unit-free rays: dot(a,b)/(|a|*|b|) <= cos(threshold)
+  // Squared (avoiding sqrt): dot^2 >= |a|^2*|b|^2*cos^2(threshold) means angle < threshold (reject)
+  // So a track is convergent when we find a pair where:
+  //   dot < 0  (angle > 90°, always convergent), OR
+  //   dot^2 < |a|^2 * |b|^2 * cos^2(threshold)  (angle > threshold)
+  const double cosThreshold = cos(D2R(dMinAcceptedAngle));
+  const double cos2Threshold = cosThreshold * cosThreshold;
 
   // Build a per-view cache of R^T + intrinsic (small, ~186 entries)
   struct ViewCache {
@@ -139,8 +146,9 @@ IndexT RemoveOutliers_AngleError
     };
   }
 
-  // Pre-fetch bearing ray for each observation
+  // Per-track ray storage (unnormalized) + precomputed squared norms
   std::vector<Vec3> rays;
+  std::vector<double> sqNorms;
 
   Landmarks::iterator iterTracks = sfm_data.structure.begin();
   while (iterTracks != sfm_data.structure.end())
@@ -149,28 +157,33 @@ IndexT RemoveOutliers_AngleError
     bool convergent = false;
 
     rays.clear();
+    sqNorms.clear();
     rays.reserve(obs.size());
+    sqNorms.reserve(obs.size());
     for (const auto& obs_it : obs)
     {
       const auto cache_it = view_cache.find(obs_it.first);
       if (cache_it != view_cache.end())
       {
         const auto& vc = cache_it->second;
-        // ray = R^T * bearing, normalized
-        rays.emplace_back(
-          (vc.Rt * vc.intrinsic->operator()(
-            vc.intrinsic->get_ud_pixel(obs_it.second.x))).normalized());
+        const Vec2 cam_pt = vc.intrinsic->ima2cam(obs_it.second.x);
+        const Vec2 undist_pt = vc.intrinsic->remove_disto(cam_pt);
+        // ray = R^T * [undist_x, undist_y, 1]^T  (unnormalized)
+        rays.emplace_back(vc.Rt * undist_pt.homogeneous());
+        sqNorms.push_back(rays.back().squaredNorm());
       }
     }
 
-    // Compare pairs via dot product, early-exit once angle exceeds threshold
-    // angle >= threshold  <=>  dot <= cos(threshold)  (for angles in [0, pi])
+    // Compare pairs — no sqrt needed:
+    //  convergent when dot < 0  OR  dot^2 < sqNorm_i * sqNorm_j * cos^2(threshold)
     const size_t rays_size = rays.size();
     for (size_t i = 0; i < rays_size && !convergent; ++i)
     {
+      const double sqNorm_i_cos2 = sqNorms[i] * cos2Threshold;
       for (size_t j = i + 1; j < rays_size; ++j)
       {
-        if (rays[i].dot(rays[j]) <= cosAngleThreshold)
+        const double d = rays[i].dot(rays[j]);
+        if (d < 0.0 || d * d <= sqNorm_i_cos2 * sqNorms[j])
         {
           convergent = true;
           break;
@@ -288,6 +301,9 @@ bool eraseUnstablePosesAndObservations
   const IndexT min_points_per_landmark
 )
 {
+  const size_t poses_before = sfm_data.poses.size();
+  const size_t tracks_before = sfm_data.structure.size();
+
   // First remove orphan observation(s) (observation using an undefined pose)
   eraseObservationsWithMissingPoses(sfm_data, min_points_per_landmark);
   // Then iteratively remove orphan poses & observations
@@ -304,6 +320,15 @@ bool eraseUnstablePosesAndObservations
     remove_iteration += bRemovedContent ? 1 : 0;
   }
   while (bRemovedContent);
+
+  if (remove_iteration > 0)
+  {
+    OPENMVG_LOG_INFO
+      << "-- eraseUnstablePosesAndObservations: "
+      << remove_iteration << " cascade iteration(s)"
+      << " | #poses: " << poses_before << " -> " << sfm_data.poses.size()
+      << " | #tracks: " << tracks_before << " -> " << sfm_data.structure.size();
+  }
 
   return remove_iteration > 0;
 }

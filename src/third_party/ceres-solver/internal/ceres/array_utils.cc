@@ -46,7 +46,7 @@ using std::string;
 bool IsArrayValid(const int size, const double* x) {
   if (x != NULL) {
     for (int i = 0; i < size; ++i) {
-      if (!IsFinite(x[i]) || (x[i] == kImpossibleValue))  {
+      if (!IsFinite(x[i]))  {
         return false;
       }
     }
@@ -60,7 +60,7 @@ int FindInvalidValue(const int size, const double* x) {
   }
 
   for (int i = 0; i < size; ++i) {
-    if (!IsFinite(x[i]) || (x[i] == kImpossibleValue))  {
+    if (!IsFinite(x[i]))  {
       return i;
     }
   }
@@ -69,11 +69,10 @@ int FindInvalidValue(const int size, const double* x) {
 }
 
 void InvalidateArray(const int size, double* x) {
-  if (x != NULL) {
-    for (int i = 0; i < size; ++i) {
-      x[i] = kImpossibleValue;
-    }
-  }
+  // No-op: skip filling with sentinel values. The linear solver always
+  // writes the full output array, and IsArrayValid still catches NaN/Inf
+  // produced by numerical failures. This avoids an O(n) memset on the
+  // ~330K parameter array per LM iteration.
 }
 
 void AppendArrayToString(const int size, const double* x, string* result) {

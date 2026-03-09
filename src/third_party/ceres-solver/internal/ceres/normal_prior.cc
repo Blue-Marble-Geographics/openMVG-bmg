@@ -45,7 +45,7 @@ NormalPrior::NormalPrior(const Matrix& A, const Vector& b)
   CHECK_GT(A_.rows(), 0);
   CHECK_EQ(b_.rows(), A.cols());
   set_num_residuals(A_.rows());
-  mutable_parameter_block_sizes()->push_back(b_.rows());
+  add_parameter_block_sizes(b_.rows());
 }
 
 bool NormalPrior::Evaluate(double const* const* parameters,

@@ -33,6 +33,7 @@
 
 #include <map>
 #include <vector>
+#include <utility>
 #include "ceres/mutex.h"
 #include "ceres/block_random_access_matrix.h"
 #include "ceres/block_sparse_matrix.h"
@@ -226,7 +227,10 @@ template <int kRowBlockSize = Eigen::Dynamic,
 class SchurEliminator : public SchurEliminatorBase {
  public:
   explicit SchurEliminator(const LinearSolver::Options& options)
-      : num_threads_(options.num_threads) {
+  : num_threads_(options.num_threads),
+    buffer_(nullptr),
+    chunk_outer_product_buffer_(nullptr),
+    buffer_size_(0) {
   }
 
   // SchurEliminatorBase Interface
@@ -271,7 +275,7 @@ class SchurEliminator : public SchurEliminatorBase {
   // buffer_layout[z1] = 0
   // buffer_layout[z5] = y1 * z1
   // buffer_layout[z2] = y1 * z1 + y1 * z5
-  typedef std::map<int, int> BufferLayoutType;
+  typedef std::vector<std::pair<int, int>> BufferLayoutType;
   struct Chunk {
     Chunk() : size(0) {}
     int size;
@@ -279,6 +283,9 @@ class SchurEliminator : public SchurEliminatorBase {
     BufferLayoutType buffer_layout;
   };
 
+  // Private helper methods templated on kNeedsLocking so the compiler
+  // can fully eliminate lock code in the single-threaded path.
+  template <bool kNeedsLocking>
   void ChunkDiagonalBlockAndGradient(
       const Chunk& chunk,
       const BlockSparseMatrix* A,
@@ -289,6 +296,7 @@ class SchurEliminator : public SchurEliminatorBase {
       double* buffer,
       BlockRandomAccessMatrix* lhs);
 
+  template <bool kNeedsLocking>
   void UpdateRhs(const Chunk& chunk,
                  const BlockSparseMatrix* A,
                  const double* b,
@@ -296,15 +304,27 @@ class SchurEliminator : public SchurEliminatorBase {
                  const double* inverse_ete_g,
                  double* rhs);
 
+  template <bool kNeedsLocking>
   void ChunkOuterProduct(const CompressedRowBlockStructure* bs,
-                         const Matrix& inverse_eet,
+                         const typename EigenTypes<kEBlockSize, kEBlockSize>::Matrix& inverse_ete,
                          const double* buffer,
                          const BufferLayoutType& buffer_layout,
                          BlockRandomAccessMatrix* lhs);
+
+  template <bool kNeedsLocking>
   void EBlockRowOuterProduct(const BlockSparseMatrix* A,
                              int row_block_index,
                              BlockRandomAccessMatrix* lhs);
 
+  // Dispatch helper: runs the elimination loop body with the
+  // appropriate kNeedsLocking instantiation.
+  template <bool kNeedsLocking>
+  void EliminateChunks(const BlockSparseMatrix* A,
+                       const double* b,
+                       const double* D,
+                       BlockRandomAccessMatrix* lhs,
+                       double* rhs,
+                       int threadsToUse);
 
   void NoEBlockRowsUpdate(const BlockSparseMatrix* A,
                              const double* b,
@@ -340,7 +360,7 @@ class SchurEliminator : public SchurEliminatorBase {
   //
   //   [thread_id * buffer_size_ , (thread_id + 1) * buffer_size_]
   //
-  scoped_array<double> buffer_;
+  double* buffer_;
 
   // Buffer to store per thread matrix matrix products used by
   // ChunkOuterProduct. Like buffer_ it is of size num_threads *
@@ -348,14 +368,14 @@ class SchurEliminator : public SchurEliminatorBase {
   //
   //   [thread_id * buffer_size_ , (thread_id + 1) * buffer_size_ -1]
   //
-  scoped_array<double> chunk_outer_product_buffer_;
+  double* chunk_outer_product_buffer_;
 
   int buffer_size_;
   int uneliminated_row_begins_;
 
   // Locks for the blocks in the right hand side of the reduced linear
   // system.
-  std::vector<Mutex*> rhs_locks_;
+  std::vector<Mutex> rhs_locks_;
 };
 
 }  // namespace internal

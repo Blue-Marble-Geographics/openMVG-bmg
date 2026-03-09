@@ -22,6 +22,8 @@
 #include "openMVG/robust_estimation/robust_estimator_ACRansacKernelAdaptator.hpp"
 #include "openMVG/system/logger.hpp"
 
+#include <ceres/types.h>
+
 #include <memory>
 #include <utility>
 
@@ -353,7 +355,9 @@ namespace sfm {
       (b_refine_pose) ? Extrinsic_Parameter_Type::ADJUST_ALL : Extrinsic_Parameter_Type::NONE,
       Structure_Parameter_Type::NONE // STRUCTURE must remain constant
     );
-    Bundle_Adjustment_Ceres bundle_adjustment_obj;
+    Bundle_Adjustment_Ceres::BA_Ceres_options ba_options(false, false);
+    ba_options.linear_solver_type_ = ceres::DENSE_SCHUR;
+    Bundle_Adjustment_Ceres bundle_adjustment_obj(ba_options);
     const bool b_BA_Status = bundle_adjustment_obj.Adjust(
       sfm_data,
       ba_refine_options);
