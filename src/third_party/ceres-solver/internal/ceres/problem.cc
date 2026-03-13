@@ -34,6 +34,7 @@
 #include <vector>
 #include "ceres/crs_matrix.h"
 #include "ceres/problem_impl.h"
+#include "ceres/program.h"
 
 namespace ceres {
 
@@ -47,20 +48,10 @@ Problem::~Problem() {}
 ResidualBlockId Problem::AddResidualBlock(
     CostFunction* cost_function,
     LossFunction* loss_function,
-    std::initializer_list<double*> parameter_blocks) {
+    const vector<double*>& parameter_blocks) {
   return problem_impl_->AddResidualBlock(cost_function,
                                          loss_function,
                                          parameter_blocks);
-}
-
-ResidualBlockId Problem::AddResidualBlock(
-    CostFunction* cost_function,
-    LossFunction* loss_function,
-    std::vector<double*>::iterator first, std::vector<double*>::iterator last) {
-  return problem_impl_->AddResidualBlock(cost_function,
-                                         loss_function,
-                                         first,
-                                         last);
 }
 
 ResidualBlockId Problem::AddResidualBlock(
@@ -284,10 +275,12 @@ void Problem::GetResidualBlocksForParameterBlock(
                                                     residual_blocks);
 }
 
-void Problem::Reserve(int num_parameter_blocks, int num_residual_blocks)
-{
-  problem_impl_->Reserve(num_parameter_blocks, num_residual_blocks);
+void Problem::ReserveParameterBlocks(size_t n) {
+  problem_impl_->mutable_program()->ReserveParameterBlocks(n);
 }
 
+void Problem::ReserveResidualBlocks(size_t n) {
+  problem_impl_->mutable_program()->ReserveResidualBlocks(n);
+}
 
 }  // namespace ceres

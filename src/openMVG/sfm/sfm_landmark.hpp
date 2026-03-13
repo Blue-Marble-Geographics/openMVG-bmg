@@ -218,6 +218,24 @@ public:
     return insert(std::move(tmp));
   }
 
+  /// Append without duplicate check. Caller guarantees key uniqueness.
+  /// This is O(1) amortized vs O(n) for insert().
+  void push_back_unchecked(const value_type& value) {
+    if (size_ == capacity_) {
+      GrowFor(size_ + 1);
+    }
+    new (data_ + size_) value_type(value);
+    ++size_;
+  }
+
+  void push_back_unchecked(value_type&& value) {
+    if (size_ == capacity_) {
+      GrowFor(size_ + 1);
+    }
+    new (data_ + size_) value_type(std::move(value));
+    ++size_;
+  }
+
   iterator erase(iterator it) {
     assert(it >= begin() && it < end());
     size_t idx = static_cast<size_t>(it - begin());
@@ -370,7 +388,7 @@ struct Observation
 };
 
 /// Observations are indexed by their View_id
-using Observations = SmallMap<IndexT, Observation, 4>;
+using Observations = SmallMap<IndexT, Observation, 8>;
 
 inline Observations::const_iterator FindObservation(
   const Observations& obs,

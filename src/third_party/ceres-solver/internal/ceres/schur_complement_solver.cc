@@ -249,10 +249,19 @@ void SparseSchurComplementSolver::InitStorage(
     blocks_[i - num_eliminate_blocks] = bs->cols[i].size;
   }
 
-  set<pair<int, int> > block_pairs;
-  for (int i = 0; i < blocks_.size(); ++i) {
-    block_pairs.insert(make_pair(i, i));
+  // Use a flat vector instead of std::set to collect block pairs.
+  // This avoids O(log n) tree-node allocations per insert and gives
+  // much better cache locality.
+  std::vector<pair<int, int>> block_pairs_vec;
+  block_pairs_vec.reserve(blocks_.size() + num_row_blocks * 4);
+
+  // Diagonal blocks
+  for (int i = 0; i < static_cast<int>(blocks_.size()); ++i) {
+    block_pairs_vec.emplace_back(i, i);
   }
+
+  // Reusable scratch vector for f_blocks within each chunk
+  vector<int> f_blocks;
 
   int r = 0;
   while (r < num_row_blocks) {
@@ -260,7 +269,7 @@ void SparseSchurComplementSolver::InitStorage(
     if (e_block_id >= num_eliminate_blocks) {
       break;
     }
-    vector<int> f_blocks;
+    f_blocks.clear();
 
     // Add to the chunk until the first block in the row is
     // different than the one in the first row for the chunk.
@@ -272,7 +281,7 @@ void SparseSchurComplementSolver::InitStorage(
 
       // Iterate over the blocks in the row, ignoring the first
       // block since it is the one to be eliminated.
-      for (int c = 1; c < row.cells.size(); ++c) {
+      for (int c = 1; c < static_cast<int>(row.cells.size()); ++c) {
         const Cell& cell = row.cells[c];
         f_blocks.push_back(cell.block_id - num_eliminate_blocks);
       }
@@ -280,28 +289,37 @@ void SparseSchurComplementSolver::InitStorage(
 
     sort(f_blocks.begin(), f_blocks.end());
     f_blocks.erase(unique(f_blocks.begin(), f_blocks.end()), f_blocks.end());
-    for (int i = 0; i < f_blocks.size(); ++i) {
-      for (int j = i + 1; j < f_blocks.size(); ++j) {
-        block_pairs.insert(make_pair(f_blocks[i], f_blocks[j]));
+    for (int i = 0; i < static_cast<int>(f_blocks.size()); ++i) {
+      for (int j = i + 1; j < static_cast<int>(f_blocks.size()); ++j) {
+        block_pairs_vec.emplace_back(f_blocks[i], f_blocks[j]);
       }
     }
   }
 
-  // Remaing rows do not contribute to the chunks and directly go
+  // Remaining rows do not contribute to the chunks and directly go
   // into the schur complement via an outer product.
   for (; r < num_row_blocks; ++r) {
     const CompressedRow& row = bs->rows[r];
     CHECK_GE(row.cells.front().block_id, num_eliminate_blocks);
-    for (int i = 0; i < row.cells.size(); ++i) {
+    for (int i = 0; i < static_cast<int>(row.cells.size()); ++i) {
       int r_block1_id = row.cells[i].block_id - num_eliminate_blocks;
-      for (int j = 0; j < row.cells.size(); ++j) {
+      for (int j = 0; j < static_cast<int>(row.cells.size()); ++j) {
         int r_block2_id = row.cells[j].block_id - num_eliminate_blocks;
         if (r_block1_id <= r_block2_id) {
-          block_pairs.insert(make_pair(r_block1_id, r_block2_id));
+          block_pairs_vec.emplace_back(r_block1_id, r_block2_id);
         }
       }
     }
   }
+
+  // Deduplicate: sort then unique — O(n log n) with no per-element allocations
+  sort(block_pairs_vec.begin(), block_pairs_vec.end());
+  block_pairs_vec.erase(unique(block_pairs_vec.begin(), block_pairs_vec.end()),
+                        block_pairs_vec.end());
+
+  // Convert to the set expected by BlockRandomAccessSparseMatrix
+  set<pair<int, int>> block_pairs(block_pairs_vec.begin(),
+                                  block_pairs_vec.end());
 
   set_lhs(new BlockRandomAccessSparseMatrix(blocks_, block_pairs));
   set_rhs(new double[lhs()->num_rows()]);

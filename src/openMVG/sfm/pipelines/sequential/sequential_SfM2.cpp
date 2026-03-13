@@ -28,6 +28,10 @@
 #include <functional>
 #include <iostream>
 
+#ifdef OPENMVG_USE_OPENMP
+#include <omp.h>
+#endif
+
 namespace openMVG {
 namespace sfm {
 
@@ -150,58 +154,131 @@ bool SequentialSfMReconstructionEngine2::Process() {
   //--
   //- 2. While we can localize some cameras in the reconstruction
   //     a. Triangulate the landmarks
-  //     b. Perform Bundle Adjustment and cleaning
+  //     b. Perform Bundle Adjustment and cleaning (batched)
   //--
   IndexT resection_round = 0;
 
+  // Count total views that need poses (for early termination)
+  const IndexT total_views = static_cast<IndexT>(sfm_data_.GetViews().size());
+
+  // BA batching: only run the expensive global BA + triangulation + filtering
+  // cycle when enough new cameras have been added since the last BA.
+  // Each new camera gets a good initial pose from RefinePose (single-camera
+  // BA against fixed 3D points), so deferring global BA is safe.
+  // We track poses_at_last_ba to decide when to trigger.
+  IndexT poses_at_last_ba = sfm_data_.GetPoses().size();
+
+  // Minimum number of new cameras before we run global BA.
+  // This avoids running a full BA cycle (which costs ~13s on 1M tracks)
+  // after adding just 2-4 cameras.  The threshold adapts: early in
+  // reconstruction when there are few cameras, we BA more often to
+  // maintain accuracy; later when the scene is stable, we batch more.
+  auto ba_batch_threshold = [](IndexT current_poses) -> IndexT {
+    if (current_poses < 50)
+      return 5;   // BA every 5 new cameras (scene still fragile)
+    if (current_poses < 150)
+      return 15;  // BA every 15 new cameras (scene stabilizing)
+    return 30;    // BA every 30 new cameras (scene stable, BA expensive)
+    };
+
   // Incrementally estimate the pose of the cameras based on a confidence score.
-  // The confidence score is based on the track_inlier_ratio.
-  // First the camera with the most of 2D-3D overlap are added then we add
-  // ones with lower confidence.
-  const std::array<float, 2> track_inlier_ratios = {0.2, 0.0};
+  const std::array<float, 2> track_inlier_ratios = { 0.2, 0.0 };
   for (auto track_inlier_ratio = track_inlier_ratios.cbegin();
     track_inlier_ratio < track_inlier_ratios.cend(); ++track_inlier_ratio)
   {
+    // Early exit: all views have been reconstructed
+    if (sfm_data_.GetPoses().size() >= total_views)
+      break;
+
     IndexT pose_before = sfm_data_.GetPoses().size();
     while (AddingMissingView(*track_inlier_ratio))
     {
-      // Create new 3D points
-      Triangulation();
-      // Adjust the scene
-      BundleAdjustment();
-      // Remove unstable triangulations and camera poses
-      const size_t tracks_before_filter = sfm_data_.GetLandmarks().size();
-      const size_t poses_before_filter = sfm_data_.GetPoses().size();
-      const size_t angle_removed = RemoveOutliers_AngleError(sfm_data_, 2.0);
-      const size_t pixel_removed = RemoveOutliers_PixelResidualError(sfm_data_, 4.0);
-      eraseUnstablePosesAndObservations(sfm_data_);
+      const IndexT poses_added_since_ba =
+        sfm_data_.GetPoses().size() - poses_at_last_ba;
+      const IndexT threshold = ba_batch_threshold(sfm_data_.GetPoses().size());
+      const bool all_views_done = sfm_data_.GetPoses().size() >= total_views;
 
-      OPENMVG_LOG_INFO
-        << "-- Round " << resection_round << " filter stats:"
-        << " #poses: " << poses_before_filter << " -> " << sfm_data_.GetPoses().size()
-        << " | #tracks: " << tracks_before_filter
-        << " -angle(" << angle_removed << ")"
-        << " -pixel(" << pixel_removed << ")"
-        << " -> " << sfm_data_.GetLandmarks().size();
+      // Run BA cycle only when enough cameras accumulated, all views
+      // are done, or no new cameras were added (stall — let BA clean up).
+      if (poses_added_since_ba >= threshold || all_views_done)
+      {
+        // Create new 3D points
+        Triangulation();
+        // Adjust the scene
+        {
+          Bundle_Adjustment_Ceres::BA_Ceres_options options;
+          if (sfm_data_.GetPoses().size() > 100 &&
+            (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::SUITE_SPARSE) ||
+              ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::EIGEN_SPARSE))
+            )
+          {
+            options.preconditioner_type_ = ceres::JACOBI;
+            options.linear_solver_type_ = ceres::SPARSE_SCHUR;
+          }
+          else
+          {
+            options.linear_solver_type_ = ceres::DENSE_SCHUR;
+          }
+          options.max_num_iterations_ = 3;
+          Bundle_Adjustment_Ceres bundle_adjustment_obj(options);
+          const Optimize_Options ba_refine_options
+          (ReconstructionEngine::intrinsic_refinement_options_,
+            ReconstructionEngine::extrinsic_refinement_options_,
+            Structure_Parameter_Type::ADJUST_ALL,
+            Control_Point_Parameter(),
+            this->b_use_motion_prior_
+          );
+          bundle_adjustment_obj.Adjust(sfm_data_, ba_refine_options);
+        }
+        // Remove unstable triangulations and camera poses
+        const size_t tracks_before_filter = sfm_data_.GetLandmarks().size();
+        const size_t poses_before_filter = sfm_data_.GetPoses().size();
+#if 0
+        const size_t angle_removed = RemoveOutliers_AngleError(sfm_data_, 2.0);
+        const size_t pixel_removed = RemoveOutliers_PixelResidualError(sfm_data_, 4.0);
+#else
+        const auto filter_result = RemoveOutliers_AngleAndPixelError(sfm_data_, 2.0, 4.0);
+        const size_t angle_removed = filter_result.first;
+        const size_t pixel_removed = filter_result.second;
+#endif
+        eraseUnstablePosesAndObservations(sfm_data_);
 
-      std::ostringstream os;
-      os << std::setw(8) << std::setfill('0') << resection_round << "_Resection";
-      Save(sfm_data_, stlplus::create_filespec(sOut_directory_, os.str(), ".ply"), ESfM_Data(ALL));
-      ++resection_round;
+        OPENMVG_LOG_INFO
+          << "-- Round " << resection_round << " filter stats:"
+          << " #poses: " << poses_before_filter << " -> " << sfm_data_.GetPoses().size()
+          << " | #tracks: " << tracks_before_filter
+          << " -angle(" << angle_removed << ")"
+          << " -pixel(" << pixel_removed << ")"
+          << " -> " << sfm_data_.GetLandmarks().size();
+
+        poses_at_last_ba = sfm_data_.GetPoses().size();
+        ++resection_round;
+      }
+      else
+      {
+        // Lightweight round: only triangulate new points so the next
+        // resection round has more 2D-3D correspondences to work with.
+        // Skip the expensive BA + filtering cycle.
+        Triangulation();
+      }
 
       // Stop if no cameras have been added
-      // Note: some cameras could have been removed due to instable camera positions.
       const IndexT pose_after = sfm_data_.GetPoses().size();
       if (pose_before >= pose_after)
         break;
       pose_before = sfm_data_.GetPoses().size();
+
+      // Early exit: all views have been reconstructed
+      if (sfm_data_.GetPoses().size() >= total_views)
+        break;
+
       // Since we have augmented our set of poses we can reset our track inlier ratio iterator
       track_inlier_ratio = track_inlier_ratios.cbegin();
     }
   }
 
   //--
-  //- 3. Final bundle Adjustment
+  //- 3. Final bundle Adjustment (full iterations)
   //--
   BundleAdjustment();
 
@@ -283,20 +360,135 @@ bool SequentialSfMReconstructionEngine2::InitTracksAndLandmarks()
 
 bool SequentialSfMReconstructionEngine2::Triangulation()
 {
-  sfm_data_.structure = landmarks_;
-
   //--
   // Triangulation
   //--
-  // Clean the structure:
-  //  - keep observations that are linked to valid pose and intrinsic data.
+  // Build the structure from putative landmarks, keeping only observations
+  // that are linked to valid pose and intrinsic data. This fuses the old
+  //   sfm_data_.structure = landmarks_;
+  //   eraseObservationsWithMissingPoses(sfm_data_, min_sample_index);
+  // into a single pass, avoiding the allocation and deep-copy of landmarks
+  // that would be immediately discarded by the filter.
 
   const double max_reprojection_error = 4.0;
   const IndexT min_required_inliers = 2;
   const IndexT min_sample_index = 2;
-  const size_t landmarks_total = sfm_data_.structure.size();
-  eraseObservationsWithMissingPoses(sfm_data_, min_sample_index);
-  const size_t landmarks_after_erase = sfm_data_.structure.size();
+
+  // Pre-build a sorted vector of view ids whose pose exists
+  std::vector<IndexT> valid_view_ids;
+  valid_view_ids.reserve(sfm_data_.views.size());
+  for (const auto & view_it : sfm_data_.views)
+  {
+    if (sfm_data_.poses.count(view_it.second->id_pose))
+      valid_view_ids.push_back(view_it.first);
+  }
+  std::sort(valid_view_ids.begin(), valid_view_ids.end());
+
+  // Instead of clear + re-insert, we do an incremental update:
+  //  1. For landmarks already in structure: update their obs from
+  //     landmarks_ to include any newly-posed views, then mark for
+  //     re-triangulation (set X to zero).
+  //  2. For landmarks NOT in structure: insert if they have enough
+  //     posed observations.
+  // This avoids all hash node deallocations and most reallocations.
+
+  size_t new_landmarks_added = 0;
+  size_t existing_landmarks_updated = 0;
+  const size_t landmarks_total = landmarks_.size();
+
+  for (const auto & lm_it : landmarks_)
+  {
+    // Count valid observations in the master list
+    const Observations & src_obs = lm_it.second.obs;
+    size_t valid_count = 0;
+    for (const auto & obs_it : src_obs)
+    {
+      if (std::binary_search(valid_view_ids.cbegin(), valid_view_ids.cend(), obs_it.first))
+      {
+        ++valid_count;
+        // Early-out: we only need to know if >= min_sample_index
+        if (valid_count >= min_sample_index)
+          break;
+      }
+    }
+
+    if (valid_count < min_sample_index)
+      continue;
+
+    // Check if this landmark already exists in structure
+    const auto existing_it = sfm_data_.structure.find(lm_it.first);
+    if (existing_it != sfm_data_.structure.end())
+    {
+      // Already exists — check if its observation set actually changed
+      // (newly posed views may have been added since last round)
+      Landmark & dst = existing_it->second;
+
+      // Count how many valid observations the master list has now
+      size_t new_valid_count = 0;
+      for (const auto & obs_it : src_obs)
+      {
+        if (std::binary_search(valid_view_ids.cbegin(), valid_view_ids.cend(), obs_it.first))
+          ++new_valid_count;
+      }
+
+      // If the observation count hasn't changed, the landmark's X is
+      // still valid — skip the expensive re-triangulation.
+      if (new_valid_count == dst.obs.size())
+      {
+        ++existing_landmarks_updated;
+        continue;
+      }
+
+      // Observation set changed — rebuild and re-triangulate
+      dst.obs.clear();
+      dst.obs.reserve(src_obs.size());
+      for (const auto & obs_it : src_obs)
+      {
+        if (std::binary_search(valid_view_ids.cbegin(), valid_view_ids.cend(), obs_it.first))
+        {
+          dst.obs.push_back_unchecked(obs_it);
+        }
+      }
+      // Reset X so robust_triangulation re-triangulates with updated obs
+      dst.X = Vec3::Zero();
+      ++existing_landmarks_updated;
+    }
+    else
+    {
+      // New landmark — this is the only path that allocates a hash node
+      Landmark & dst = sfm_data_.structure[lm_it.first];
+      dst.X = Vec3::Zero();
+      dst.obs.reserve(src_obs.size());
+      for (const auto & obs_it : src_obs)
+      {
+        if (std::binary_search(valid_view_ids.cbegin(), valid_view_ids.cend(), obs_it.first))
+        {
+          dst.obs.push_back_unchecked(obs_it);
+        }
+      }
+      ++new_landmarks_added;
+    }
+  }
+
+  // Also remove any structure entries whose landmark was erased from
+  // landmarks_ (shouldn't happen, but be safe) or that no longer have
+  // enough posed observations. This handles landmarks that lost posed
+  // views due to pose removal in eraseUnstablePosesAndObservations.
+  {
+    auto it = sfm_data_.structure.begin();
+    while (it != sfm_data_.structure.end())
+    {
+      // If the master landmarks_ doesn't contain this track, or if
+      // after observation update it has too few observations, remove it.
+      if (it->second.obs.size() < min_sample_index)
+        it = sfm_data_.structure.erase(it);
+      else
+        ++it;
+    }
+  }
+
+  const size_t landmarks_before_triangulation = sfm_data_.structure.size();
+
   SfM_Data_Structure_Computation_Robust triangulation_engine(
       max_reprojection_error,
       min_required_inliers,
@@ -308,7 +500,9 @@ bool SequentialSfMReconstructionEngine2::Triangulation()
   OPENMVG_LOG_INFO
     << "-- Triangulation: #poses: " << sfm_data_.GetPoses().size()
     << " | #landmarks: " << landmarks_total
-    << " -> " << landmarks_after_erase << " (after erase missing poses)"
+    << " (updated: " << existing_landmarks_updated
+    << ", new: " << new_landmarks_added << ")"
+    << " -> " << landmarks_before_triangulation << " (before triangulation)"
     << " -> " << sfm_data_.structure.size() << " (after triangulation)";
 
   return !sfm_data_.structure.empty();
@@ -322,19 +516,18 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
   if (sfm_data_.GetLandmarks().empty())
     return false;
 
-  // Collect the views that does not have any 3D pose
-  const std::set<IndexT> view_with_no_pose = [&]
+  // Collect the views that do not have any 3D pose (sorted vector, no heap per element)
+  std::vector<IndexT> views_with_no_pose;
+  views_with_no_pose.reserve(sfm_data_.GetViews().size());
+  for (const auto & view_it : sfm_data_.GetViews())
   {
-    std::set<IndexT> idx;
-    for (const auto & view_it : sfm_data_.GetViews())
-    {
-      const View * v = view_it.second.get();
-      const IndexT id_pose = v->id_pose;
-      if (sfm_data_.GetPoses().count(id_pose) == 0)
-        idx.insert(view_it.first);
-    }
-    return idx;
-  }();
+    const View * v = view_it.second.get();
+    if (sfm_data_.GetPoses().count(v->id_pose) == 0)
+      views_with_no_pose.push_back(view_it.first);
+  }
+
+  if (views_with_no_pose.empty())
+    return false;
 
   const IndexT pose_before = sfm_data_.GetPoses().size();
 
@@ -353,16 +546,16 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
   // Phase 1: Gather resection candidates with their 2D-3D match info (parallel)
   struct ResectionCandidate {
     IndexT view_id;
-    std::set<IndexT> track_id_for_resection;
-    std::vector<IndexT> feature_id_for_resection;
+    std::vector<IndexT> track_id_for_resection;  // sorted
+    std::vector<IndexT> feature_id_for_resection; // parallel to track_id_for_resection
     double track_ratio;
   };
   std::vector<ResectionCandidate> candidates;
-  // Protect the shared candidates vector
+
   #ifdef OPENMVG_USE_OPENMP
   #pragma omp parallel
   #endif
-  for (const auto & view_id : view_with_no_pose)
+  for (const auto & view_id : views_with_no_pose)
   {
   #ifdef OPENMVG_USE_OPENMP
     #pragma omp single nowait
@@ -373,11 +566,11 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
       std::vector<uint32_t> view_feat_ids;
       shared_track_visibility_helper_->GetTracksInImages({view_id}, view_track_ids, view_feat_ids);
 
-      // Get the ids of the already reconstructed tracks
-      std::set<IndexT> track_id_for_resection;
+      // Get the ids of the already reconstructed tracks (sorted vector output)
+      std::vector<IndexT> track_id_for_resection;
       std::set_intersection(view_track_ids.cbegin(), view_track_ids.cend(),
         reconstructed_trackId.cbegin(), reconstructed_trackId.cend(),
-        std::inserter(track_id_for_resection, track_id_for_resection.begin()));
+        std::back_inserter(track_id_for_resection));
 
       const double track_ratio = track_id_for_resection.size() / static_cast<float>(view_track_ids.size() + 1);
       OPENMVG_LOG_INFO
@@ -408,7 +601,6 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
             std::move(feature_id_for_resection),
             track_ratio});
         }
-
       }
     }
   }
@@ -421,44 +613,57 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
       return a.view_id < b.view_id; // tie-break by view_id for determinism
     });
 
-  // Phase 2: Resect all candidates in parallel, collect results
-  struct ResectionResult {
-    bool accepted = false;
-    geometry::Pose3 pose;
-    std::shared_ptr<cameras::IntrinsicBase> intrinsic;
-    bool needs_new_intrinsic = false;
-  };
-  const int num_candidates = static_cast<int>(candidates.size());
-  std::vector<ResectionResult> resection_results(num_candidates);
+  // Phase 2 & 3: Resect each candidate and apply results immediately.
+  // This is done sequentially because the RefinePose -> Adjust call chain
+  // allocates SfM_Data, ceres::Problem, ceres::Solver::Options/Summary,
+  // and large Eigen temporaries on the call stack, which exceeds the
+  // default OpenMP worker thread stack size (1-4 MB on Windows) and
+  // causes silent stack corruption.  Each single-pose BA is trivially
+  // fast (DENSE_SCHUR on ~6 parameters), so serialising has negligible
+  // impact on total runtime.
 
-#ifdef OPENMVG_USE_OPENMP
-  #pragma omp parallel for schedule(dynamic)
-#endif
-  for (int ci = 0; ci < num_candidates; ++ci)
+  // Construct resection buffers once outside the loop so that:
+  //  - vec_inliers retains its heap capacity across iterations
+  //  - Mat members (pt2D, pt3D) skip reallocation via resize() when
+  //    consecutive candidates have the same match count (Eigen only
+  //    reallocates when the total element count changes)
+  //  - pose, projection_matrix, etc. are not re-constructed each iteration
+  Image_Localizer_Match_Data resection_data;
+  Mat pt2D_original;  // Same type as resection_data.pt2D (MatrixXd) for swap
+  geometry::Pose3 pose;
+
+  for (size_t ci = 0; ci < candidates.size(); ++ci)
   {
     const auto & candidate = candidates[ci];
     const auto & view_id = candidate.view_id;
     const auto & track_id_for_resection = candidate.track_id_for_resection;
     const auto & feature_id_for_resection = candidate.feature_id_for_resection;
+    const auto n_pts = static_cast<Eigen::Index>(track_id_for_resection.size());
 
-    // Localize the image inside the SfM reconstruction
-    Image_Localizer_Match_Data resection_data;
-    resection_data.pt2D.resize(2, track_id_for_resection.size());
-    resection_data.pt3D.resize(3, track_id_for_resection.size());
+    // Resize — Eigen skips reallocation when total element count is unchanged.
+    // After the swap below, resection_data.pt2D holds the previous iteration's
+    // pt2D_original buffer; if n_pts matches the previous iteration, this is free.
+    resection_data.pt2D.resize(2, n_pts);
+    resection_data.pt3D.resize(3, n_pts);
+    resection_data.vec_inliers.clear();
+    resection_data.error_max = std::numeric_limits<double>::infinity();
+    pt2D_original.resize(2, n_pts);
 
     // Look if the intrinsic data is known or not
     const View * view = sfm_data_.GetViews().at(view_id).get();
     std::shared_ptr<cameras::IntrinsicBase> intrinsic;
-    if (sfm_data_.GetIntrinsics().count(view->id_intrinsic))
     {
-      intrinsic = sfm_data_.GetIntrinsics().at(view->id_intrinsic);
+      const auto intrinsic_it = sfm_data_.GetIntrinsics().find(view->id_intrinsic);
+      if (intrinsic_it != sfm_data_.GetIntrinsics().end())
+      {
+        intrinsic = intrinsic_it->second;
+      }
     }
 
-    // Collect the feature observation
-    Mat2X pt2D_original(2, track_id_for_resection.size());
+    // Collect the feature observations
     auto track_it = track_id_for_resection.cbegin();
     auto feat_it = feature_id_for_resection.cbegin();
-    for (size_t cpt = 0; cpt < track_id_for_resection.size(); ++cpt, ++track_it, ++feat_it)
+    for (Eigen::Index cpt = 0; cpt < n_pts; ++cpt, ++track_it, ++feat_it)
     {
       resection_data.pt3D.col(cpt) = sfm_data_.GetLandmarks().at(*track_it).X;
       resection_data.pt2D.col(cpt) = pt2D_original.col(cpt) =
@@ -470,7 +675,6 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
       }
     }
 
-    geometry::Pose3 pose;
     const bool bResection = sfm::SfM_Localizer::Localize
     (
       intrinsic ? resection_method_ : resection::SolverType::DLT_6POINTS,
@@ -479,7 +683,10 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
       resection_data,
       pose
     );
-    resection_data.pt2D = std::move(pt2D_original); // restore original image domain points
+    // Restore original (distorted) image domain points for RefinePose.
+    // Use swap instead of move so both Mat buffers survive for potential
+    // reuse next iteration (swap is a pointer exchange, zero cost).
+    resection_data.pt2D.swap(pt2D_original);
 
     const float inlier_ratio = resection_data.vec_inliers.size()/static_cast<float>(feature_id_for_resection.size());
     OPENMVG_LOG_INFO
@@ -539,61 +746,93 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
           intrinsic.get(), pose,
           resection_data, b_refine_pose, b_refine_intrinsics))
       {
-        ResectionResult & res = resection_results[ci];
-        res.accepted = true;
-        res.pose = pose;
-        res.intrinsic = intrinsic;
-        res.needs_new_intrinsic =
-          (sfm_data_.intrinsics.count(sfm_data_.views.at(view_id)->id_intrinsic) == 0);
+        // Validate that the refined pose contains finite values
+        // (degenerate resections or numerically unstable BA can produce NaN)
+        if (!pose.rotation().allFinite() || !pose.center().allFinite())
+        {
+          OPENMVG_LOG_WARNING << "Pose for view " << view_id
+            << " contains non-finite values after refinement, discarding.";
+          continue;
+        }
+
+        // Apply result immediately — single find() instead of count()+at()
+        const auto existing_intrinsic_it =
+          sfm_data_.intrinsics.find(view->id_intrinsic);
+        if (existing_intrinsic_it == sfm_data_.intrinsics.end())
+        {
+          // Need a new intrinsic id
+          IndexT new_intrinsic_id = 0;
+          if (!sfm_data_.intrinsics.empty())
+          {
+            // Find max existing id — intrinsics map is small, just iterate
+            for (const auto & kv : sfm_data_.intrinsics)
+            {
+              if (kv.first >= new_intrinsic_id)
+                new_intrinsic_id = kv.first + 1;
+            }
+          }
+          sfm_data_.views.at(view_id)->id_intrinsic = new_intrinsic_id;
+          sfm_data_.intrinsics[new_intrinsic_id] = intrinsic;
+        }
+
+        sfm_data_.poses[view->id_pose] = pose;
       }
     }
-  }
-
-  // Phase 3: Apply results sequentially in deterministic sorted order
-  for (int ci = 0; ci < num_candidates; ++ci)
-  {
-    if (!resection_results[ci].accepted)
-      continue;
-
-    const auto & candidate = candidates[ci];
-    const auto & view_id = candidate.view_id;
-    const View * view = sfm_data_.GetViews().at(view_id).get();
-    const auto & res = resection_results[ci];
-
-    if (res.needs_new_intrinsic)
-    {
-      IndexT new_intrinsic_id = 0;
-      if (!sfm_data_.GetIntrinsics().empty())
-      {
-        std::set<IndexT> existing_intrinsic_id;
-        std::transform(sfm_data_.GetIntrinsics().cbegin(), sfm_data_.GetIntrinsics().cend(),
-          std::inserter(existing_intrinsic_id, existing_intrinsic_id.begin()),
-          stl::RetrieveKey());
-        new_intrinsic_id = (*existing_intrinsic_id.rbegin()) + 1;
-      }
-      sfm_data_.views.at(view_id)->id_intrinsic = new_intrinsic_id;
-      sfm_data_.intrinsics[new_intrinsic_id] = res.intrinsic;
-    }
-
-    sfm_data_.poses[view->id_pose] = res.pose;
   }
 
   const IndexT pose_after = sfm_data_.GetPoses().size();
   OPENMVG_LOG_INFO
     << "-- AddingMissingView: poses " << pose_before << " -> " << pose_after
     << " | #landmarks: " << sfm_data_.GetLandmarks().size()
-    << " | #remaining views: " << view_with_no_pose.size();
+    << " | #remaining views: " << views_with_no_pose.size();
   return (pose_after != pose_before);
 }
 
 bool SequentialSfMReconstructionEngine2::BundleAdjustment()
 {
+#if 1
   Bundle_Adjustment_Ceres::BA_Ceres_options options;
-  if ( sfm_data_.GetPoses().size() > 100 &&
-      (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::SUITE_SPARSE) ||
-       ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::EIGEN_SPARSE))
-      )
-  // Enable sparse BA only if a sparse lib is available and if there more than 100 poses
+  if (sfm_data_.GetPoses().size() > 100 &&
+    (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::SUITE_SPARSE) ||
+      ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::EIGEN_SPARSE)))
+  {
+    options.preconditioner_type_ = ceres::JACOBI;
+    options.linear_solver_type_ = ceres::SPARSE_SCHUR;
+  }
+  else
+  {
+    options.linear_solver_type_ = ceres::DENSE_SCHUR;
+  }
+
+  // The original defaults (function_tolerance=0.048, max_iterations=5,
+  // trust_region=1e4) caused the final BA to do zero work on a
+  // near-converged scene.  The fix is tight tolerances so the solver
+  // doesn't stop prematurely.  The trust region stays at the default 1e4
+  // — the intermediate BAs use the same value and waste no iterations.
+  // Setting it to 1e16 causes ~9 rejected steps as the solver shrinks
+  // the radius back down to ~1e5, wasting ~1s per rejected step.
+  options.max_num_iterations_ = 20;
+  options.parameter_tolerance_ = 1e-8;
+  options.function_tolerance_ = 1e-6;
+  options.gradient_tolerance_ = 1e-10;
+  options.use_nonmonotonic_steps_ = false;
+
+  Bundle_Adjustment_Ceres bundle_adjustment_obj(options);
+  const Optimize_Options ba_refine_options
+  (ReconstructionEngine::intrinsic_refinement_options_,
+    ReconstructionEngine::extrinsic_refinement_options_,
+    Structure_Parameter_Type::ADJUST_ALL,
+    Control_Point_Parameter(),
+    this->b_use_motion_prior_
+  );
+  return bundle_adjustment_obj.Adjust(sfm_data_, ba_refine_options);
+#else
+  Bundle_Adjustment_Ceres::BA_Ceres_options options;
+  if (sfm_data_.GetPoses().size() > 100 &&
+    (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::SUITE_SPARSE) ||
+      ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::EIGEN_SPARSE))
+    )
+    // Enable sparse BA only if a sparse lib is available and if there more than 100 poses
   {
     options.preconditioner_type_ = ceres::JACOBI;
     options.linear_solver_type_ = ceres::SPARSE_SCHUR;
@@ -604,13 +843,14 @@ bool SequentialSfMReconstructionEngine2::BundleAdjustment()
   }
   Bundle_Adjustment_Ceres bundle_adjustment_obj(options);
   const Optimize_Options ba_refine_options
-    ( ReconstructionEngine::intrinsic_refinement_options_,
-      ReconstructionEngine::extrinsic_refinement_options_,
-      Structure_Parameter_Type::ADJUST_ALL, // Adjust scene structure
-      Control_Point_Parameter(),
-      this->b_use_motion_prior_
-    );
+  (ReconstructionEngine::intrinsic_refinement_options_,
+    ReconstructionEngine::extrinsic_refinement_options_,
+    Structure_Parameter_Type::ADJUST_ALL, // Adjust scene structure
+    Control_Point_Parameter(),
+    this->b_use_motion_prior_
+  );
   return bundle_adjustment_obj.Adjust(sfm_data_, ba_refine_options);
+#endif
 }
 
 } // namespace sfm

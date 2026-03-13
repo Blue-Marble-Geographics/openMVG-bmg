@@ -342,10 +342,10 @@ const
   }
 
   // Per-track success flag; failed tracks will be erased after the loop
-  std::vector<bool> succeeded(num_tracks, false);
+  std::vector<uint8_t> succeeded(num_tracks, 0);
 
 #ifdef OPENMVG_USE_OPENMP
-  #pragma omp parallel for schedule(dynamic)
+  #pragma omp parallel for schedule(dynamic, 64)
 #endif
   for (int i = 0; i < num_tracks; ++i)
   {
@@ -360,7 +360,7 @@ const
 
     if (robust_triangulation(sfm_data, obs_copy, landmark))
     {
-      succeeded[i] = true;
+      succeeded[i] = 1;
     }
   }
 

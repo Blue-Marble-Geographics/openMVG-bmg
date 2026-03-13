@@ -50,11 +50,11 @@ template<int kNumResiduals,
 class SizedCostFunction : public CostFunction {
  public:
   SizedCostFunction() {
-    DCHECK(kNumResiduals > 0 || kNumResiduals == DYNAMIC)
+    CHECK(kNumResiduals > 0 || kNumResiduals == DYNAMIC)
         << "Cost functions must have at least one residual block.";
 
     // This block breaks the 80 column rule to keep it somewhat readable.
-    DCHECK((!N1 && !N2 && !N3 && !N4 && !N5 && !N6 && !N7 && !N8 && !N9) ||
+    CHECK((!N1 && !N2 && !N3 && !N4 && !N5 && !N6 && !N7 && !N8 && !N9) ||
           ((N1 > 0) && !N2 && !N3 && !N4 && !N5 && !N6 && !N7 && !N8 && !N9) ||
           ((N1 > 0) && (N2 > 0) && !N3 && !N4 && !N5 && !N6 && !N7 && !N8 && !N9) ||                                   // NOLINT
           ((N1 > 0) && (N2 > 0) && (N3 > 0) && !N4 && !N5 && !N6 && !N7 && !N8 && !N9) ||                              // NOLINT
@@ -71,16 +71,20 @@ class SizedCostFunction : public CostFunction {
 
     set_num_residuals(kNumResiduals);
 
-    if (N0) add_parameter_block_sizes(N0);
-    if (N1) add_parameter_block_sizes(N1);
-    if (N2) add_parameter_block_sizes(N2);
-    if (N3) add_parameter_block_sizes(N3);
-    if (N4) add_parameter_block_sizes(N4);
-    if (N5) add_parameter_block_sizes(N5);
-    if (N6) add_parameter_block_sizes(N6);
-    if (N7) add_parameter_block_sizes(N7);
-    if (N8) add_parameter_block_sizes(N8);
-    if (N9) add_parameter_block_sizes(N9);
+    // Write directly to inline storage (no heap allocation)
+#define CERES_ADD_PARAMETER_BLOCK(N) \
+    if (N) add_parameter_block_size(N);
+    CERES_ADD_PARAMETER_BLOCK(N0);
+    CERES_ADD_PARAMETER_BLOCK(N1);
+    CERES_ADD_PARAMETER_BLOCK(N2);
+    CERES_ADD_PARAMETER_BLOCK(N3);
+    CERES_ADD_PARAMETER_BLOCK(N4);
+    CERES_ADD_PARAMETER_BLOCK(N5);
+    CERES_ADD_PARAMETER_BLOCK(N6);
+    CERES_ADD_PARAMETER_BLOCK(N7);
+    CERES_ADD_PARAMETER_BLOCK(N8);
+    CERES_ADD_PARAMETER_BLOCK(N9);
+#undef CERES_ADD_PARAMETER_BLOCK
   }
 
   virtual ~SizedCostFunction() { }

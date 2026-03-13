@@ -34,6 +34,7 @@
 #ifndef CERES_INTERNAL_RESIDUAL_BLOCK_H_
 #define CERES_INTERNAL_RESIDUAL_BLOCK_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -42,8 +43,6 @@
 #include "ceres/internal/scoped_ptr.h"
 #include "ceres/stringprintf.h"
 #include "ceres/types.h"
-
-#include "ceres/internal/fixed_array.h" // Borrow this
 
 namespace ceres {
 
@@ -68,12 +67,22 @@ class ParameterBlock;
 // loss functions, and parameter blocks.
 class ResidualBlock {
  public:
-  // Construct the residual block with the given cost/loss functions. Loss may
-  // be null. The index is the index of the residual block in the Program's
-  // residual_blocks array.
+  // Maximum number of parameter blocks a single residual can reference.
+  // Ceres convenience API caps at 10 (x0..x9). This avoids a heap
+  // allocation per residual block for the parameter_blocks_ array.
+  static const int kMaxParameterBlocks = 10;
+
+  // Construct from a vector (legacy interface).
   ResidualBlock(const CostFunction* cost_function,
                 const LossFunction* loss_function,
-                const FixedArray<ParameterBlock*, 10>& parameter_blocks,
+                const std::vector<ParameterBlock*>& parameter_blocks,
+                int index);
+
+  // Construct from a raw pointer + count (zero-allocation fast path).
+  ResidualBlock(const CostFunction* cost_function,
+                const LossFunction* loss_function,
+                ParameterBlock* const* parameter_blocks,
+                int num_parameter_blocks,
                 int index);
 
   // Evaluates the residual term, storing the scalar cost in *cost, the residual
@@ -116,7 +125,7 @@ class ResidualBlock {
 
   // Number of variable blocks that this residual term depends on.
   int NumParameterBlocks() const {
-    return cost_function_->num_parameter_block_sizes();
+    return cost_function_->num_parameter_blocks();
   }
 
   // The size of the residual vector returned by this residual function.
@@ -136,13 +145,13 @@ class ResidualBlock {
  private:
   const CostFunction* cost_function_;
   const LossFunction* loss_function_;
-  // JPB WIP BUG These must remain pointers (we don't own them).
-  enum { kMaxParameterBlocks = 10 };
-  ParameterBlock* parameter_blocks_[ kMaxParameterBlocks ];
 
-  // The index of the residual, typically in a Program. This is only to permit
-  // switching from a ResidualBlock* to an index in the Program's array, needed
-  // to do efficient removals.
+  // Inline storage for parameter block pointers. Avoids a heap allocation
+  // per residual block. kMaxParameterBlocks (10) covers all cases supported
+  // by the Ceres convenience API.
+  ParameterBlock* parameter_blocks_[kMaxParameterBlocks];
+
+  // The index of the residual, typically in a Program.
   int32 index_;
 };
 

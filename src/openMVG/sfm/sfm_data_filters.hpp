@@ -59,6 +59,17 @@ IndexT RemoveOutliers_AngleError
   const double dMinAcceptedAngle
 );
 
+// Fused filter: runs both angle and pixel-residual outlier removal in a single
+// pass over the structure, avoiding redundant unordered_map traversals.
+// Returns {angle_removed, pixel_removed}.
+std::pair<IndexT, IndexT> RemoveOutliers_AngleAndPixelError
+(
+  SfM_Data & sfm_data,
+  const double dMinAcceptedAngle,
+  const double dThresholdPixel,
+  const unsigned int minTrackLength = 2
+);
+
 /// Erase pose with insufficient track observations
 bool eraseMissingPoses
 (

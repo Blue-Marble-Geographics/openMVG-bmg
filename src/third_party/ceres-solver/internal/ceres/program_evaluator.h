@@ -239,10 +239,9 @@ class ProgramEvaluator : public Evaluator {
       if (gradient != NULL) {
         int num_residuals = residual_block->NumResiduals();
         int num_parameter_blocks = residual_block->NumParameterBlocks();
-        const auto& pbs = residual_block->parameter_blocks();
         for (int j = 0; j < num_parameter_blocks; ++j) {
-          const ParameterBlock* parameter_block = pbs[j];
-
+          const ParameterBlock* parameter_block =
+              residual_block->parameter_blocks()[j];
           if (parameter_block->IsConstant()) {
             continue;
           }

@@ -51,17 +51,7 @@ class ExecutionSummary {
     times_[name] += value;
   }
 
-  void IncrementTimeBy(const char* name, const double value) {
-    CeresMutexLock l(&times_mutex_);
-    times_[name] += value;
-  }
-
   void IncrementCall(const std::string& name) {
-    CeresMutexLock l(&calls_mutex_);
-    calls_[name] += 1;
-  }
-
-  void IncrementCall(const char* name) {
     CeresMutexLock l(&calls_mutex_);
     calls_[name] += 1;
   }
@@ -79,7 +69,7 @@ class ExecutionSummary {
 
 class ScopedExecutionTimer {
  public:
-  ScopedExecutionTimer(const char* name, ExecutionSummary* summary)
+  ScopedExecutionTimer(const std::string& name, ExecutionSummary* summary)
       : start_time_(WallTimeInSeconds()),
         name_(name),
         summary_(summary) {}
@@ -90,7 +80,7 @@ class ScopedExecutionTimer {
 
  private:
   const double start_time_;
-  const char* name_;
+  const std::string name_;
   ExecutionSummary* summary_;
 };
 

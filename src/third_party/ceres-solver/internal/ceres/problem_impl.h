@@ -75,11 +75,7 @@ class ProblemImpl {
   ResidualBlockId AddResidualBlock(
       CostFunction* cost_function,
       LossFunction* loss_function,
-      std::initializer_list<double*> parameter_blocks);
-  ResidualBlock* AddResidualBlock(
-    CostFunction* cost_function,
-    LossFunction* loss_function,
-    std::vector<double*>::iterator first, std::vector<double*>::iterator last);
+      const std::vector<double*>& parameter_blocks);
   ResidualBlockId AddResidualBlock(CostFunction* cost_function,
                                    LossFunction* loss_function,
                                    double* x0);
@@ -183,11 +179,17 @@ class ProblemImpl {
     return residual_block_set_;
   }
 
-  void Reserve(int num_parameter_blocks, int num_residual_blocks);
-
  private:
   ParameterBlock* InternalAddParameterBlock(double* values, int size);
   void InternalRemoveResidualBlock(ResidualBlock* residual_block);
+
+  // Core implementation: accepts a stack-allocated array of double* pointers
+  // and their count, avoiding any heap allocation for the parameter list.
+  ResidualBlock* AddResidualBlockImpl(
+      CostFunction* cost_function,
+      LossFunction* loss_function,
+      double* const* parameter_block_ptrs,
+      int num_parameter_blocks);
 
   bool InternalEvaluate(Program* program,
                         double* cost,

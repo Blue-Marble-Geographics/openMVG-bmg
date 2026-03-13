@@ -87,20 +87,8 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
   int* cols = tsm_->mutable_cols();
   double* values = tsm_->mutable_values();
 
+  // Single pass: build layout, cell_values, AND fill sparsity pattern.
   int pos = 0;
-  for (set<pair<int, int> >::const_iterator it = block_pairs.begin();
-       it != block_pairs.end();
-       ++it) {
-    const int row_block_size = blocks_[it->first];
-    const int col_block_size = blocks_[it->second];
-    cell_values_.push_back(make_pair(make_pair(it->first, it->second),
-                                     values + pos));
-    layout_[IntPairToLong(it->first, it->second)] =
-        new CellInfo(values + pos);
-    pos += row_block_size * col_block_size;
-  }
-
-  // Fill the sparsity pattern of the underlying matrix.
   for (set<pair<int, int> >::const_iterator it = block_pairs.begin();
        it != block_pairs.end();
        ++it) {
@@ -108,15 +96,20 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
     const int col_block_id = it->second;
     const int row_block_size = blocks_[row_block_id];
     const int col_block_size = blocks_[col_block_id];
-    int pos =
-        layout_[IntPairToLong(row_block_id, col_block_id)]->values - values;
+
+    cell_values_.push_back(make_pair(make_pair(row_block_id, col_block_id),
+                                     values + pos));
+    layout_[IntPairToLong(row_block_id, col_block_id)] =
+        new CellInfo(values + pos);
+
+    // Fill sparsity pattern for this block in-place.
+    const int row_start = block_positions_[row_block_id];
+    const int col_start = block_positions_[col_block_id];
     for (int r = 0; r < row_block_size; ++r) {
       for (int c = 0; c < col_block_size; ++c, ++pos) {
-          rows[pos] = block_positions_[row_block_id] + r;
-          cols[pos] = block_positions_[col_block_id] + c;
-          values[pos] = 1.0;
-          DCHECK_LT(rows[pos], tsm_->num_rows());
-          DCHECK_LT(cols[pos], tsm_->num_rows());
+        rows[pos] = row_start + r;
+        cols[pos] = col_start + c;
+        values[pos] = 1.0;
       }
     }
   }

@@ -52,15 +52,18 @@ ConditionedCostFunction::ConditionedCostFunction(
       ownership_(ownership) {
   // Set up our dimensions.
   set_num_residuals(wrapped_cost_function_->num_residuals());
-  copy_parameter_block_sizes(wrapped_cost_function_->parameter_block_sizes(), wrapped_cost_function_->num_parameter_block_sizes());
+  const std::vector<int32>& pbs = wrapped_cost_function_->parameter_block_sizes();
+  for (int i = 0; i < static_cast<int>(pbs.size()); ++i) {
+    add_parameter_block_size(pbs[i]);
+  }
 
   // Sanity-check the conditioners' dimensions.
-  DCHECK_EQ(wrapped_cost_function_->num_residuals(), conditioners_.size());
+  CHECK_EQ(wrapped_cost_function_->num_residuals(), conditioners_.size());
   for (int i = 0; i < wrapped_cost_function_->num_residuals(); i++) {
     if (conditioners[i]) {
-      DCHECK_EQ(1, conditioners[i]->num_residuals());
-      DCHECK_EQ(1, conditioners[i]->num_parameter_block_sizes());
-      DCHECK_EQ(1, conditioners[i]->parameter_block_sizes()[0]);
+      CHECK_EQ(1, conditioners[i]->num_residuals());
+      CHECK_EQ(1, conditioners[i]->parameter_block_sizes().size());
+      CHECK_EQ(1, conditioners[i]->parameter_block_sizes()[0]);
     }
   }
 }
@@ -110,7 +113,7 @@ bool ConditionedCostFunction::Evaluate(double const* const* parameters,
 
       if (jacobians) {
         for (int i = 0;
-             i < wrapped_cost_function_->num_parameter_block_sizes();
+             i < wrapped_cost_function_->parameter_block_sizes().size();
              i++) {
           if (jacobians[i]) {
             int parameter_block_size =

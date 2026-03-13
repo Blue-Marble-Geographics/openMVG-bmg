@@ -43,7 +43,7 @@ class CERES_EXPORT DynamicCostFunction : public CostFunction {
   ~DynamicCostFunction() {}
 
   virtual void AddParameterBlock(int size) {
-   add_parameter_block_sizes(size);
+    add_parameter_block_size(size);
   }
 
   virtual void SetNumResiduals(int num_residuals) {

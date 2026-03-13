@@ -30,9 +30,13 @@
 
 #include "ceres/array_utils.h"
 
+#include <omp.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include "ceres/fpclassify.h"
@@ -43,10 +47,20 @@ namespace internal {
 
 using std::string;
 
+// Fast check: a double is non-finite (NaN or Inf) iff its 11-bit exponent
+// field is all 1s. This avoids the overhead of _finite() on MSVC and enables
+// auto-vectorization of the loop.
+static inline bool IsFiniteFast(double x) {
+  uint64_t bits;
+  std::memcpy(&bits, &x, sizeof(bits));
+  // Exponent mask for IEEE 754 double: bits [62:52]
+  return (bits & UINT64_C(0x7FF0000000000000)) != UINT64_C(0x7FF0000000000000);
+}
+
 bool IsArrayValid(const int size, const double* x) {
   if (x != NULL) {
     for (int i = 0; i < size; ++i) {
-      if (!IsFinite(x[i]))  {
+      if (!IsFiniteFast(x[i]))  {
         return false;
       }
     }
@@ -60,7 +74,7 @@ int FindInvalidValue(const int size, const double* x) {
   }
 
   for (int i = 0; i < size; ++i) {
-    if (!IsFinite(x[i]))  {
+    if (!IsFiniteFast(x[i]))  {
       return i;
     }
   }

@@ -52,14 +52,29 @@ namespace internal {
 ResidualBlock::ResidualBlock(
     const CostFunction* cost_function,
     const LossFunction* loss_function,
-    const FixedArray<ParameterBlock*, 10>& parameter_blocks,
+    const std::vector<ParameterBlock*>& parameter_blocks,
     int index)
     : cost_function_(cost_function),
       loss_function_(loss_function),
       index_(index) {
-  std::copy(parameter_blocks.begin(),
-            parameter_blocks.end(),
-            parameter_blocks_);
+  const int n = static_cast<int>(parameter_blocks.size());
+  for (int i = 0; i < n; ++i) {
+    parameter_blocks_[i] = parameter_blocks[i];
+  }
+}
+
+ResidualBlock::ResidualBlock(
+    const CostFunction* cost_function,
+    const LossFunction* loss_function,
+    ParameterBlock* const* parameter_blocks,
+    int num_parameter_blocks,
+    int index)
+    : cost_function_(cost_function),
+      loss_function_(loss_function),
+      index_(index) {
+  for (int i = 0; i < num_parameter_blocks; ++i) {
+    parameter_blocks_[i] = parameter_blocks[i];
+  }
 }
 
 bool ResidualBlock::Evaluate(const bool apply_loss_function,
@@ -70,15 +85,16 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
   const int num_parameter_blocks = NumParameterBlocks();
   const int num_residuals = cost_function_->num_residuals();
 
-  // Collect the parameters from their blocks. This will rarely allocate, since
-  // residuals taking more than 8 parameter block arguments are rare.
-  FixedArray<const double*, 10> parameters(num_parameter_blocks);
+  // Use stack arrays sized to kMaxParameterBlocks instead of FixedArray.
+  // We know num_parameter_blocks <= kMaxParameterBlocks (enforced at
+  // construction), so this is always safe and avoids FixedArray overhead.
+  const double* parameters[kMaxParameterBlocks];
   for (int i = 0; i < num_parameter_blocks; ++i) {
     parameters[i] = parameter_blocks_[i]->state();
   }
 
   // Put pointers into the scratch space into global_jacobians as appropriate.
-  FixedArray<double*, 10> global_jacobians(num_parameter_blocks);
+  double* global_jacobians[kMaxParameterBlocks];
   if (jacobians != NULL) {
     for (int i = 0; i < num_parameter_blocks; ++i) {
       const ParameterBlock* parameter_block = parameter_blocks_[i];
@@ -101,16 +117,16 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
   // Invalidate the evaluation buffers so that we can check them after
   // the CostFunction::Evaluate call, to see if all the return values
   // that were required were written to and that they are finite.
-  double** eval_jacobians = (jacobians != NULL) ? global_jacobians.get() : NULL;
+  double** eval_jacobians = (jacobians != NULL) ? global_jacobians : NULL;
 
   InvalidateEvaluation(*this, cost, residuals, eval_jacobians);
 
-  if (!cost_function_->Evaluate(parameters.get(), residuals, eval_jacobians)) {
+  if (!cost_function_->Evaluate(parameters, residuals, eval_jacobians)) {
     return false;
   }
 
   if (!IsEvaluationValid(*this,
-                         parameters.get(),
+                         parameters,
                          cost,
                          residuals,
                          eval_jacobians)) {
@@ -121,7 +137,7 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
         "residual and jacobians that were requested or there was a non-finite value (nan/infinite)\n"  // NOLINT
         "generated during the or jacobian computation. \n\n" +
         EvaluationToString(*this,
-                           parameters.get(),
+                           parameters,
                            cost,
                            residuals,
                            eval_jacobians);
@@ -129,14 +145,16 @@ bool ResidualBlock::Evaluate(const bool apply_loss_function,
     return false;
   }
 
-#if 1// Much faster than Eigen for small num_residuals
-  double squared_norm = 0.;
-  for (int i = 0; i != num_residuals; ++i) {
-    squared_norm += residuals[i]*residuals[i];
+  // Inline squared norm for small residual counts (SfM BA uses 2).
+  // Avoids Eigen VectorRef construction overhead.
+  double squared_norm;
+  if (num_residuals == 2) {
+    squared_norm = residuals[0] * residuals[0] + residuals[1] * residuals[1];
+  } else if (num_residuals == 1) {
+    squared_norm = residuals[0] * residuals[0];
+  } else {
+    squared_norm = VectorRef(residuals, num_residuals).squaredNorm();
   }
-#else
-  double squared_norm = VectorRef(residuals, num_residuals).squaredNorm();
-#endif
 
   // Update the jacobians with the local parameterizations.
   if (jacobians != NULL) {

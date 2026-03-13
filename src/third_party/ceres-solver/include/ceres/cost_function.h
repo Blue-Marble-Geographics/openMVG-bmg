@@ -63,7 +63,7 @@ namespace ceres {
 // when added with AddResidualBlock().
 class CERES_EXPORT CostFunction {
  public:
-  CostFunction() : parameter_block_count_(0), num_residuals_(0) {}
+  CostFunction() : num_residuals_(0), num_parameter_blocks_(0) {}
 
   virtual ~CostFunction() {}
 
@@ -115,38 +115,49 @@ class CERES_EXPORT CostFunction {
                         double* residuals,
                         double** jacobians) const = 0;
 
-  int num_parameter_block_sizes() const {
-    return parameter_block_count_;
+  const std::vector<int32>& parameter_block_sizes() const {
+    // Reconstruct the vector on demand for API compatibility.
+    // Hot-path internal Ceres code should use the inline accessors instead.
+    parameter_block_sizes_vec_.assign(
+      parameter_block_sizes_inline_,
+      parameter_block_sizes_inline_ + num_parameter_blocks_);
+    return parameter_block_sizes_vec_;
   }
 
-  const int32* parameter_block_sizes() const {
-    return (int32*) parameter_block_sizes_;
-  }
   int num_residuals() const {
     return num_residuals_;
   }
 
- protected:
-
-   void copy_parameter_block_sizes(const int32* parameter_block_sizes, int cnt)
-   {
-     std::copy(parameter_block_sizes, parameter_block_sizes+cnt, std::begin(parameter_block_sizes_));
-     parameter_block_count_ = cnt;
+  // Fast inline accessors for hot paths (avoids vector overhead)
+  int num_parameter_blocks() const {
+    return num_parameter_blocks_;
   }
 
-  void add_parameter_block_sizes(int32 v) { parameter_block_sizes_[parameter_block_count_++] = v; }
+  int parameter_block_size(int i) const {
+    return parameter_block_sizes_inline_[i];
+  }
 
+  const int32* parameter_block_sizes_data() const {
+    return parameter_block_sizes_inline_;
+  }
+
+ protected:
   void set_num_residuals(int num_residuals) {
     num_residuals_ = num_residuals;
   }
 
+  // Direct inline storage write for SizedCostFunction and DynamicCostFunction.
+  void add_parameter_block_size(int32 size) {
+    parameter_block_sizes_inline_[num_parameter_blocks_++] = size;
+  }
+
  private:
-  // Cost function signature metadata: number of inputs & their sizes,
-  // number of outputs (residuals).
-  enum { kMaxBlocks = 10 };
-  int32 parameter_block_sizes_[kMaxBlocks];
-  int parameter_block_count_;
+  static constexpr int kMaxParameterBlocks = 10;
+  int32 parameter_block_sizes_inline_[kMaxParameterBlocks] = {};
+  int num_parameter_blocks_;
   int num_residuals_;
+  // Lazy reconstruction buffer for parameter_block_sizes() const& return.
+  mutable std::vector<int32> parameter_block_sizes_vec_;
   CERES_DISALLOW_COPY_AND_ASSIGN(CostFunction);
 };
 

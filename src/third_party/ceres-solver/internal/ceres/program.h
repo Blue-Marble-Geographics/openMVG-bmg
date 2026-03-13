@@ -163,11 +163,10 @@ class Program {
   // TODO(keir): If necessary, also dump the residual blocks.
   std::string ToString() const;
 
-  void Reserve(int num_parameter_blocks, int num_residual_blocks)
-  {
-    parameter_blocks_.reserve(num_parameter_blocks);
-    residual_blocks_.reserve(num_residual_blocks);
-  }
+  // Pre-reserve storage for parameter and residual block pointer vectors
+  // to avoid repeated heap reallocations during problem construction.
+  void ReserveParameterBlocks(size_t n) { parameter_blocks_.reserve(n); }
+  void ReserveResidualBlocks(size_t n) { residual_blocks_.reserve(n); }
 
  private:
   // Remove constant parameter blocks and residual blocks with no

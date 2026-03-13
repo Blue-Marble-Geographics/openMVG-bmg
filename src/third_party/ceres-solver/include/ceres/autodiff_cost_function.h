@@ -170,7 +170,7 @@ class AutoDiffCostFunction : public SizedCostFunction<kNumResiduals,
   // Takes ownership of functor. Uses the template-provided value for the
   // number of residuals ("kNumResiduals").
   explicit AutoDiffCostFunction(CostFunctor* functor)
-      : functor_(functor) {
+      : functor_(functor), owns_functor_(true) {
     CHECK_NE(kNumResiduals, DYNAMIC)
         << "Can't run the fixed-size constructor if the "
         << "number of residuals is set to ceres::DYNAMIC.";
@@ -182,7 +182,7 @@ class AutoDiffCostFunction : public SizedCostFunction<kNumResiduals,
   // This allows for having autodiff cost functions which return varying
   // numbers of residuals at runtime.
   AutoDiffCostFunction(CostFunctor* functor, int num_residuals)
-      : functor_(functor) {
+      : functor_(functor), owns_functor_(true) {
     CHECK_EQ(kNumResiduals, DYNAMIC)
         << "Can't run the dynamic-size constructor if the "
         << "number of residuals is not ceres::DYNAMIC.";
@@ -192,7 +192,22 @@ class AutoDiffCostFunction : public SizedCostFunction<kNumResiduals,
         ::set_num_residuals(num_residuals);
   }
 
-  virtual ~AutoDiffCostFunction() {}
+  virtual ~AutoDiffCostFunction() {
+    if (owns_functor_) {
+      delete functor_;
+    }
+  }
+
+  // Non-owning constructor: does NOT take ownership of functor.
+  // Caller is responsible for the functor's lifetime.
+  // Tag type to distinguish from owning constructor.
+  struct NonOwning {};
+  AutoDiffCostFunction(CostFunctor* functor, NonOwning)
+      : functor_(functor), owns_functor_(false) {
+    CHECK_NE(kNumResiduals, DYNAMIC)
+        << "Can't run the fixed-size constructor if the "
+        << "number of residuals is set to ceres::DYNAMIC.";
+  }
 
   // Implementation details follow; clients of the autodiff cost function should
   // not have to examine below here.
@@ -219,7 +234,8 @@ class AutoDiffCostFunction : public SizedCostFunction<kNumResiduals,
   }
 
  private:
-  internal::scoped_ptr<CostFunctor> functor_;
+  CostFunctor* functor_;
+  bool owns_functor_;
 };
 
 }  // namespace ceres

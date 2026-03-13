@@ -55,6 +55,17 @@ public:
     assert(3 == x3D_.rows());
     assert(x2d_.cols() == x3D_.cols());
     bearing_vectors_= camera->operator()(x2d_);
+
+    // Precompute 2D camera-plane coordinates: ima2cam(x2d) for each point.
+    // This lets Errors() work entirely with scalar math (no virtual calls).
+    // ima2cam(x) = (x - pp) / f, which equals hnormalize(Kinv * [x; 1]).
+    // The error in camera-plane coords is identical to
+    //   (residual_in_pixels * N1_(0,0))  since N1_(0,0) = 1/f.
+    x2d_cam_.resize(2, x2d_.cols());
+    for (Mat::Index i = 0; i < x2d_.cols(); ++i)
+    {
+      x2d_cam_.col(i) = camera->ima2cam(x2d_.col(i));
+    }
   }
 
   enum { MINIMUM_SAMPLES = Solver::MINIMUM_SAMPLES };
@@ -68,20 +79,47 @@ public:
 
   void Errors(const Model & model, std::vector<double> & vec_errors) const
   {
-    // Convert the found model into a Pose3
-    const Vec3 t = model.block(0, 3, 3, 1);
-    const geometry::Pose3 pose(model.block(0, 0, 3, 3),
-                               - model.block(0, 0, 3, 3).transpose() * t);
-
     vec_errors.resize(x2d_.cols());
 
-    const bool ignore_distortion = true; // We ignore distortion since we are using undistorted bearing vector as input
-
-    for (Mat::Index sample = 0; sample < x2d_.cols(); ++sample)
+    // Guard against NaN/Inf models from degenerate solver outputs.
+    // NaN residuals are converted to 0 by the radix sort's integer
+    // truncation (_cvt_dtoui_fast), causing ACRANSAC to treat a
+    // NaN model as having perfect fit (precision=0, all inliers).
+    if (!model.allFinite())
     {
-      vec_errors[sample] = (camera_->residual(pose(x3D_.col(sample)),
-                              x2d_.col(sample),
-                              ignore_distortion) * N1_(0,0)).squaredNorm();
+      std::fill(vec_errors.begin(), vec_errors.end(),
+                std::numeric_limits<double>::infinity());
+      return;
+    }
+
+    // Extract R and C directly from the model [R|t] matrix.
+    // R = model.block<3,3>(0,0), t = model.col(3), C = -R^T * t
+    const Mat3 R = model.block(0, 0, 3, 3);
+    const Vec3 C = -R.transpose() * model.block(0, 3, 3, 1);
+
+    // Compute error in camera-plane coordinates (no virtual calls per sample):
+    //   error = || ima2cam(x2d) - hnormalize(R * (X - C)) ||²
+    //
+    // This is mathematically identical to the original:
+    //   || (x2d - cam2ima(hnormalize(R*(X-C)))) * (1/f) ||²
+    // since ima2cam(x) = (x - pp)/f  and  cam2ima(y) = f*y + pp.
+    const Mat::Index n = x2d_.cols();
+    for (Mat::Index sample = 0; sample < n; ++sample)
+    {
+      // Compute Xc = R * (X - C) using scalar math to avoid Eigen
+      // temporaries / dynamic allocation from the dynamic-size x3D_ matrix.
+      const double* X = x3D_.data() + sample * 3; // column-major
+      const double dx3 = X[0] - C.x();
+      const double dy3 = X[1] - C.y();
+      const double dz3 = X[2] - C.z();
+      const double Xc_x = R(0,0) * dx3 + R(0,1) * dy3 + R(0,2) * dz3;
+      const double Xc_y = R(1,0) * dx3 + R(1,1) * dy3 + R(1,2) * dz3;
+      const double Xc_z = R(2,0) * dx3 + R(2,1) * dy3 + R(2,2) * dz3;
+      // Perspective divide: project to z=1 plane
+      const double inv_z = 1.0 / Xc_z;
+      const double dx = x2d_cam_(0, sample) - Xc_x * inv_z;
+      const double dy = x2d_cam_(1, sample) - Xc_y * inv_z;
+      vec_errors[sample] = dx * dx + dy * dy;
     }
   }
 
@@ -98,6 +136,7 @@ public:
 
 private:
   Mat x2d_, bearing_vectors_;
+  Mat x2d_cam_;  // Precomputed ima2cam(x2d_) — 2D camera-plane coordinates
   const Mat & x3D_;
   Mat3 N1_;
   double logalpha0_;  // Alpha0 is used to make the error adaptive to the image size
@@ -296,10 +335,33 @@ namespace sfm {
     if (bResection)
     {
       resection_data.projection_matrix = P;
+
+      // Validate the projection matrix before decomposition:
+      // - P must contain finite values
+      // - The left 3x3 block must be non-degenerate (non-zero determinant)
+      //   for the RQ decomposition in KRt_From_P to be numerically stable.
+      //   A degenerate P arises when ACRANSAC finds a model with precision=0
+      //   (all residuals exactly zero), typically from collinear/coplanar
+      //   point configurations.
+      const Mat3 P3x3 = P.block(0, 0, 3, 3);
+      if (!P.allFinite() || std::abs(P3x3.determinant()) < 1e-12)
+      {
+        OPENMVG_LOG_WARNING << "Resection produced a degenerate projection matrix"
+          << " (det=" << P3x3.determinant() << "), discarding.";
+        return false;
+      }
+
       Mat3 K, R;
       Vec3 t;
       KRt_From_P(P, &K, &R, &t);
       pose = geometry::Pose3(R, -R.transpose() * t);
+
+      // Validate that the decomposition produced finite values
+      if (!pose.rotation().allFinite() || !pose.center().allFinite())
+      {
+        OPENMVG_LOG_WARNING << "Resection produced a non-finite pose from KRt decomposition.";
+        return false;
+      }
     }
 
     OPENMVG_LOG_INFO << "\n"
@@ -364,6 +426,12 @@ namespace sfm {
     if (b_BA_Status)
     {
       pose = sfm_data.poses[0];
+      // Validate that BA produced finite pose values
+      if (!pose.rotation().allFinite() || !pose.center().allFinite())
+      {
+        OPENMVG_LOG_WARNING << "RefinePose produced non-finite pose values.";
+        return false;
+      }
       if (b_refine_intrinsic)
         intrinsics->updateFromParams(shared_intrinsics->getParams());
     }

@@ -29,8 +29,11 @@
 #include <ceres/rotation.h>
 #include <ceres/types.h>
 
+#include <cmath>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <vector>
 
 namespace openMVG {
 namespace sfm {
@@ -79,8 +82,104 @@ struct PoseCenterConstraintCostFunction
   }
 };
 
+/// Arena allocator for ceres::CostFunction objects.
+/// Allocates cost functions from large contiguous memory blocks to avoid
+/// per-observation heap allocation overhead. When the arena is destroyed,
+/// all cost functions are destructed in bulk — far cheaper than having
+/// ceres::Problem individually delete each one via STLDeleteUniqueContainerPointers.
+class CostFunctionArena
+{
+public:
+  explicit CostFunctionArena(size_t block_size = 4 * 1024 * 1024)
+    : block_size_(block_size),
+      current_block_(nullptr),
+      current_offset_(0),
+      current_capacity_(0)
+  {}
+
+  ~CostFunctionArena()
+  {
+    // Destroy all cost functions in reverse order, then free blocks
+    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
+    {
+      it->destructor(it->ptr);
+    }
+    for (auto* block : blocks_)
+    {
+      ::operator delete(block);
+    }
+  }
+
+  /// Allocate and construct any type T with the given constructor args.
+  /// Returns a raw pointer (lifetime managed by the arena).
+  /// The destructor will be called when the arena is destroyed.
+  template <typename T, typename... Args>
+  T* Alloc(Args&&... args)
+  {
+    constexpr size_t alignment = alignof(T);
+    constexpr size_t size = sizeof(T);
+
+    size_t aligned_offset = (current_offset_ + alignment - 1) & ~(alignment - 1);
+    if (current_block_ == nullptr || aligned_offset + size > current_capacity_)
+    {
+      AllocateBlock(std::max(block_size_, size + alignment));
+      aligned_offset = (current_offset_ + alignment - 1) & ~(alignment - 1);
+    }
+
+    void* mem = static_cast<char*>(current_block_) + aligned_offset;
+    current_offset_ = aligned_offset + size;
+
+    T* obj = new (mem) T(std::forward<Args>(args)...);
+    entries_.push_back({obj, [](void* p) { static_cast<T*>(p)->~T(); }});
+    return obj;
+  }
+
+  /// Allocate and construct a CostFunction of type T with the given constructor args.
+  /// Returns a raw pointer (lifetime managed by the arena).
+  template <typename T, typename... Args>
+  T* Create(Args&&... args)
+  {
+    static_assert(std::is_base_of<ceres::CostFunction, T>::value,
+                  "T must derive from ceres::CostFunction");
+    return Alloc<T>(std::forward<Args>(args)...);
+  }
+
+  /// Pre-reserve the entries vector to avoid reallocation during construction.
+  void Reserve(size_t count)
+  {
+    entries_.reserve(count);
+  }
+
+  CostFunctionArena(const CostFunctionArena&) = delete;
+  CostFunctionArena& operator=(const CostFunctionArena&) = delete;
+
+private:
+  void AllocateBlock(size_t min_size)
+  {
+    size_t alloc_size = std::max(block_size_, min_size);
+    void* block = ::operator new(alloc_size);
+    blocks_.push_back(block);
+    current_block_ = block;
+    current_offset_ = 0;
+    current_capacity_ = alloc_size;
+  }
+
+  struct Entry
+  {
+    void* ptr;
+    void (*destructor)(void*);
+  };
+
+  size_t block_size_;
+  void* current_block_;
+  size_t current_offset_;
+  size_t current_capacity_;
+  std::vector<void*> blocks_;
+  std::vector<Entry> entries_;
+};
+
 /// Create the appropriate cost functor according the provided input camera intrinsic model.
-/// The residual can be weighetd if desired (default 0.0 means no weight).
+/// The residual can be weighted if desired (default 0.0 means no weight).
 ceres::CostFunction * IntrinsicsToCostFunction
 (
   IntrinsicBase * intrinsic,
@@ -107,6 +206,55 @@ ceres::CostFunction * IntrinsicsToCostFunction
   }
 }
 
+/// Arena-based version: constructs cost functions in the provided arena.
+/// Returns a pointer whose lifetime is managed by the arena (no individual delete).
+/// For non-pinhole camera types (fisheye, spherical), falls back to heap allocation
+/// and stores the pointer in fallback_storage for manual cleanup.
+ceres::CostFunction * IntrinsicsToCostFunction
+(
+  CostFunctionArena & arena,
+  std::vector<std::unique_ptr<ceres::CostFunction>> & fallback_storage,
+  IntrinsicBase * intrinsic,
+  const Vec2 & observation,
+  const double weight = 0.0
+)
+{
+  if (weight != 0.0)
+  {
+    // Weighted path (GCPs): heap-allocate and track for cleanup.
+    auto* cf = IntrinsicsToCostFunction(intrinsic, observation, weight);
+    fallback_storage.emplace_back(cf);
+    return cf;
+  }
+
+  switch (intrinsic->getType())
+  {
+    case PINHOLE_CAMERA:
+      return arena.Create<AnalyticCostFunction_Pinhole>(
+        observation[0], observation[1]);
+
+    case PINHOLE_CAMERA_RADIAL1:
+      return arena.Create<AnalyticCostFunction_Pinhole_Radial_K1>(
+        observation[0], observation[1]);
+
+    case PINHOLE_CAMERA_RADIAL3:
+      return arena.Create<AnalyticCostFunction_Pinhole_Radial_K3>(
+        observation[0], observation[1]);
+
+    case PINHOLE_CAMERA_BROWN:
+      return arena.Create<AnalyticCostFunction_Pinhole_Brown_T2>(
+        observation[0], observation[1]);
+
+    default:
+    {
+      // Fisheye, spherical, and any future models: heap-allocate and track.
+      auto* cf = IntrinsicsToCostFunction(intrinsic, observation, 0.0);
+      fallback_storage.emplace_back(cf);
+      return cf;
+    }
+  }
+}
+
 Bundle_Adjustment_Ceres::BA_Ceres_options::BA_Ceres_options
 (
   const bool bVerbose,
@@ -122,10 +270,10 @@ Bundle_Adjustment_Ceres::BA_Ceres_options::BA_Ceres_options
   max_linear_solver_iterations_(500),
   use_nonmonotonic_steps_(true),
   max_consecutive_nonmonotonic_steps_(2),
-  initial_trust_region_radius_(1e6),
+  initial_trust_region_radius_(1e4),
   max_trust_region_radius_(1e15),
   min_trust_region_radius_(1e-31),
-  max_num_consecutive_invalid_steps_(1)
+  max_num_consecutive_invalid_steps_(5)
 {
   #ifdef OPENMVG_USE_OPENMP
     nb_threads_ = omp_get_max_threads();
@@ -184,6 +332,15 @@ bool Bundle_Adjustment_Ceres::Adjust
   // parameters for cameras and points are added automatically.
   //----------
 
+  // Arena for bulk-allocating cost functions.
+  // All cost functions created via the arena overload live here;
+  // we tell Ceres DO_NOT_TAKE_OWNERSHIP so ~Problem won't delete them individually.
+  // The arena destructor runs after the Problem is destroyed, cleaning up in bulk.
+  CostFunctionArena cost_function_arena;
+  // Fallback cost functions for non-pinhole camera types (fisheye, spherical).
+  // These are heap-allocated by IntrinsicsToCostFunction and must be manually
+  // freed after the Problem is solved (Problem uses DO_NOT_TAKE_OWNERSHIP).
+  std::vector<std::unique_ptr<ceres::CostFunction>> fallback_cost_functions;
 
   double pose_center_robust_fitting_error = 0.0;
   openMVG::geometry::Similarity3 sim_to_center;
@@ -249,6 +406,7 @@ bool Bundle_Adjustment_Ceres::Adjust
   ceres::Problem::Options problem_options;
   problem_options.enable_fast_removal = false;
   problem_options.disable_all_safety_checks = true;
+  problem_options.cost_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
 
   // Set a LossFunction to be less penalized by false measurements
   //  - set it to nullptr if you don't want use a lossFunction.
@@ -274,8 +432,23 @@ bool Bundle_Adjustment_Ceres::Adjust
     const Mat3 R = pose.rotation();
     const Vec3 t = pose.translation();
 
+    // Guard against NaN/Inf poses (e.g. from degenerate resection or triangulation)
+    if (!R.allFinite() || !t.allFinite())
+    {
+      OPENMVG_LOG_WARNING << "Pose " << indexPose << " contains non-finite values, skipping in BA.";
+      continue;
+    }
+
     double angleAxis[3];
     ceres::RotationMatrixToAngleAxis((const double*)R.data(), angleAxis);
+
+    // Verify angle-axis conversion produced finite values
+    if (!std::isfinite(angleAxis[0]) || !std::isfinite(angleAxis[1]) || !std::isfinite(angleAxis[2]))
+    {
+      OPENMVG_LOG_WARNING << "Pose " << indexPose << " produced non-finite angle-axis, skipping in BA.";
+      continue;
+    }
+
     // angleAxis + translation
     map_poses[indexPose] = { angleAxis[0], angleAxis[1], angleAxis[2], t(0), t(1), t(2) };
 
@@ -359,40 +532,74 @@ bool Bundle_Adjustment_Ceres::Adjust
     }
   }
 
+  // Pre-reserve arena entries and Ceres-internal vectors to avoid
+  // repeated heap reallocations during bulk problem construction.
+  {
+    size_t total_observations = 0;
+    for (const auto & landmark_it : sfm_data.structure)
+      total_observations += landmark_it.second.obs.size();
+    // Each observation needs 2 arena entries (functor + AutoDiffCostFunction).
+    cost_function_arena.Reserve(total_observations * 2);
+    // Pre-reserve Ceres-internal vectors.
+    // Parameter blocks: one per landmark + one per pose + one per intrinsic.
+    const size_t estimated_parameter_blocks =
+      sfm_data.structure.size() + map_poses.size() + map_intrinsics.size();
+    problem.ReserveResidualBlocks(total_observations);
+    problem.ReserveParameterBlocks(estimated_parameter_blocks);
+  }
+
   // For all visibility add reprojections errors:
   for (auto & structure_landmark_it : sfm_data.structure)
   {
     const Observations & obs = structure_landmark_it.second.obs;
+
+    // Skip landmarks with non-finite 3D positions
+    if (!structure_landmark_it.second.X.allFinite())
+      continue;
+
+    bool landmark_has_residuals = false;
+    double* landmark_data = structure_landmark_it.second.X.data();
 
     for (const auto & obs_it : obs)
     {
       // Build the residual block corresponding to the track observation:
       const View * view = sfm_data.views.at(obs_it.first).get();
 
+      // Skip observations that reference a pose not in the BA problem
+      // (e.g. because the pose had NaN values and was excluded)
+      const auto pose_it = map_poses.find(view->id_pose);
+      if (pose_it == map_poses.end())
+        continue;
+
+      const auto intrinsic_it = map_intrinsics.find(view->id_intrinsic);
+
       // Each Residual block takes a point and a camera as input and outputs a 2
       // dimensional residual. Internally, the cost function stores the observed
       // image location and compares the reprojection against the observation.
       ceres::CostFunction* cost_function =
-        IntrinsicsToCostFunction(sfm_data.intrinsics.at(view->id_intrinsic).get(),
+        IntrinsicsToCostFunction(cost_function_arena,
+                                 fallback_cost_functions,
+                                 sfm_data.intrinsics.at(view->id_intrinsic).get(),
                                  obs_it.second.x);
 
       if (cost_function)
       {
-        if (!map_intrinsics.at(view->id_intrinsic).empty())
+        if (intrinsic_it != map_intrinsics.end() && !intrinsic_it->second.empty())
         {
           problem.AddResidualBlock(cost_function,
             p_LossFunction.get(),
-            &map_intrinsics.at(view->id_intrinsic)[0],
-            &map_poses.at(view->id_pose)[0],
-            structure_landmark_it.second.X.data());
+            &intrinsic_it->second[0],
+            &pose_it->second[0],
+            landmark_data);
         }
         else
         {
           problem.AddResidualBlock(cost_function,
             p_LossFunction.get(),
-            &map_poses.at(view->id_pose)[0],
-            structure_landmark_it.second.X.data());
+            &pose_it->second[0],
+            landmark_data);
         }
+        landmark_has_residuals = true;
       }
       else
       {
@@ -400,8 +607,8 @@ bool Bundle_Adjustment_Ceres::Adjust
         return false;
       }
     }
-    if (options.structure_opt == Structure_Parameter_Type::NONE)
-      problem.SetParameterBlockConstant(structure_landmark_it.second.X.data());
+    if (landmark_has_residuals && options.structure_opt == Structure_Parameter_Type::NONE)
+      problem.SetParameterBlockConstant(landmark_data);
   }
 
   if (options.control_point_opt.bUse_control_points)
@@ -412,16 +619,24 @@ bool Bundle_Adjustment_Ceres::Adjust
     {
       const Observations & obs = gcp_landmark_it.second.obs;
 
+      bool gcp_has_residuals = false;
+
       for (const auto & obs_it : obs)
       {
         // Build the residual block corresponding to the track observation:
         const View * view = sfm_data.views.at(obs_it.first).get();
+
+        // Skip observations that reference a pose not in the BA problem
+        if (map_poses.count(view->id_pose) == 0)
+          continue;
 
         // Each Residual block takes a point and a camera as input and outputs a 2
         // dimensional residual. Internally, the cost function stores the observed
         // image location and compares the reprojection against the observation.
         ceres::CostFunction* cost_function =
           IntrinsicsToCostFunction(
+            cost_function_arena,
+            fallback_cost_functions,
             sfm_data.intrinsics.at(view->id_intrinsic).get(),
             obs_it.second.x,
             options.control_point_opt.weight);
@@ -443,6 +658,7 @@ bool Bundle_Adjustment_Ceres::Adjust
                                      &map_poses.at(view->id_pose)[0],
                                      gcp_landmark_it.second.X.data());
           }
+          gcp_has_residuals = true;
         }
       }
       if (obs.empty())
@@ -451,7 +667,7 @@ bool Bundle_Adjustment_Ceres::Adjust
           << "Cannot use this GCP id: " << gcp_landmark_it.first
           << ". There is not linked image observation.";
       }
-      else
+      else if (gcp_has_residuals)
       {
         // Set the 3D point as FIXED (it's a valid GCP)
         problem.SetParameterBlockConstant(gcp_landmark_it.second.X.data());
@@ -460,6 +676,10 @@ bool Bundle_Adjustment_Ceres::Adjust
   }
 
   // Add Pose prior constraints if any
+  // Note: prior cost functions and loss functions are heap-allocated because their
+  // number is small. We track them for manual cleanup since ownership is DO_NOT_TAKE.
+  std::vector<std::unique_ptr<ceres::CostFunction>> prior_cost_functions;
+  std::vector<std::unique_ptr<ceres::LossFunction>> prior_loss_functions;
   if (b_usable_prior)
   {
     for (const auto& view_it : sfm_data.GetViews())
@@ -467,16 +687,23 @@ bool Bundle_Adjustment_Ceres::Adjust
       const sfm::ViewPriors* prior = dynamic_cast<sfm::ViewPriors*>(view_it.second.get());
       if (prior != nullptr && prior->b_use_pose_center_ && sfm_data.IsPoseAndIntrinsicDefined(prior))
       {
+        // Skip if this pose was excluded from the BA (e.g. due to NaN values)
+        if (map_poses.count(prior->id_pose) == 0)
+          continue;
+
         // Add the cost functor (distance from Pose prior to the SfM_Data Pose center)
-        ceres::CostFunction* cost_function =
+        auto* cost_function =
           new ceres::AutoDiffCostFunction<PoseCenterConstraintCostFunction, 3, 6>(
             new PoseCenterConstraintCostFunction(prior->pose_center_, prior->center_weight_));
+        prior_cost_functions.emplace_back(cost_function);
+
+        auto* loss = new ceres::HuberLoss(Square(pose_center_robust_fitting_error));
+        prior_loss_functions.emplace_back(loss);
 
         problem.AddResidualBlock(
           cost_function,
-          new ceres::HuberLoss(
-            Square(pose_center_robust_fitting_error)),
-          &map_poses.at(prior->id_view)[0]);
+          loss,
+          &map_poses.at(prior->id_pose)[0]);
       }
     }
   }
@@ -493,7 +720,12 @@ bool Bundle_Adjustment_Ceres::Adjust
   ceres_config_options.sparse_linear_algebra_library_type =
     static_cast<ceres::SparseLinearAlgebraLibraryType>(ceres_options_.sparse_linear_algebra_library_type_);
   ceres_config_options.minimizer_progress_to_stdout = ceres_options_.bVerbose_;
-  ceres_config_options.logging_type = ceres::SILENT;
+  ceres_config_options.logging_type =
+#if 0 // JPB WIP BUG Debugging
+    ceres::PER_MINIMIZER_ITERATION;
+#else
+    ceres::SILENT;
+#endif
   ceres_config_options.num_threads = ceres_options_.nb_threads_;
 #if CERES_VERSION_MAJOR < 2
   ceres_config_options.num_linear_solver_threads = ceres_options_.nb_threads_;
@@ -508,6 +740,10 @@ bool Bundle_Adjustment_Ceres::Adjust
   ceres_config_options.min_trust_region_radius = ceres_options_.min_trust_region_radius_;
   ceres_config_options.max_num_consecutive_invalid_steps = ceres_options_.max_num_consecutive_invalid_steps_;
 
+#if 0 // JPB WIP BUG Debugging
+  // Log per-iteration cost to see convergence rate
+  ceres_config_options.minimizer_progress_to_stdout = true;
+#endif
 
   // Solve BA
   ceres::Solver::Summary summary;
@@ -518,7 +754,16 @@ bool Bundle_Adjustment_Ceres::Adjust
   // If no error, get back refined parameters
   if (!summary.IsSolutionUsable())
   {
-    OPENMVG_LOG_ERROR << "IsSolutionUsable is false. Bundle Adjustment failed.";
+    OPENMVG_LOG_ERROR << "IsSolutionUsable is false. Bundle Adjustment failed."
+      << " termination: " << ceres::TerminationTypeToString(summary.termination_type)
+      << " message: " << summary.message
+      << " #residuals: " << summary.num_residuals
+      << " #params: " << summary.num_parameters
+      << " initial_cost: " << summary.initial_cost
+      << " final_cost: " << summary.final_cost
+      << " #iterations: " << summary.iterations.size()
+      << "\n" << summary.FullReport();
+
     return false;
   }
   else // Solution is usable
@@ -546,6 +791,10 @@ bool Bundle_Adjustment_Ceres::Adjust
       for (auto& pose_it : sfm_data.poses)
       {
         const IndexT indexPose = pose_it.first;
+
+        // Skip poses that were not included in the BA (e.g. due to NaN values)
+        if (map_poses.count(indexPose) == 0)
+          continue;
 
         Mat3 R_refined;
         ceres::AngleAxisToRotationMatrix(&map_poses.at(indexPose)[0], R_refined.data());

@@ -253,8 +253,8 @@ Eliminate(const BlockSparseMatrix* A,
     // unnecessary thread-pool wake-up overhead when the user has
     // configured fewer threads.  Each iteration writes to a distinct
     // diagonal cell so there is zero contention regardless.
-    const int diag_threads = num_threads_;
-#pragma omp parallel for num_threads(diag_threads) schedule(static) if (diag_threads > 1)
+//    const int diag_threads = num_threads_;
+//#pragma omp parallel for num_threads(diag_threads) schedule(static) if (diag_threads > 1)
     for (int i = num_eliminate_blocks_; i < num_col_blocks; ++i) {
       const int block_id = i - num_eliminate_blocks_;
       int r, c, row_stride, col_stride;
@@ -293,7 +293,7 @@ Eliminate(const BlockSparseMatrix* A,
   // than useful parallelism since the per-lock work is tiny.
   // Cap threads to avoid contention while preserving parallelism
   // on machines with fewer cores.
-  const int kMaxSchurThreads = 8;
+  const int kMaxSchurThreads = 6; // 6 marginally better than 8 or 4 on big data.
   int threadsToUse = std::min(num_threads_, kMaxSchurThreads);
 
   // Dispatch to a template instantiation so the compiler can fully
@@ -327,7 +327,7 @@ EliminateChunks(const BlockSparseMatrix* A,
   // keeping scheduling overhead low. This also naturally distributes
   // chunks that see the same cameras across threads, reducing mutex
   // contention on the LHS cells.
-#pragma omp parallel for num_threads(threadsToUse) schedule(dynamic, 256) if (kNeedsLocking)
+#pragma omp parallel for num_threads(threadsToUse) schedule(static) if (kNeedsLocking)
   for (int i = 0; i < chunks_.size(); ++i) {
 #ifdef CERES_USE_OPENMP
     int thread_id = omp_get_thread_num();
@@ -416,6 +416,8 @@ BackSubstitute(const BlockSparseMatrix* A,
                const double* D,
                const double* z,
                double* y) {
+  //volatile double a = WallTimeInSeconds();
+
   const CompressedRowBlockStructure* bs = A->block_structure();
   const Block* const __restrict col_blocks = bs->cols.data();
   const int* const __restrict lhs_layout = lhs_row_layout_.data();
@@ -487,6 +489,15 @@ BackSubstitute(const BlockSparseMatrix* A,
     y_block = InvertPSDMatrix<kEBlockSize>(assume_full_rank_ete_, ete)
         * y_block;
   }
+
+
+  //volatile double e = WallTimeInSeconds();
+
+  //if ((e - a) * 1000 > 25.) {
+ //   std::cout << "SchurEliminator::Eliminate timings: "
+  //    << "total=" << ((e - a) * 1000.0)
+  //    << std::endl;
+//  }
 }
 
 // Update the rhs of the reduced linear system. Compute

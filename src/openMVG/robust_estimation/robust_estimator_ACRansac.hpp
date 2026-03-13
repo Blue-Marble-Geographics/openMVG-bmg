@@ -255,8 +255,8 @@ template <typename Kernel>
 bool
 NFA_Interface<Kernel>::ComputeNFA_and_inliers
 (
-    std::vector<uint32_t> & inliers,
-    /// NFA and residual threshold
+  std::vector<uint32_t> & inliers,
+  /// NFA and residual threshold
   std::pair<double, double>& nfa_threshold,
   std::vector<uint64_t>& scratchMemory64,
   std::vector<uint32_t>& scratchMemory32
@@ -329,12 +329,21 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
       if (numSamples <= 65536)
       {
         scratchMemory32.clear();
-        // Uses second half of scratchMemory2 as a separate array.
-        scratchMemory32.reserve(numSamples*2);
+        // RadixSort32 uses the second half (a + count) as scratch space.
+        scratchMemory32.resize(numSamples * 2);
         for (size_t i = 0; i < numSamples; ++i)
         {
-          const uint32_t residualAndIndex = (((uint32_t)_cvt_dtoui_fast(m_residuals[i] * USHRT_MAX)) << 16) + i;
-          scratchMemory32.emplace_back(residualAndIndex);
+          // Sanitize NaN/Inf residuals: _cvt_dtoui_fast has undefined
+          // behavior for non-finite inputs (typically converts NaN to 0),
+          // which would make degenerate models appear to have zero error.
+          // Use 1.0 so that sanitized * USHRT_MAX == USHRT_MAX (max quantized bucket).
+          // Inline bit-test avoids the MSVC CRT call that std::isfinite generates.
+          uint64_t bits;
+          std::memcpy(&bits, &m_residuals[i], sizeof(bits));
+          const double sanitized = ((bits >> 52) & 0x7FF) != 0x7FF
+            ? m_residuals[i]
+            : 1.0;
+          scratchMemory32[i] = (((uint32_t)_cvt_dtoui_fast(sanitized * USHRT_MAX)) << 16) + static_cast<uint32_t>(i);
         }
         RadixSort32(scratchMemory32.data(), numSamples);
 
@@ -342,28 +351,36 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
         m_sorted_residuals.reserve(numSamples);
         constexpr double inv_USHRT_MAX = 1. / USHRT_MAX;
 
-        for (const auto& i : scratchMemory32)
+        for (size_t idx = 0; idx < numSamples; ++idx)
         {
-          m_sorted_residuals.emplace_back((i>>16) * inv_USHRT_MAX, i&0xFFFF);
+          const auto val = scratchMemory32[idx];
+          m_sorted_residuals.emplace_back((val >> 16) * inv_USHRT_MAX, val & 0xFFFF);
         }
 
       }
       else
       {
         scratchMemory64.clear();
-        scratchMemory64.reserve(numSamples*2);
+        // RadixSort64 uses the second half (a + count) as scratch space.
+        scratchMemory64.resize(numSamples * 2);
         for (size_t i = 0; i < numSamples; ++i)
         {
-          const uint64_t residualAndIndex = (((uint64_t)_cvt_dtoui_fast(m_residuals[i] * UINT_MAX)) << 32) + i;
-          scratchMemory64.emplace_back(residualAndIndex);
+          // Sanitize NaN/Inf residuals (see comment above)
+          uint64_t bits;
+          std::memcpy(&bits, &m_residuals[i], sizeof(bits));
+          const double sanitized = ((bits >> 52) & 0x7FF) != 0x7FF
+            ? m_residuals[i]
+            : 1.0;
+          scratchMemory64[i] = (((uint64_t)_cvt_dtoui_fast(sanitized * UINT_MAX)) << 32) + static_cast<uint64_t>(i);
         }
         RadixSort64(scratchMemory64.data(), numSamples);
 
         m_sorted_residuals.clear();
         m_sorted_residuals.reserve(numSamples);
-        for (const auto& i : scratchMemory64)
+        for (size_t idx = 0; idx < numSamples; ++idx)
         {
-          m_sorted_residuals.emplace_back(((double) (i>>32)) / ((double) UINT_MAX), i&0xFFFFFFFF);
+          const auto val = scratchMemory64[idx];
+          m_sorted_residuals.emplace_back(((double)(val >> 32)) / ((double)UINT_MAX), val & 0xFFFFFFFF);
         }
       }
 #else
