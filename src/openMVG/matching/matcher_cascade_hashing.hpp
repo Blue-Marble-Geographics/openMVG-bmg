@@ -65,8 +65,8 @@ class ArrayMatcherCascadeHashing  : public ArrayMatcher<Scalar, Metric>
     cascade_hasher_.Init(dimension);
     // Index the input descriptors
     zero_mean_descriptor_ = CascadeHasher::GetZeroMeanDescriptor(*memMapping);
-    hashed_base_ = std::move(cascade_hasher_.CreateHashedDescriptions(
-      *memMapping, zero_mean_descriptor_));
+    hashed_base_ = cascade_hasher_.CreateHashedDescriptions(
+      *memMapping, zero_mean_descriptor_);
 
     return true;
   }
@@ -123,13 +123,13 @@ class ArrayMatcherCascadeHashing  : public ArrayMatcher<Scalar, Metric>
     pvec_indices->reserve(nbQuery * NN);
 
     // Index the query descriptors
-    const auto hashed_query = cascade_hasher_.CreateHashedDescriptions(
+    const HashedDescriptions hashed_query = cascade_hasher_.CreateHashedDescriptions(
       mat_query,
       zero_mean_descriptor_);
     // Match the query descriptors to the database
     cascade_hasher_.Match_HashedDescriptions(
-      *hashed_query, mat_query,
-      *hashed_base_, *memMapping,
+      hashed_query, mat_query,
+      hashed_base_, *memMapping,
       pvec_indices, pvec_distances,
       NN);
 
@@ -141,7 +141,7 @@ private:
   /// Use a memory mapping in order to avoid memory re-allocation
   std::unique_ptr< Eigen::Map<BaseMat>> memMapping;
   CascadeHasher cascade_hasher_;
-  std::unique_ptr<HashedDescriptions> hashed_base_;
+  HashedDescriptions hashed_base_;
   Eigen::VectorXf zero_mean_descriptor_;
 };
 

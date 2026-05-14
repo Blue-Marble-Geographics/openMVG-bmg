@@ -30,8 +30,6 @@
 
 #include "ceres/array_utils.h"
 
-#include <omp.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -47,20 +45,22 @@ namespace internal {
 
 using std::string;
 
-// Fast check: a double is non-finite (NaN or Inf) iff its 11-bit exponent
-// field is all 1s. This avoids the overhead of _finite() on MSVC and enables
-// auto-vectorization of the loop.
+// Fast check: an IEEE-754 double is non-finite (NaN or Inf) iff its
+// 11-bit exponent field is all 1s.  This is faster than MSVC's
+// _finite() (which is a real function call) and auto-vectorizes
+// cleanly on the scan loops below.  The sentinel equality check must
+// still be performed separately because kImpossibleValue (1e302) is
+// a perfectly finite double.
 static inline bool IsFiniteFast(double x) {
   uint64_t bits;
   std::memcpy(&bits, &x, sizeof(bits));
-  // Exponent mask for IEEE 754 double: bits [62:52]
   return (bits & UINT64_C(0x7FF0000000000000)) != UINT64_C(0x7FF0000000000000);
 }
 
 bool IsArrayValid(const int size, const double* x) {
   if (x != NULL) {
     for (int i = 0; i < size; ++i) {
-      if (!IsFiniteFast(x[i]))  {
+      if (!IsFiniteFast(x[i]) || (x[i] == kImpossibleValue))  {
         return false;
       }
     }
@@ -74,7 +74,7 @@ int FindInvalidValue(const int size, const double* x) {
   }
 
   for (int i = 0; i < size; ++i) {
-    if (!IsFiniteFast(x[i]))  {
+    if (!IsFiniteFast(x[i]) || (x[i] == kImpossibleValue))  {
       return i;
     }
   }
@@ -83,10 +83,11 @@ int FindInvalidValue(const int size, const double* x) {
 }
 
 void InvalidateArray(const int size, double* x) {
-  // No-op: skip filling with sentinel values. The linear solver always
-  // writes the full output array, and IsArrayValid still catches NaN/Inf
-  // produced by numerical failures. This avoids an O(n) memset on the
-  // ~330K parameter array per LM iteration.
+  if (x != NULL) {
+    for (int i = 0; i < size; ++i) {
+      x[i] = kImpossibleValue;
+    }
+  }
 }
 
 void AppendArrayToString(const int size, const double* x, string* result) {

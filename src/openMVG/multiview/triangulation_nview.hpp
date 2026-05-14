@@ -36,13 +36,6 @@ namespace openMVG {
     Vec4 *X
   );
 
-  bool TriangulateNViewAlgebraic2
-  (
-    const Mat3X & points,
-    const Mat34* poses,
-    Vec4 *X
-  );
-
 }  // namespace openMVG
 
 #endif  // OPENMVG_MULTIVIEW_TRIANGULATION_NVIEW_HPP

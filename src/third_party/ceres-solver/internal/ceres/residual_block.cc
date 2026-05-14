@@ -40,6 +40,7 @@
 #include "ceres/cost_function.h"
 #include "ceres/internal/eigen.h"
 #include "ceres/internal/fixed_array.h"
+#include "glog/logging.h"
 #include "ceres/local_parameterization.h"
 #include "ceres/loss_function.h"
 #include "ceres/small_blas.h"
@@ -58,6 +59,9 @@ ResidualBlock::ResidualBlock(
       loss_function_(loss_function),
       index_(index) {
   const int n = static_cast<int>(parameter_blocks.size());
+  // parameter_blocks_ is an inline fixed-size array of kMaxParameterBlocks.
+  // Writing past it would silently corrupt adjacent struct fields.
+  DCHECK_LE(n, kMaxParameterBlocks);
   for (int i = 0; i < n; ++i) {
     parameter_blocks_[i] = parameter_blocks[i];
   }
@@ -72,6 +76,8 @@ ResidualBlock::ResidualBlock(
     : cost_function_(cost_function),
       loss_function_(loss_function),
       index_(index) {
+  // See note above: inline fixed-size array, no implicit growth.
+  DCHECK_LE(num_parameter_blocks, kMaxParameterBlocks);
   for (int i = 0; i < num_parameter_blocks; ++i) {
     parameter_blocks_[i] = parameter_blocks[i];
   }

@@ -174,7 +174,102 @@ class ProgramEvaluator : public Evaluator {
     // but with an empty body, and so will finish quickly.
     bool abort = false;
     int num_residual_blocks = program_->NumResidualBlocks();
-#pragma omp parallel for num_threads(options_.num_threads) if(options_.num_threads > 1)
+    // Hoist the residual_blocks vector reference out of the parallel
+    // loop body. This is a const accessor on Program, but MSVC cannot
+    // prove the underlying vector is invariant across the body and so
+    // re-issues the call every iteration. Caching once is free and lets
+    // the compiler treat residual_blocks_ref[i] as a plain indexed read.
+    const std::vector<ResidualBlock*>& residual_blocks_ref =
+        program_->residual_blocks();
+    const int* const residual_layout_data = residual_layout_.data();
+
+    // ---- A4: workload threshold for OMP parallel-for. ----
+    // Below this many residual blocks, the OpenMP fork/join cost
+    // outweighs the parallelism gain.  Define =0 to always parallelize
+    // (legacy behavior).
+#ifndef CERES_PARALLEL_EVAL_MIN_BLOCKS
+#define CERES_PARALLEL_EVAL_MIN_BLOCKS 256
+#endif
+    const int kParallelMinBlocks = CERES_PARALLEL_EVAL_MIN_BLOCKS;
+    const bool use_threads =
+        (options_.num_threads > 1) &&
+        (num_residual_blocks >= kParallelMinBlocks);
+
+    // ---- U2: single-thread fast path. ----
+    // When use_threads is false, hoist preparer/scratch outside the
+    // loop, skip omp_get_thread_num(), and skip the abort flush
+    // (the loop is sequential, so a plain `break` works).
+    // Bit-exact w.r.t. the multi-thread path: the per-iteration
+    // arithmetic is identical, only the dispatch/synchronization
+    // overhead is removed.  Define CERES_PROGRAM_EVAL_FAST_SINGLE_THREAD=0
+    // to disable.
+#ifndef CERES_PROGRAM_EVAL_FAST_SINGLE_THREAD
+#define CERES_PROGRAM_EVAL_FAST_SINGLE_THREAD 1
+#endif
+#if CERES_PROGRAM_EVAL_FAST_SINGLE_THREAD
+    if (!use_threads) {
+      EvaluatePreparer* const preparer = &evaluate_preparers_[0];
+      EvaluateScratch* const scratch = &evaluate_scratch_[0];
+      for (int i = 0; i < num_residual_blocks; ++i) {
+        const ResidualBlock* residual_block = residual_blocks_ref[i];
+        const int residual_offset = residual_layout_data[i];
+        double* block_residuals = NULL;
+        if (residuals != NULL) {
+          block_residuals = residuals + residual_offset;
+        } else if (gradient != NULL) {
+          block_residuals = scratch->residual_block_residuals.get();
+        }
+
+        double** block_jacobians = NULL;
+        if (jacobian != NULL || gradient != NULL) {
+          preparer->Prepare(residual_block,
+                            i,
+                            jacobian,
+                            scratch->jacobian_block_ptrs.get());
+          block_jacobians = scratch->jacobian_block_ptrs.get();
+        }
+
+        double block_cost;
+        if (!residual_block->Evaluate(
+                evaluate_options.apply_loss_function,
+                &block_cost,
+                block_residuals,
+                block_jacobians,
+                scratch->residual_block_evaluate_scratch.get())) {
+          abort = true;
+          break;
+        }
+
+        scratch->cost += block_cost;
+
+        if (jacobian != NULL) {
+          jacobian_writer_.Write(i,
+                                 residual_offset,
+                                 block_jacobians,
+                                 jacobian);
+        }
+
+        if (gradient != NULL) {
+          int num_residuals = residual_block->NumResiduals();
+          int num_parameter_blocks = residual_block->NumParameterBlocks();
+          for (int j = 0; j < num_parameter_blocks; ++j) {
+            const ParameterBlock* parameter_block =
+                residual_block->parameter_blocks()[j];
+            if (parameter_block->IsConstant()) {
+              continue;
+            }
+            MatrixTransposeVectorMultiply<Eigen::Dynamic, Eigen::Dynamic, 1>(
+                block_jacobians[j],
+                num_residuals,
+                parameter_block->LocalSize(),
+                block_residuals,
+                scratch->gradient.get() + parameter_block->delta_offset());
+          }
+        }
+      }
+    } else {
+#endif
+#pragma omp parallel for num_threads(options_.num_threads) if(use_threads)
     for (int i = 0; i < num_residual_blocks; ++i) {
 // Disable the loop instead of breaking, as required by OpenMP.
 #pragma omp flush(abort)
@@ -191,10 +286,11 @@ class ProgramEvaluator : public Evaluator {
       EvaluateScratch* scratch = &evaluate_scratch_[thread_id];
 
       // Prepare block residuals if requested.
-      const ResidualBlock* residual_block = program_->residual_blocks()[i];
+      const ResidualBlock* residual_block = residual_blocks_ref[i];
+      const int residual_offset = residual_layout_data[i];
       double* block_residuals = NULL;
       if (residuals != NULL) {
-        block_residuals = residuals + residual_layout_[i];
+        block_residuals = residuals + residual_offset;
       } else if (gradient != NULL) {
         block_residuals = scratch->residual_block_residuals.get();
       }
@@ -230,7 +326,7 @@ class ProgramEvaluator : public Evaluator {
       // Store the jacobians, if they were requested.
       if (jacobian != NULL) {
         jacobian_writer_.Write(i,
-                               residual_layout_[i],
+                               residual_offset,
                                block_jacobians,
                                jacobian);
       }
@@ -255,6 +351,9 @@ class ProgramEvaluator : public Evaluator {
         }
       }
     }
+#if CERES_PROGRAM_EVAL_FAST_SINGLE_THREAD
+    }
+#endif
 
     if (!abort) {
       const int num_parameters = program_->NumEffectiveParameters();

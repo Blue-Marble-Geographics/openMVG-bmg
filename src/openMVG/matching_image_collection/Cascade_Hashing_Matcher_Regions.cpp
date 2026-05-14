@@ -15,8 +15,12 @@
 #include "openMVG/sfm/pipelines/sfm_regions_provider.hpp"
 #include "openMVG/system/logger.hpp"
 #include "openMVG/system/progressinterface.hpp"
+#include "openMVG/system/timer.hpp"
 #include "openMVG/types.hpp"
 
+#ifdef OPENMVG_USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace openMVG {
 namespace matching_image_collection {
@@ -72,9 +76,37 @@ void Match
     cascade_hasher.Init(dimension);
   }
 
-  std::map<IndexT, std::unique_ptr<HashedDescriptions>> hashed_base_;
+  std::map<IndexT, HashedDescriptions> hashed_base_;
 
-  // Compute the zero mean descriptor that will be used for hashing (one for all the image regions)
+  // --- Diagnostics: feature counts ---
+  {
+    size_t totalFeatures = 0;
+    size_t minFeatures = std::numeric_limits<size_t>::max();
+    size_t maxFeatures = 0;
+    for (const auto idx : used_index)
+    {
+      const size_t cnt = regions_provider.get(idx)->RegionCount();
+      totalFeatures += cnt;
+      if (cnt < minFeatures) minFeatures = cnt;
+      if (cnt > maxFeatures) maxFeatures = cnt;
+    }
+    OPENMVG_LOG_INFO
+      << "[Diag] Views: " << used_index.size()
+      << ", Pairs: " << pairs.size()
+      << ", Features — min: " << minFeatures
+      << ", max: " << maxFeatures
+      << ", avg: " << (used_index.empty() ? 0 : totalFeatures / used_index.size())
+      << ", total: " << totalFeatures;
+  }
+
+#ifdef OPENMVG_USE_OPENMP
+  OPENMVG_LOG_INFO << "[Diag] OpenMP max threads: " << omp_get_max_threads();
+#else
+  OPENMVG_LOG_INFO << "[Diag] OpenMP DISABLED — single threaded";
+#endif
+
+  // --- Phase 1: Zero mean descriptor ---
+  system::Timer timer_phase;
   Eigen::VectorXf zero_mean_descriptor;
   {
     Eigen::MatrixXf matForZeroMean;
@@ -100,12 +132,10 @@ void Match
     }
     zero_mean_descriptor = CascadeHasher::GetZeroMeanDescriptor(matForZeroMean);
   }
+  OPENMVG_LOG_INFO << "[Diag] Phase 1 — Zero mean descriptor: " << timer_phase.elapsed() << " s";
 
-  // Index the input regions
-  using RType = std::pair<IndexT,std::unique_ptr<HashedDescriptions>>;
-  std::unique_ptr<RType[]> results(new RType[used_index.size()]);
-  RType* const pResults = results.get();
-
+  // --- Phase 2: Hashing ---
+  timer_phase.reset();
 #ifdef OPENMVG_USE_OPENMP
   #pragma omp parallel for schedule(dynamic)
 #endif
@@ -120,49 +150,113 @@ void Match
     const size_t dimension = regionsI->DescriptorLength();
 
     Eigen::Map<BaseMat> mat_I( (ScalarT*)tabI, regionsI->RegionCount(), dimension);
-    pResults[i] = {I, std::move(cascade_hasher.CreateHashedDescriptions(mat_I, zero_mean_descriptor))};
-  }
 
-  for (int i = 0, cnt = used_index.size(); i != cnt; ++i) {
-      auto& r = results[i];
-      hashed_base_[r.first] = std::move(r.second);
-  }
+    // Hash OUTSIDE the critical section — this is the expensive part
+    HashedDescriptions hashed =
+      cascade_hasher.CreateHashedDescriptions(mat_I, zero_mean_descriptor);
 
-  // Perform matching between all the pairs
-  int cnt = map_Pairs.size();
+    // Only the map insertion needs serialization
+#ifdef OPENMVG_USE_OPENMP
+    #pragma omp critical
+#endif
+    {
+      hashed_base_[I] = std::move(hashed);
+    }
+  }
+  OPENMVG_LOG_INFO << "[Diag] Phase 2 — Hashing " << used_index.size() << " views: " << timer_phase.elapsed() << " s";
+
+  // --- Phase 3: Matching ---
+  timer_phase.reset();
+
+  struct PairTask {
+    IndexT I;
+    IndexT J;
+  };
+  std::vector<PairTask> all_tasks;
+  all_tasks.reserve(pairs.size());
+  for (const auto& pair_it : map_Pairs)
+  {
+    for (const auto J : pair_it.second)
+    {
+      all_tasks.push_back({pair_it.first, J});
+    }
+  }
+  const int numTasks = static_cast<int>(all_tasks.size());
+
+  // Find max region count and estimate max candidates per query for scratch sizing.
+  // Each query hits one bucket per group; the candidates per query is bounded
+  // by the sum of the largest bucket sizes across groups — typically ~500-2000,
+  // far smaller than the total region count (100K+).
+  size_t maxRegionCount = 0;
+  int maxCandidatesPerQuery = 0;
+  for (const auto idx : used_index)
+  {
+    const std::shared_ptr<features::Regions> r = regions_provider.get(idx);
+    const size_t rc = r->RegionCount();
+    if (rc > maxRegionCount)
+      maxRegionCount = rc;
+  }
+  for (const auto& kv : hashed_base_)
+  {
+    const auto& hd = kv.second;
+    int viewTotal = 0;
+    for (int g = 0; g < static_cast<int>(hd.buckets.size()); ++g)
+    {
+      int groupMax = 0;
+      for (const auto& bucket : hd.buckets[g])
+      {
+        if (static_cast<int>(bucket.size()) > groupMax)
+          groupMax = static_cast<int>(bucket.size());
+      }
+      viewTotal += groupMax;
+    }
+    if (viewTotal > maxCandidatesPerQuery)
+      maxCandidatesPerQuery = viewTotal;
+  }
+  const size_t dimension = regions_provider.get(*used_index.begin())->DescriptorLength();
+  const int nb_hash_code = static_cast<int>(dimension);
+
+  OPENMVG_LOG_INFO
+    << "[Diag] maxRegionCount: " << maxRegionCount
+    << ", maxCandidatesPerQuery: " << maxCandidatesPerQuery
+    << ", scratch matrix per thread: "
+    << (maxCandidatesPerQuery * (nb_hash_code + 1) * 4 / 1024) << " KB"
+    << " (was " << (maxRegionCount * (nb_hash_code + 1) * 4 / 1048576) << " MB)";
 
 #ifdef OPENMVG_USE_OPENMP
-  #pragma omp parallel for schedule(dynamic)
+  #pragma omp parallel
 #endif
-  for (int i = 0; i < cnt; ++i)
   {
-    auto it = std::begin( map_Pairs );
-    std::advance( it, i );
-    const auto& pair_it = *it;
+    // --- Per-thread scratch: allocated once, reused for every task ---
+    std::vector<int> scratch_candidates;
+    scratch_candidates.reserve(maxCandidatesPerQuery);
+    std::vector<std::pair<typename Accumulator<ScalarT>::Type, int>> scratch_euclidean;
+    scratch_euclidean.reserve(10);
+    std::vector<char> scratch_used(maxRegionCount, 0);
 
-    if (my_progress_bar->hasBeenCanceled())
-      break;
-    const IndexT I = pair_it.first;
-    const std::vector<IndexT> & indexToCompare = pair_it.second;
+    // Per-thread output buffers — avoid 2.5 MB heap alloc per pair
+    IndMatches pvec_indices;
+    using ResultType = typename Accumulator<ScalarT>::Type;
+    std::vector<ResultType> pvec_distances;
 
-    const std::shared_ptr<features::Regions> regionsI = regions_provider.get(I);
-    if (regionsI->RegionCount() == 0)
-    {
-      (*my_progress_bar) += indexToCompare.size();
-      continue;
-    }
-
-    const std::vector<features::PointFeature> pointFeaturesI = regionsI->GetRegionsPositions();
-    const ScalarT * tabI =
-      reinterpret_cast<const ScalarT*>(regionsI->DescriptorRawData());
-    const size_t dimension = regionsI->DescriptorLength();
-    Eigen::Map<BaseMat> mat_I( (ScalarT*)tabI, regionsI->RegionCount(), dimension);
-
-    for (int j = 0; j < (int)indexToCompare.size(); ++j)
+#ifdef OPENMVG_USE_OPENMP
+    #pragma omp for schedule(dynamic)
+#endif
+    for (int t = 0; t < numTasks; ++t)
     {
       if (my_progress_bar->hasBeenCanceled())
         continue;
-      const size_t J = indexToCompare[j];
+
+      const IndexT I = all_tasks[t].I;
+      const IndexT J = all_tasks[t].J;
+
+      const std::shared_ptr<features::Regions> regionsI = regions_provider.get(I);
+      if (regionsI->RegionCount() == 0)
+      {
+        ++(*my_progress_bar);
+        continue;
+      }
+
       const std::shared_ptr<features::Regions> regionsJ = regions_provider.get(J);
 
       if (regionsI->Type_id() != regionsJ->Type_id())
@@ -171,32 +265,32 @@ void Match
         continue;
       }
 
-      // Matrix representation of the query input data;
+      const ScalarT * tabI =
+        reinterpret_cast<const ScalarT*>(regionsI->DescriptorRawData());
+      Eigen::Map<BaseMat> mat_I( (ScalarT*)tabI, regionsI->RegionCount(), dimension);
+
       const ScalarT * tabJ = reinterpret_cast<const ScalarT*>(regionsJ->DescriptorRawData());
       Eigen::Map<BaseMat> mat_J( (ScalarT*)tabJ, regionsJ->RegionCount(), dimension);
 
-      IndMatches pvec_indices;
-      using ResultType = typename Accumulator<ScalarT>::Type;
-      std::vector<ResultType> pvec_distances;
-      pvec_distances.reserve(regionsJ->RegionCount() * 2);
-      pvec_indices.reserve(regionsJ->RegionCount() * 2);
+      // Reuse per-thread buffers — clear, don't reallocate
+      pvec_indices.clear();
+      pvec_distances.clear();
 
-      // Match the query descriptors to the database
       cascade_hasher.Match_HashedDescriptions<BaseMat, ResultType>(
-        *hashed_base_[J], mat_J,
-        *hashed_base_[I], mat_I,
-        &pvec_indices, &pvec_distances);
+        hashed_base_.at(J), mat_J,
+        hashed_base_.at(I), mat_I,
+        &pvec_indices, &pvec_distances,
+        2,
+        scratch_candidates,
+        scratch_euclidean,
+        scratch_used);
 
       std::vector<int> vec_nn_ratio_idx;
-      // Filter the matches using a distance ratio test:
-      //   The probability that a match is correct is determined by taking
-      //   the ratio of distance from the closest neighbor to the distance
-      //   of the second closest.
       matching::NNdistanceRatio(
-        pvec_distances.begin(), // distance start
-        pvec_distances.end(),   // distance end
-        2, // Number of neighbor in iterator sequence (minimum required 2)
-        vec_nn_ratio_idx, // output (indices that respect the distance Ratio)
+        pvec_distances.begin(),
+        pvec_distances.end(),
+        2,
+        vec_nn_ratio_idx,
         Square(fDistRatio));
 
       matching::IndMatches vec_putative_matches;
@@ -207,20 +301,24 @@ void Match
         vec_putative_matches.emplace_back(pvec_indices[index*2].j_, pvec_indices[index*2].i_);
       }
 
-      // Remove duplicates
       matching::IndMatch::getDeduplicated(vec_putative_matches);
 
-      // Remove matches that have the same (X,Y) coordinates
-      const std::vector<features::PointFeature> pointFeaturesJ = regionsJ->GetRegionsPositions();
-      matching::IndMatchDecorator<float> matchDeduplicator(vec_putative_matches,
-        pointFeaturesI, pointFeaturesJ);
-      matchDeduplicator.getDeduplicated(vec_putative_matches);
-
-#ifdef OPENMVG_USE_OPENMP
-#pragma omp critical
-#endif
+      // Only do the expensive XY dedup if there are enough matches to justify
+      // copying 107K PointFeatures. For small match sets the index dedup above
+      // is sufficient — XY duplicates are extremely rare.
+      if (vec_putative_matches.size() > 2)
       {
-        if (!vec_putative_matches.empty())
+        const std::vector<features::PointFeature> pointFeaturesI = regionsI->GetRegionsPositions();
+        const std::vector<features::PointFeature> pointFeaturesJ = regionsJ->GetRegionsPositions();
+        matching::IndMatchDecorator<float> matchDeduplicator(vec_putative_matches,
+          pointFeaturesI, pointFeaturesJ);
+        matchDeduplicator.getDeduplicated(vec_putative_matches);
+      }
+      if (!vec_putative_matches.empty())
+      {
+#ifdef OPENMVG_USE_OPENMP
+        #pragma omp critical
+#endif
         {
           map_PutativeMatches.insert(
             {
@@ -231,7 +329,8 @@ void Match
       }
       ++(*my_progress_bar);
     }
-  }
+  } // end omp parallel
+  OPENMVG_LOG_INFO << "[Diag] Phase 3 — Matching " << numTasks << " pairs: " << timer_phase.elapsed() << " s";
 }
 } // namespace impl
 

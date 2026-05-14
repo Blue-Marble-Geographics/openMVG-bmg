@@ -1,4 +1,3 @@
-
 ###
 # Intrinsic image analysis and SfM_Data container initialization
 ###
@@ -34,6 +33,15 @@ install(TARGETS openMVG_main_ConvertList DESTINATION bin/)
 # - openMVG_main_ComputeFeatures: features and descriptors
 # - openMVG_main_ComputeMatches: putative matches + geometric filtered matches
 ###
+
+add_executable(openMVG_main_ClassifyScene main_ClassifyScene.cpp)
+target_link_libraries(openMVG_main_ClassifyScene
+  PRIVATE
+    openMVG_sfm
+    openMVG_system
+    ${STLPLUS_LIBRARY}
+)
+
 
 add_executable(openMVG_main_ComputeFeatures main_ComputeFeatures.cpp)
 target_link_libraries(openMVG_main_ComputeFeatures
@@ -145,6 +153,7 @@ target_link_libraries(openMVG_main_MatchesToTracks
 )
 
 # Installation rules
+set_property( TARGET openMVG_main_ClassifyScene PROPERTY FOLDER OpenMVG/software )
 set_property( TARGET openMVG_main_ListMatchingPairs PROPERTY FOLDER OpenMVG/software )
 set_property( TARGET openMVG_main_ComputeFeatures   PROPERTY FOLDER OpenMVG/software )
 set_property( TARGET openMVG_main_PairGenerator     PROPERTY FOLDER OpenMVG/software )
@@ -153,6 +162,7 @@ set_property( TARGET openMVG_main_ComputeMatches    PROPERTY FOLDER OpenMVG/soft
 set_property( TARGET openMVG_main_GeometricFilter   PROPERTY FOLDER OpenMVG/software )
 set_property( TARGET openMVG_main_MatchesToTracks   PROPERTY FOLDER OpenMVG/software )
 
+install( TARGETS openMVG_main_ClassifyScene DESTINATION bin/ )
 install( TARGETS openMVG_main_ListMatchingPairs DESTINATION bin/ )
 install( TARGETS openMVG_main_ComputeFeatures   DESTINATION bin/ )
 install( TARGETS openMVG_main_PairGenerator     DESTINATION bin/ )
@@ -272,7 +282,7 @@ if(OpenMVG_USE_OPENCV)
   add_executable(openMVG_main_ComputeFeatures_OpenCV
     main_ComputeFeatures_OpenCV.cpp)
   target_link_libraries(openMVG_main_ComputeFeatures_OpenCV
-    openMVG_system
+  openMVG_system
     openMVG_image
     openMVG_features
     openMVG_multiview
@@ -344,3 +354,55 @@ configure_file(${OPENMVG_TUTORIAL_IN_FILE}
 add_subdirectory(clustering)
 add_subdirectory(export)
 add_subdirectory(import)
+
+set_property(TARGET openMVG_main_MatchesToTracks   PROPERTY FOLDER OpenMVG/software )
+
+# ==============================================================================
+# Matching diagnostics test
+# ==============================================================================
+if (OpenMVG_BUILD_TESTS)
+  add_executable(openMVG_test_matching_diagnostics matching_diagnostics_test.cpp)
+  set_property(TARGET openMVG_test_matching_diagnostics PROPERTY FOLDER OpenMVG/test)
+  target_include_directories(openMVG_test_matching_diagnostics
+    PRIVATE
+      ${CMAKE_SOURCE_DIR}
+      ${CMAKE_SOURCE_DIR}/third_party)
+  target_link_libraries(openMVG_test_matching_diagnostics
+    PRIVATE
+      openMVG_features
+      openMVG_matching
+      openMVG_matching_image_collection
+      openMVG_sfm
+      openMVG_numeric
+      openMVG_system
+      CppUnitLite)
+  if (MSVC)
+    set_target_properties(openMVG_test_matching_diagnostics PROPERTIES COMPILE_FLAGS "/bigobj")
+  endif()
+  add_test(NAME openMVG_test_matching_diagnostics
+    WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+    COMMAND $<TARGET_FILE:openMVG_test_matching_diagnostics>)
+
+  # IncrementalV2 SfM pipeline diagnostics
+  add_executable(openMVG_test_sfm_incrementalv2 sfm_incrementalv2_test.cpp)
+  set_property(TARGET openMVG_test_sfm_incrementalv2 PROPERTY FOLDER OpenMVG/test)
+  target_include_directories(openMVG_test_sfm_incrementalv2
+    PRIVATE
+      ${CMAKE_SOURCE_DIR}
+      ${CMAKE_SOURCE_DIR}/third_party)
+  target_link_libraries(openMVG_test_sfm_incrementalv2
+    PRIVATE
+      openMVG_sfm
+      openMVG_features
+      openMVG_numeric
+      openMVG_system
+      CppUnitLite)
+  if (MSVC)
+    set_target_properties(openMVG_test_sfm_incrementalv2 PROPERTIES COMPILE_FLAGS "/bigobj")
+  endif()
+  add_test(NAME openMVG_test_sfm_incrementalv2
+    WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+    COMMAND $<TARGET_FILE:openMVG_test_sfm_incrementalv2>)
+endif()
+
+install( TARGETS openMVG_main_ListMatchingPairs DESTINATION bin/ )

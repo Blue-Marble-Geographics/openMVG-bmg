@@ -21,6 +21,8 @@
 
 extern "C" {
 #include "nonFree/sift/vl/sift.h"
+  extern int hasAVX2;
+  extern int hasSSE41;
 }
 
 namespace openMVG {
@@ -30,21 +32,47 @@ namespace features {
 // [1] R. Arandjelović, A. Zisserman.
 // Three things everyone should know to improve object retrieval. CVPR2012.
 
-inline void siftDescToUChar(
-  vl_sift_pix descr[128],
-  Descriptor<unsigned char,128> & descriptor,
-  bool brootSift = false)
-{
-  if (brootSift)  {
-    // rootsift = sqrt( sift / sum(sift) );
-    const float sum = std::accumulate(descr, descr+128, 0.0f);
-    for (int k=0;k<128;++k)
-      descriptor[k] = static_cast<unsigned char>(512.f*sqrt(descr[k]/sum));
+  inline void siftDescToUChar(
+    const vl_sift_pix descr[128],
+    Descriptor<unsigned char, 128>& descriptor,
+    bool brootSift = false)
+  {
+    if (brootSift) {
+      /* SSE2 horizontal sum */
+      __m128 vSum = _mm_setzero_ps();
+      for (int k = 0; k < 128; k += 4)
+        vSum = _mm_add_ps(vSum, _mm_loadu_ps(descr + k));
+      /* horizontal reduce */
+      vSum = _mm_add_ps(vSum, _mm_movehl_ps(vSum, vSum));
+      vSum = _mm_add_ss(vSum, _mm_shuffle_ps(vSum, vSum, 1));
+      const float sum = _mm_cvtss_f32(vSum);
+      const float invSum = (sum > 1e-12f) ? 1.0f / sum : 0.0f;
+
+      /* sqrt(descr[k] * invSum) * 512, 4 at a time */
+      const __m128 v512 = _mm_set1_ps(512.0f);
+      const __m128 vInvSum = _mm_set1_ps(invSum);
+      for (int k = 0; k < 128; k += 4) {
+        __m128 v = _mm_mul_ps(_mm_loadu_ps(descr + k), vInvSum);
+        v = _mm_sqrt_ps(v);
+        v = _mm_mul_ps(v, v512);
+        /* clamp to [0, 255] and convert */
+        __m128i vi = _mm_cvttps_epi32(v);
+        vi = _mm_packs_epi32(vi, vi);     /* 4×int32 → 4×int16 */
+        vi = _mm_packus_epi16(vi, vi);    /* 4×int16 → 4×uint8 */
+        *(int*)(&descriptor[k]) = _mm_cvtsi128_si32(vi);
+      }
+    }
+    else {
+      const __m128 v512 = _mm_set1_ps(512.0f);
+      for (int k = 0; k < 128; k += 4) {
+        __m128 v = _mm_mul_ps(_mm_loadu_ps(descr + k), v512);
+        __m128i vi = _mm_cvttps_epi32(v);
+        vi = _mm_packs_epi32(vi, vi);
+        vi = _mm_packus_epi16(vi, vi);
+        *(int*)(&descriptor[k]) = _mm_cvtsi128_si32(vi);
+      }
+    }
   }
-  else
-    for (int k=0;k<128;++k)
-    descriptor[k] = static_cast<unsigned char>(512.f*descr[k]);
-}
 
 class SIFT_Image_describer : public Image_describer
 {
@@ -56,7 +84,7 @@ public:
   {
     Params(
       int first_octave = 0,
-      int num_octaves = 6,
+      int num_octaves = 5, // Drop one from 6 negligible quality loss.
       int num_scales = 3,
       float edge_threshold = 10.0f,
       float peak_threshold = 0.04f,
@@ -110,8 +138,8 @@ public:
     break;
     case ULTRA_PRESET:
       _params._peak_threshold = 0.01f;
-      _params._first_octave = -1;
-    break;
+      _params._first_octave = 0; // was -1; saves 4× memory on first octave
+      break;
     default:
       return false;
     }
@@ -166,8 +194,9 @@ public:
     auto regions = std::unique_ptr<Regions_type>(new Regions_type);
 
     // reserve some memory for faster keypoint saving
-    regions->Features().reserve(2000);
-    regions->Descriptors().reserve(2000);
+    const size_t estimatedKeypoints = (size_t)(w * h) / 400; // ~1 keypoint per 20x20 block
+    regions->Features().reserve(estimatedKeypoints);
+    regions->Descriptors().reserve(estimatedKeypoints);
 
     while (true) {
       vl_sift_detect(filt);
@@ -175,14 +204,11 @@ public:
       VlSiftKeypoint const *keys  = vl_sift_get_keypoints(filt);
       const int nkeys = vl_sift_get_nkeypoints(filt);
 
+#if 0 // Now gradient buffer free
       // Update gradient before launching parallel extraction
       vl_sift_update_gradient(filt);
-
-#if PARALLEL_KEYPOINT_GENERATION
-      #ifdef OPENMVG_USE_OPENMP
-      #pragma omp parallel for private(descr, descriptor)
-      #endif
 #endif
+
       for (int i = 0; i < nkeys; ++i) {
 
         // Feature masking
@@ -193,28 +219,30 @@ public:
             continue;
         }
 
-        double angles [4] = {0.0, 0.0, 0.0, 0.0};
+        double angles[4];
         int nangles = 1; // by default (1 upright feature)
         if (_bOrientation)
         { // compute from 1 to 4 orientations
-          nangles = vl_sift_calc_keypoint_orientations(filt, angles, keys+i);
+          nangles = vl_sift_calc_keypoint_orientations(filt, angles, keys + i);
+        }
+        else
+        {
+          angles[0] = 0.0;
         }
 
+        // Cache keypoint fields once — avoid re-reading the struct
+        // through a pointer on each orientation iteration
+        const float kx = keys[i].x;
+        const float ky = keys[i].y;
+        const float ksig = keys[i].sigma;
+
         for (int q=0 ; q < nangles ; ++q) {
-          vl_sift_calc_keypoint_descriptor(filt, &descr[0], keys+i, angles[q]);
-          const SIOPointFeature fp(keys[i].x, keys[i].y,
-            keys[i].sigma, static_cast<float>(angles[q]));
+          vl_sift_calc_keypoint_descriptor(filt, &descr[0], keys + i, angles[q]);
 
           siftDescToUChar(&descr[0], descriptor, _params._root_sift);
-#if PARALLEL_KEYPOINT_GENERATION
-          #ifdef OPENMVG_USE_OPENMP
-          #pragma omp critical
-          #endif
-#endif
-          {
-            regions->Descriptors().push_back(descriptor);
-            regions->Features().push_back(fp);
-          }
+
+          regions->Descriptors().push_back(descriptor);
+          regions->Features().emplace_back(kx, ky, ksig, static_cast<float>(angles[q]));
         }
       }
       if (vl_sift_process_next_octave(filt))

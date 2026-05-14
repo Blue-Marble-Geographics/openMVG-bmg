@@ -30,6 +30,11 @@ Mat3X Similarity3::operator () ( const Mat3X & point ) const
   return scale_ * pose_( point );
 }
 
+Vec3 Similarity3::operator () ( const Vec3 & point ) const
+{
+  return scale_ * pose_( point );
+}
+
 Pose3 Similarity3::operator () ( const Pose3 & pose ) const
 {
   return Pose3( pose.rotation() * pose_.rotation().transpose(), this->operator()( pose.center() ) );

@@ -112,6 +112,15 @@ class BlockRandomAccessSparseMatrix : public BlockRandomAccessMatrix {
   typedef HashMap<long int, CellInfo* > LayoutType;
   LayoutType layout_;
 
+  // CellInfo storage pool. One contiguous array of size block_pairs.size()
+  // is allocated in the ctor and freed in the dtor, replacing M individual
+  // `new CellInfo` heap allocations (and matching `delete`s). The CellInfo*
+  // pointers stored in layout_ alias into this array; they remain valid for
+  // the matrix's lifetime because the array is never resized.
+  // Mutex (a member of CellInfo) is non-copyable and non-movable, so
+  // std::vector<CellInfo> is not viable here.
+  CellInfo* cell_info_pool_;
+
   // In order traversal of contents of the matrix. This allows us to
   // implement a matrix-vector which is 20% faster than using the
   // iterator in the Layout object instead.

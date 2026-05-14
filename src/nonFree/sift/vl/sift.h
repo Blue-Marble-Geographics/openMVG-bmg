@@ -86,9 +86,6 @@ typedef struct _VlSiftFilt
   double magnif ;       /**< magnification factor. */
   double windowSize ;   /**< size of Gaussian window (in spatial bins) */
 
-  vl_sift_pix *grad ;   /**< GSS gradient data. */
-  int grad_o ;          /**< GSS gradient data octave. */
-
   double expn_tab [EXPN_SZ+1] ; /**< ::fast_expn table @internal */
 
 } VlSiftFilt ;
@@ -123,10 +120,10 @@ int   vl_sift_calc_keypoint_orientations (VlSiftFilt *f,
                                           double angles [4],
                                           VlSiftKeypoint const*k);
 VL_EXPORT
-void  vl_sift_calc_keypoint_descriptor   (VlSiftFilt *f,
-                                          vl_sift_pix *descr,
-                                          VlSiftKeypoint const* k,
-                                          double angle) ;
+void  vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
+  vl_sift_pix* __restrict descr,
+  VlSiftKeypoint const* __restrict k,
+  double angle);
 
 VL_EXPORT
 void  vl_sift_calc_raw_descriptor        (VlSiftFilt const *f,

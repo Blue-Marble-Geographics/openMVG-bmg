@@ -59,15 +59,62 @@ IndexT RemoveOutliers_AngleError
   const double dMinAcceptedAngle
 );
 
-// Fused filter: runs both angle and pixel-residual outlier removal in a single
-// pass over the structure, avoiding redundant unordered_map traversals.
-// Returns {angle_removed, pixel_removed}.
-std::pair<IndexT, IndexT> RemoveOutliers_AngleAndPixelError
+/// Fused angle + pixel-residual outlier filter. Equivalent to calling
+///   RemoveOutliers_AngleError(sfm_data, dMinAcceptedAngle);
+///   RemoveOutliers_PixelResidualError(sfm_data, dThresholdPixel, minTrackLength);
+/// in that order, but does it in a single pass over sfm_data.structure with
+/// the per-view (pose, intrinsic) cache built only once. Returns the total
+/// number of erased observations + erased-track placeholders (semantically
+/// the sum of what the two separate calls would have returned).
+IndexT RemoveOutliers_PixelAndAngleError
 (
   SfM_Data & sfm_data,
-  const double dMinAcceptedAngle,
   const double dThresholdPixel,
-  const unsigned int minTrackLength = 2
+  const double dMinAcceptedAngle,
+  const unsigned int minTrackLength = 2,
+  IndexT * out_removed_by_angle = nullptr,
+  IndexT * out_removed_by_pixel = nullptr
+);
+
+/// Eject poses whose median reprojection residual is much worse than the
+/// rest of the reconstruction. Implements the "one bad pose poisons the BA"
+/// safety net used by COLMAP-style robust pipelines.
+///
+/// For each pose, the median pixel residual over its observations is
+/// computed. The global median over poses is used as the reference. Any
+/// pose whose median residual exceeds
+///     max( k_factor * global_median_of_medians, abs_floor_pixels )
+/// is removed (along with its observations); short tracks get pruned as a
+/// side effect via the same minTrackLength rule used elsewhere.
+///
+/// @param sfm_data        scene to clean (modified in place)
+/// @param k_factor        multiplier on the median-of-medians (default 3.0)
+/// @param abs_floor_pixels minimum residual a pose must exceed to be ejected
+///                         even when the scene is uniformly noisy (default 2.0)
+/// @param min_points_per_landmark forwarded to the orphan cleanup pass
+/// @return number of poses ejected
+IndexT EjectPosesByMedianResidual
+(
+  SfM_Data & sfm_data,
+  const double k_factor = 3.0,
+  const double abs_floor_pixels = 2.0,
+  const IndexT min_points_per_landmark = 2
+);
+
+/// Pose-prior outlier ejection. Complements EjectPosesByMedianResidual for
+/// scenes with motion priors: a pose can have a clean reprojection median
+/// yet sit far from its prior center. Each pose's distance from its prior
+/// center is compared against
+///     max( k_factor * median_distance, abs_floor_units )
+/// (user units, e.g. meters). Poses exceeding the threshold are erased
+/// along with their orphaned observations. Safe to call when no priors
+/// are active (returns 0).
+IndexT EjectPosesByPriorResidual
+(
+  SfM_Data & sfm_data,
+  const double k_factor = 3.0,
+  const double abs_floor_units = 1.0,
+  const IndexT min_points_per_landmark = 2
 );
 
 /// Erase pose with insufficient track observations

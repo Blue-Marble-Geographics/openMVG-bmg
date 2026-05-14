@@ -180,7 +180,6 @@ TEST(GLOBAL_SFM, RotationAveragingL2_TranslationAveragingL2_Chordal) {
   sfmEngine.SetRotationAveragingMethod(ROTATION_AVERAGING_L2);
   sfmEngine.SetTranslationAveragingMethod(TRANSLATION_AVERAGING_L2_DISTANCE_CHORDAL);
 
-#if 0 // JPB WIP BUG Uses removed code.
   EXPECT_TRUE (sfmEngine.Process());
 
   const double dResidual = RMSE(sfmEngine.Get_SfM_Data());
@@ -189,7 +188,6 @@ TEST(GLOBAL_SFM, RotationAveragingL2_TranslationAveragingL2_Chordal) {
   EXPECT_EQ( nviews, sfmEngine.Get_SfM_Data().GetPoses().size());
   EXPECT_EQ( npoints, sfmEngine.Get_SfM_Data().GetLandmarks().size());
   EXPECT_TRUE( IsTracksOneCC(sfmEngine.Get_SfM_Data()));
-#endif
 }
 
 TEST(GLOBAL_SFM, RotationAveragingL2_TranslationAveragingSoftL1) {
@@ -234,7 +232,6 @@ TEST(GLOBAL_SFM, RotationAveragingL2_TranslationAveragingSoftL1) {
   sfmEngine.SetRotationAveragingMethod(ROTATION_AVERAGING_L2);
   sfmEngine.SetTranslationAveragingMethod(TRANSLATION_AVERAGING_SOFTL1);
 
-#if 0 // JPB WIP BUG Uses removed code.
   EXPECT_TRUE (sfmEngine.Process());
 
   const double dResidual = RMSE(sfmEngine.Get_SfM_Data());
@@ -243,12 +240,10 @@ TEST(GLOBAL_SFM, RotationAveragingL2_TranslationAveragingSoftL1) {
   EXPECT_EQ( nviews, sfmEngine.Get_SfM_Data().GetPoses().size());
   EXPECT_EQ( npoints, sfmEngine.Get_SfM_Data().GetLandmarks().size());
   EXPECT_TRUE( IsTracksOneCC(sfmEngine.Get_SfM_Data()));
-#endif
 }
 
 #ifdef USE_PATENTED_LIGT
 TEST(GLOBAL_SFM, RotationAveragingL2_Translation_LIGT) {
-#if 0 // JPB Unsupported
   const int nviews = 6;
   const int npoints = 64;
   const nViewDatasetConfigurator config;
@@ -297,7 +292,6 @@ TEST(GLOBAL_SFM, RotationAveragingL2_Translation_LIGT) {
   EXPECT_EQ( nviews, sfmEngine.Get_SfM_Data().GetPoses().size());
   EXPECT_EQ( npoints, sfmEngine.Get_SfM_Data().GetLandmarks().size());
   EXPECT_TRUE( IsTracksOneCC(sfmEngine.Get_SfM_Data()));
-#endif
 }
 #endif // USE_PATENTED_LIGT
 

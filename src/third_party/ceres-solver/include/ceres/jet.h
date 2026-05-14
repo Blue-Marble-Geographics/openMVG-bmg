@@ -204,13 +204,26 @@ struct Jet {
   }
 
   // Compound operators
+  // Direct in-place form for the alias-safe cases. Bit-identical to the
+  // construct-then-assign form built from the binary operators (same per
+  // -element FP expressions, same evaluation order). Avoids materialising
+  // a full Jet<T,N> temporary on the stack on every call -- this matters
+  // because += / -= are dominant in autodiff residual accumulation.
+  //
+  // *= and /= against a Jet are kept in their original construct-then-assign
+  // form: the RHS expression reads `a` (the scalar part) while computing the
+  // new `v` (infinitesimal part), so a naive in-place rewrite would have to
+  // hold an intermediate to be safe under self-aliasing (x *= x). The cost
+  // of a Jet temp there is small relative to the audit risk; leave as-is.
   Jet<T, N>& operator+=(const Jet<T, N> &y) {
-    *this = *this + y;
+    a += y.a;
+    v += y.v;
     return *this;
   }
 
   Jet<T, N>& operator-=(const Jet<T, N> &y) {
-    *this = *this - y;
+    a -= y.a;
+    v -= y.v;
     return *this;
   }
 
@@ -225,23 +238,29 @@ struct Jet {
   }
 
   // Compound with scalar operators.
+  // No Jet aliasing possible (RHS is a scalar T), so all four are safely
+  // written in-place. /= goes through the reciprocal-multiply form to match
+  // the binary operator/(Jet, T) bit-for-bit.
   Jet<T, N>& operator+=(const T& s) {
-    *this = *this + s;
+    a += s;
     return *this;
   }
 
   Jet<T, N>& operator-=(const T& s) {
-    *this = *this - s;
+    a -= s;
     return *this;
   }
 
   Jet<T, N>& operator*=(const T& s) {
-    *this = *this * s;
+    a *= s;
+    v *= s;
     return *this;
   }
 
   Jet<T, N>& operator/=(const T& s) {
-    *this = *this / s;
+    const T s_inverse = T(1.0) / s;
+    a *= s_inverse;
+    v *= s_inverse;
     return *this;
   }
 
@@ -382,7 +401,8 @@ Jet<T, N> operator/(const Jet<T, N>& f,
   // which holds because v*v = 0.
   const T g_a_inverse = T(1.0) / g.a;
   const T f_a_by_g_a = f.a * g_a_inverse;
-  return Jet<T, N>(f.a * g_a_inverse, (f.v - f_a_by_g_a * g.v) * g_a_inverse);
+  // Reuse f_a_by_g_a (== f.a * g_a_inverse) for the scalar part; bit-identical.
+  return Jet<T, N>(f_a_by_g_a, (f.v - f_a_by_g_a * g.v) * g_a_inverse);
 }
 
 // Binary / with a scalar: s / x

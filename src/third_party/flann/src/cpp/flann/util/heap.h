@@ -105,8 +105,11 @@ public:
         count = 0;
     }
 
-    struct CompareT : public std::binary_function<T,T,bool>
+    struct CompareT
     {
+        // std::binary_function was removed in C++17; the typedefs it provided
+        // (first_argument_type, second_argument_type, result_type) are not
+        // used by any caller of this comparator, so we can drop the base.
         bool operator()(const T& t_1, const T& t_2) const
         {
             return t_2 < t_1;

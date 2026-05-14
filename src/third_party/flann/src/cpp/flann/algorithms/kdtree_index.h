@@ -264,7 +264,11 @@ protected:
         /* Construct the randomized trees. */
         for (int i = 0; i < trees_; i++) {
             /* Randomize the order of vectors to allow for unbiased sampling. */
-            std::random_shuffle(ind.begin(), ind.end());
+            // std::random_shuffle was removed in C++17; use std::shuffle.
+            {
+                std::mt19937 rng(static_cast<std::mt19937::result_type>(std::rand()));
+                std::shuffle(ind.begin(), ind.end(), rng);
+            }
             tree_roots_[i] = divideTree(&ind[0], int(size_) );
         }
         delete[] mean_;

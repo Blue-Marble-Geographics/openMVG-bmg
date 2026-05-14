@@ -39,6 +39,58 @@
 #include "ceres/internal/eigen.h"
 #include "glog/logging.h"
 
+// Selects the inner loop order for the four custom (non-Eigen) small
+// BLAS kernels below: MatrixMatrixMultiplyNaive,
+// MatrixTransposeMatrixMultiplyNaive, and the custom branches of
+// MatrixVectorMultiply / MatrixTransposeVectorMultiply.
+//
+// When CERES_SMALL_BLAS_AXPY = 1 (the default) three additional
+// optimizations are also enabled:
+//   1. CERES_SMALL_BLAS_FORCE_INLINE on every kernel, eliminating call
+//      frames in the inner-most Schur eliminator loops where the
+//      kernels are invoked once per (chunk row, cell).
+//   2. AXPY-form inner loops (described below).
+//   3. MatrixTransposeMatrixMultiplySelf, a specialised C op A'A kernel
+//      that computes only the upper triangle and mirrors -- halving
+//      FLOPs for the diagonal-block updates in the Schur eliminator
+//      (E'E in ChunkDiagonalBlockAndGradient/BackSubstitute and the
+//      F'F diagonal in [No]EBlockRowOuterProduct).
+//
+//   CERES_SMALL_BLAS_AXPY = 1  (default): AXPY-form loops.  Reads from
+//     A in unit-stride row order and broadcasts the other operand.
+//     Inner loops vectorize cleanly and are typically 2-4x faster on
+//     the dynamic-shape paths used by the 2_3_d Schur eliminator.
+//     NOT bit-identical to the legacy loops -- the floating-point
+//     accumulation order changes (k-outer instead of k-inner), so
+//     the last few bits of each result may differ.
+//
+//   CERES_SMALL_BLAS_AXPY = 0: legacy dot-product loops, bit-identical
+//     to upstream Ceres.  Define CERES_SMALL_BLAS_NO_AXPY before
+//     including this header (or via -D) to force this mode.  Force
+//     inlining and the symmetric self-multiply specialisation are
+//     disabled in this mode as well, so the build matches upstream.
+#if !defined(CERES_SMALL_BLAS_AXPY)
+# if defined(CERES_SMALL_BLAS_NO_AXPY)
+#  define CERES_SMALL_BLAS_AXPY 0
+# else
+#  define CERES_SMALL_BLAS_AXPY 1
+# endif
+#endif
+
+// Force inlining attribute, conditional on the AXPY mode so the
+// legacy bit-identical build stays as close to upstream as possible.
+#if CERES_SMALL_BLAS_AXPY
+# if defined(_MSC_VER)
+#  define CERES_SMALL_BLAS_FORCE_INLINE __forceinline
+# elif defined(__GNUC__) || defined(__clang__)
+#  define CERES_SMALL_BLAS_FORCE_INLINE inline __attribute__((always_inline))
+# else
+#  define CERES_SMALL_BLAS_FORCE_INLINE inline
+# endif
+#else
+# define CERES_SMALL_BLAS_FORCE_INLINE inline
+#endif
+
 namespace ceres {
 namespace internal {
 
@@ -46,7 +98,7 @@ namespace internal {
 // template junk across the various GEMM variants.
 #define CERES_GEMM_BEGIN(name)                                          \
   template<int kRowA, int kColA, int kRowB, int kColB, int kOperation>  \
-  inline void name(const double* A,                                     \
+  CERES_SMALL_BLAS_FORCE_INLINE void name(const double* A,              \
                    const int num_row_a,                                 \
                    const int num_col_a,                                 \
                    const double* B,                                     \
@@ -161,23 +213,68 @@ CERES_GEMM_BEGIN(MatrixMatrixMultiplyNaive) {
   DCHECK_LE(start_row_c + NUM_ROW_C, row_stride_c);
   DCHECK_LE(start_col_c + NUM_COL_C, col_stride_c);
 
-  for (int row = 0; row < NUM_ROW_C; ++row) {
-    for (int col = 0; col < NUM_COL_C; ++col) {
-      double tmp = 0.0;
-      for (int k = 0; k < NUM_COL_A; ++k) {
-        tmp += A[row * NUM_COL_A + k] * B[k * NUM_COL_B + col];
-      }
+  // Caller contract: A, B, C never alias.  Aliasing as __restrict
+  // lets the compiler vectorize the inner reduction without proving
+  // non-aliasing across translation units.
+  const double* __restrict A_r = A;
+  const double* __restrict B_r = B;
+  double* __restrict C_r = C;
 
-      const int index = (row + start_row_c) * col_stride_c + start_col_c + col;
-      if (kOperation > 0) {
-        C[index] += tmp;
-      } else if (kOperation < 0) {
-        C[index] -= tmp;
+#if CERES_SMALL_BLAS_AXPY
+  // AXPY form: walk B by rows (k-outer, col-inner).  Inner loop reads
+  // a row of B at unit stride and writes C at unit stride; the scalar
+  // a = A[row,k] is broadcast.  This vectorises into
+  // vbroadcastsd + vfmadd231pd / vmulpd+vaddpd on AVX2/FMA.
+  for (int row = 0; row < NUM_ROW_C; ++row) {
+    const double* __restrict A_row = A_r + row * NUM_COL_A;
+    double* __restrict C_row =
+        C_r + (row + start_row_c) * col_stride_c + start_col_c;
+
+    if (kOperation == 0) {
+      // Zero-init the destination row before accumulating; converts
+      // the kernel to pure C += A * B for the rest of the inner work.
+      for (int col = 0; col < NUM_COL_C; ++col) {
+        C_row[col] = 0.0;
+      }
+    }
+
+    for (int k = 0; k < NUM_COL_A; ++k) {
+      const double a = A_row[k];
+      const double* __restrict B_k = B_r + k * NUM_COL_B;
+      if (kOperation >= 0) {
+        for (int col = 0; col < NUM_COL_C; ++col) {
+          C_row[col] += a * B_k[col];
+        }
       } else {
-        C[index] = tmp;
+        for (int col = 0; col < NUM_COL_C; ++col) {
+          C_row[col] -= a * B_k[col];
+        }
       }
     }
   }
+#else
+  // Legacy dot-product form (bit-identical to upstream Ceres).
+  for (int row = 0; row < NUM_ROW_C; ++row) {
+    const double* __restrict A_row = A_r + row * NUM_COL_A;
+    const int    C_row_base       = (row + start_row_c) * col_stride_c
+                                  + start_col_c;
+    for (int col = 0; col < NUM_COL_C; ++col) {
+      double tmp = 0.0;
+      for (int k = 0; k < NUM_COL_A; ++k) {
+        tmp += A_row[k] * B_r[k * NUM_COL_B + col];
+      }
+
+      const int index = C_row_base + col;
+      if (kOperation > 0) {
+        C_r[index] += tmp;
+      } else if (kOperation < 0) {
+        C_r[index] -= tmp;
+      } else {
+        C_r[index] = tmp;
+      }
+    }
+  }
+#endif  // CERES_SMALL_BLAS_AXPY
 }
 
 CERES_GEMM_BEGIN(MatrixMatrixMultiply) {
@@ -221,23 +318,69 @@ CERES_GEMM_BEGIN(MatrixTransposeMatrixMultiplyNaive) {
   DCHECK_LE(start_row_c + NUM_ROW_C, row_stride_c);
   DCHECK_LE(start_col_c + NUM_COL_C, col_stride_c);
 
-  for (int row = 0; row < NUM_ROW_C; ++row) {
-    for (int col = 0; col < NUM_COL_C; ++col) {
-      double tmp = 0.0;
-      for (int k = 0; k < NUM_ROW_A; ++k) {
-        tmp += A[k * NUM_COL_A + row] * B[k * NUM_COL_B + col];
-      }
+  // See note on MatrixMatrixMultiplyNaive: __restrict locals.
+  const double* __restrict A_r = A;
+  const double* __restrict B_r = B;
+  double* __restrict C_r = C;
 
-      const int index = (row + start_row_c) * col_stride_c + start_col_c + col;
-      if (kOperation > 0) {
-        C[index]+= tmp;
-      } else if (kOperation < 0) {
-        C[index]-= tmp;
-      } else {
-        C[index]= tmp;
+#if CERES_SMALL_BLAS_AXPY
+  // AXPY form: outer over k (the contracted dim), then over output
+  // rows, with the unit-stride col-loop innermost.  This reads A and
+  // B by rows (unit stride) and broadcasts a = A[k,row] across the
+  // inner loop -- the same vectorisable shape as MatrixMatrixMultiply.
+  // The previous form read A and B both column-strided, which prevents
+  // SIMD entirely.
+  if (kOperation == 0) {
+    // Zero the (NUM_ROW_C x NUM_COL_C) destination sub-block once;
+    // every (k, row, col) update from here on is +=.
+    for (int row = 0; row < NUM_ROW_C; ++row) {
+      double* __restrict C_row =
+          C_r + (row + start_row_c) * col_stride_c + start_col_c;
+      for (int col = 0; col < NUM_COL_C; ++col) {
+        C_row[col] = 0.0;
       }
     }
   }
+
+  for (int k = 0; k < NUM_ROW_A; ++k) {
+    const double* __restrict A_k = A_r + k * NUM_COL_A;  // row k of A
+    const double* __restrict B_k = B_r + k * NUM_COL_B;  // row k of B
+    for (int row = 0; row < NUM_ROW_C; ++row) {
+      const double a = A_k[row];                          // = A[k,row]
+      double* __restrict C_row =
+          C_r + (row + start_row_c) * col_stride_c + start_col_c;
+      if (kOperation >= 0) {
+        for (int col = 0; col < NUM_COL_C; ++col) {
+          C_row[col] += a * B_k[col];
+        }
+      } else {
+        for (int col = 0; col < NUM_COL_C; ++col) {
+          C_row[col] -= a * B_k[col];
+        }
+      }
+    }
+  }
+#else
+  // Legacy dot-product form (bit-identical to upstream Ceres).
+  for (int row = 0; row < NUM_ROW_C; ++row) {
+    const int C_row_base = (row + start_row_c) * col_stride_c + start_col_c;
+    for (int col = 0; col < NUM_COL_C; ++col) {
+      double tmp = 0.0;
+      for (int k = 0; k < NUM_ROW_A; ++k) {
+        tmp += A_r[k * NUM_COL_A + row] * B_r[k * NUM_COL_B + col];
+      }
+
+      const int index = C_row_base + col;
+      if (kOperation > 0) {
+        C_r[index]+= tmp;
+      } else if (kOperation < 0) {
+        C_r[index]-= tmp;
+      } else {
+        C_r[index]= tmp;
+      }
+    }
+  }
+#endif  // CERES_SMALL_BLAS_AXPY
 }
 
 CERES_GEMM_BEGIN(MatrixTransposeMatrixMultiply) {
@@ -272,7 +415,7 @@ CERES_GEMM_BEGIN(MatrixTransposeMatrixMultiply) {
 // kOperation = -1  -> c -= A' * b
 // kOperation =  0  -> c  = A' * b
 template<int kRowA, int kColA, int kOperation>
-inline void MatrixVectorMultiply(const double* A,
+CERES_SMALL_BLAS_FORCE_INLINE void MatrixVectorMultiply(const double* A,
                                  const int num_row_a,
                                  const int num_col_a,
                                  const double* b,
@@ -302,18 +445,27 @@ inline void MatrixVectorMultiply(const double* A,
   const int NUM_ROW_A = (kRowA != Eigen::Dynamic ? kRowA : num_row_a);
   const int NUM_COL_A = (kColA != Eigen::Dynamic ? kColA : num_col_a);
 
+  // Caller contract: A, b, c never alias.
+  const double* __restrict A_r = A;
+  const double* __restrict b_r = b;
+  double* __restrict c_r = c;
+
   for (int row = 0; row < NUM_ROW_A; ++row) {
+    // Hoist the row base of A out of the inner column reduction.  On
+    // the dynamic-kColA path this saves one imul per (row, col) and
+    // turns the inner loop into a clean unit-stride dot product.
+    const double* __restrict A_row = A_r + row * NUM_COL_A;
     double tmp = 0.0;
     for (int col = 0; col < NUM_COL_A; ++col) {
-      tmp += A[row * NUM_COL_A + col] * b[col];
+      tmp += A_row[col] * b_r[col];
     }
 
     if (kOperation > 0) {
-      c[row] += tmp;
+      c_r[row] += tmp;
     } else if (kOperation < 0) {
-      c[row] -= tmp;
+      c_r[row] -= tmp;
     } else {
-      c[row] = tmp;
+      c_r[row] = tmp;
     }
   }
 #endif  // CERES_NO_CUSTOM_BLAS
@@ -323,7 +475,7 @@ inline void MatrixVectorMultiply(const double* A,
 //
 // c op A' * b;
 template<int kRowA, int kColA, int kOperation>
-inline void MatrixTransposeVectorMultiply(const double* A,
+CERES_SMALL_BLAS_FORCE_INLINE void MatrixTransposeVectorMultiply(const double* A,
                                           const int num_row_a,
                                           const int num_col_a,
                                           const double* b,
@@ -353,20 +505,55 @@ inline void MatrixTransposeVectorMultiply(const double* A,
   const int NUM_ROW_A = (kRowA != Eigen::Dynamic ? kRowA : num_row_a);
   const int NUM_COL_A = (kColA != Eigen::Dynamic ? kColA : num_col_a);
 
+  // Caller contract: A, b, c never alias.
+  const double* __restrict A_r = A;
+  const double* __restrict b_r = b;
+  double* __restrict c_r = c;
+
+#if CERES_SMALL_BLAS_AXPY
+  // AXPY form: outer over k (rows of A), inner over j (cols of A,
+  // also length of c).  Inner loop reads A row k at unit stride and
+  // writes c at unit stride; bk = b[k] is broadcast.  Vectorises into
+  // a tight vfmadd / vfnmadd loop.  The previous form read a column
+  // of A at stride NUM_COL_A doubles, defeating SIMD.
+  if (kOperation == 0) {
+    for (int j = 0; j < NUM_COL_A; ++j) {
+      c_r[j] = 0.0;
+    }
+  }
+
+  for (int k = 0; k < NUM_ROW_A; ++k) {
+    const double bk = b_r[k];
+    const double* __restrict A_k = A_r + k * NUM_COL_A;  // row k of A
+    if (kOperation >= 0) {
+      for (int j = 0; j < NUM_COL_A; ++j) {
+        c_r[j] += A_k[j] * bk;
+      }
+    } else {
+      for (int j = 0; j < NUM_COL_A; ++j) {
+        c_r[j] -= A_k[j] * bk;
+      }
+    }
+  }
+#else
+  // Legacy dot-product form (bit-identical to upstream Ceres):
+  // outer over output entries, inner reduction with strided A reads.
   for (int row = 0; row < NUM_COL_A; ++row) {
+    const double* __restrict A_col = A_r + row;
     double tmp = 0.0;
     for (int col = 0; col < NUM_ROW_A; ++col) {
-      tmp += A[col * NUM_COL_A + row] * b[col];
+      tmp += A_col[col * NUM_COL_A] * b_r[col];
     }
 
     if (kOperation > 0) {
-      c[row] += tmp;
+      c_r[row] += tmp;
     } else if (kOperation < 0) {
-      c[row] -= tmp;
+      c_r[row] -= tmp;
     } else {
-      c[row] = tmp;
+      c_r[row] = tmp;
     }
   }
+#endif  // CERES_SMALL_BLAS_AXPY
 #endif  // CERES_NO_CUSTOM_BLAS
 }
 
@@ -374,6 +561,109 @@ inline void MatrixTransposeVectorMultiply(const double* A,
 #undef CERES_GEMM_EIGEN_HEADER
 #undef CERES_GEMM_NAIVE_HEADER
 #undef CERES_CALL_GEMM
+
+// Symmetric self-multiply: C op A' * A.
+//
+// The result is symmetric (NUM_COL_A x NUM_COL_A).  Computes the
+// upper triangle only (i <= j) and mirrors to the lower triangle,
+// halving the FLOP count compared with a general MTMM call.
+//
+// Correctness contract for kOperation == 1 (+=) and -1 (-=): the
+// caller guarantees that the destination sub-block of C is already
+// symmetric.  All Schur eliminator diagonal-block accumulators
+// satisfy this -- they are zero-initialised by lhs->SetZero() (or
+// start as a diagonal D*D matrix) and only ever receive symmetric
+// updates, so symmetry is preserved across calls.
+//
+// Falls back to a general MatrixTransposeMatrixMultiply call when the
+// AXPY family of optimisations is disabled, so the bit-identical
+// legacy build path stays untouched.
+template<int kRowA, int kColA, int kOperation>
+CERES_SMALL_BLAS_FORCE_INLINE void MatrixTransposeMatrixMultiplySelf(
+    const double* A,
+    const int num_row_a,
+    const int num_col_a,
+    double* C,
+    const int start_row_c,
+    const int start_col_c,
+    const int row_stride_c,
+    const int col_stride_c) {
+#if !CERES_SMALL_BLAS_AXPY
+  // Bit-identical fallback: dispatch to the legacy MTMM with B == A.
+  MatrixTransposeMatrixMultiply<kRowA, kColA, kRowA, kColA, kOperation>(
+      A, num_row_a, num_col_a,
+      A, num_row_a, num_col_a,
+      C, start_row_c, start_col_c, row_stride_c, col_stride_c);
+#else
+  DCHECK_GT(num_row_a, 0);
+  DCHECK_GT(num_col_a, 0);
+  DCHECK_GE(start_row_c, 0);
+  DCHECK_GE(start_col_c, 0);
+  DCHECK_GT(row_stride_c, 0);
+  DCHECK_GT(col_stride_c, 0);
+  DCHECK((kRowA == Eigen::Dynamic) || (kRowA == num_row_a));
+  DCHECK((kColA == Eigen::Dynamic) || (kColA == num_col_a));
+
+  const int NUM_ROW_A = (kRowA != Eigen::Dynamic ? kRowA : num_row_a);
+  const int NUM_COL_A = (kColA != Eigen::Dynamic ? kColA : num_col_a);
+  const int N = NUM_COL_A;
+
+  DCHECK_LE(start_row_c + N, row_stride_c);
+  DCHECK_LE(start_col_c + N, col_stride_c);
+
+  const double* __restrict A_r = A;
+  double* __restrict C_r = C;
+
+  // Step 1: optionally zero the upper triangle (only for kOperation==0).
+  if (kOperation == 0) {
+    for (int i = 0; i < N; ++i) {
+      double* __restrict C_row =
+          C_r + (start_row_c + i) * col_stride_c + start_col_c;
+      for (int j = i; j < N; ++j) {
+        C_row[j] = 0.0;
+      }
+    }
+  }
+
+  // Step 2: AXPY accumulation over k.  For each row k of A, broadcast
+  // a_ki = A[k,i] and update the upper triangle of row i:
+  //   C[i,j] += a_ki * A[k,j]   for j >= i
+  // The inner j-loop reads A[k,j..] and writes C_row[j..] at unit
+  // stride; both vectorise into vfmadd231pd / vfnmadd231pd packs.
+  for (int k = 0; k < NUM_ROW_A; ++k) {
+    const double* __restrict A_k = A_r + k * NUM_COL_A;  // row k of A
+    for (int i = 0; i < N; ++i) {
+      const double a_ki = A_k[i];
+      double* __restrict C_row =
+          C_r + (start_row_c + i) * col_stride_c + start_col_c;
+      if (kOperation >= 0) {
+        for (int j = i; j < N; ++j) {
+          C_row[j] += a_ki * A_k[j];
+        }
+      } else {
+        for (int j = i; j < N; ++j) {
+          C_row[j] -= a_ki * A_k[j];
+        }
+      }
+    }
+  }
+
+  // Step 3: mirror upper triangle into lower triangle.  After the
+  // accumulation above the upper triangle (j >= i) holds the correct
+  // C[i,j].  Because the input C was symmetric and A'A is symmetric,
+  // the lower triangle's correct value equals the upper's value at
+  // the transposed index.
+  for (int i = 0; i < N; ++i) {
+    const int upper_row_base =
+        (start_row_c + i) * col_stride_c + start_col_c;
+    for (int j = i + 1; j < N; ++j) {
+      const int lower_idx =
+          (start_row_c + j) * col_stride_c + start_col_c + i;
+      C_r[lower_idx] = C_r[upper_row_base + j];
+    }
+  }
+#endif  // CERES_SMALL_BLAS_AXPY
+}
 
 }  // namespace internal
 }  // namespace ceres

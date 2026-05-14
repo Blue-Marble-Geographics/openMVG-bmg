@@ -148,9 +148,18 @@ struct IntrinsicBase : public Clonable<IntrinsicBase>
   */
   virtual Mat3X operator () ( const Mat2X& p ) const = 0;
 
-  virtual void allBearings( Mat3X& result, const Mat2X& points ) const = 0;
-
-  virtual Vec3 oneBearing( const Vec2& p ) const = 0;
+  /**
+  * @brief Scalar bearing fast path. Equivalent to `(*this)(Mat2X(x)).col(0)`
+  * but avoids dynamic matrix allocation. Hot path for AngleBetweenRay,
+  * cheirality tests, and RANSAC inner loops. Default delegates to the
+  * Mat2X overload; subclasses that can do better should override.
+  */
+  virtual Vec3 oneBearing( const Vec2 & x ) const
+  {
+    Mat2X m( 2, 1 );
+    m.col( 0 ) = x;
+    return ( *this )( m ).col( 0 );
+  }
 
   /**
   * @brief Transform a point from the camera plane to the image plane

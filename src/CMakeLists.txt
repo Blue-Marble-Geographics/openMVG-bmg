@@ -137,7 +137,11 @@ include(CXX11)
 check_for_cxx11_compiler(CXX11_COMPILER)
 # If a C++11 compiler is available, then set the appropriate flags
 if (CXX11_COMPILER)
-  set(CMAKE_CXX_STANDARD 11)
+  # C++17 is required (ankerl::unordered_dense used as the Observations
+  # backing store needs C++17 or higher). MSVC gates the feature off _MSVC_LANG
+  # which only advances when /std:c++17 (or later) is passed, so we bump the
+  # CMAKE_CXX_STANDARD globally rather than per-target.
+  set(CMAKE_CXX_STANDARD 17)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   set(CMAKE_CXX_EXTENSIONS OFF)
 else (CXX11_COMPILER)

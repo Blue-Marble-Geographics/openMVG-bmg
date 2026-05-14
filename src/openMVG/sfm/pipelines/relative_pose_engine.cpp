@@ -103,7 +103,7 @@ bool Relative_Pose_Engine::Relative_Pose_Engine::Process(
       // Select common bearing vectors
       if (match_pairs.size() > 1)
       {
-        OPENMVG_LOG_ERROR << "Compute relative pose between more than two view (rigid camera rigs) is not supported ";
+        OPENMVG_LOG_ERROR << "Compute relative pose between more than two view (rigid camera rigs) is not supported ";        continue;
         continue;
       }
 
@@ -176,12 +176,13 @@ bool Relative_Pose_Engine::Relative_Pose_Engine::Process(
             triangulation_method_
           ))
           {
-            Landmark& landmark = landmarks[k];
+            Observations obs;
             const Vec2 obs_I = features_provider_->feats_per_view.at(I)[matches[k].i_].coords().cast<double>();
             const Vec2 obs_J = features_provider_->feats_per_view.at(J)[matches[k].j_].coords().cast<double>();
-            landmark.obs[view_I->id_view] = Observation(obs_I, matches[k].i_);
-            landmark.obs[view_J->id_view] = Observation(obs_J, matches[k].j_);
-            landmark.X = X;
+            obs[view_I->id_view] = {obs_I, matches[k].i_};
+            obs[view_J->id_view] = {obs_J, matches[k].j_};
+            landmarks[k].obs = obs;
+            landmarks[k].X = X;
           }
         }
         // - refine only Structure and Rotations & translations (keep intrinsic constant)

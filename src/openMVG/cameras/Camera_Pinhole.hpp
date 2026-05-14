@@ -135,30 +135,15 @@ class Pinhole_Intrinsic : public IntrinsicBase
     */
     Mat3X operator () ( const Mat2X& points ) const override
     {
-      Mat3X tmp;
-      tmp.resize(3, points.cols());
-      int h = 0;
-      for (const auto &i : points.colwise())
-      {
-        tmp.col(h++) = Pinhole_Intrinsic::oneBearing( i );
-      }
-
-      return tmp;
+      return (Kinv_ * points.colwise().homogeneous()).colwise().normalized();
     }
 
-    void allBearings( Mat3X& result, const Mat2X& points ) const override
+    /**
+    * @brief Scalar bearing fast path (avoids Mat2X/Mat3X allocation).
+    */
+    Vec3 oneBearing( const Vec2 & x ) const override
     {
-      result.resize( 3, points.cols() );
-      int h = 0;
-      for (const auto& i : points.colwise())
-      {
-        result.col( h++ ) = Pinhole_Intrinsic::oneBearing( i );
-      }
-    }
-
-    Vec3 oneBearing( const Vec2& p ) const override
-    {
-      return (Kinv_ * p.homogeneous()).normalized();
+      return ( Kinv_ * x.homogeneous() ).normalized();
     }
 
     /**

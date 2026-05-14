@@ -8,7 +8,7 @@
 #define BINARY_FEATURES              (1)
 
 /* Potentially faster, but will reorder generated keypoints and make debugging more difficult. */
-#define PARALLEL_KEYPOINT_GENERATION (1)
+#define PARALLEL_KEYPOINT_GENERATION (0) // Do not enable.  Nested OpenMP
 
 #define FAST_SIFT_DETECT             (1) /* Default behavior.  No error loss. */
 #define FAST_SIFT_GRADIENT_UPDATE    (1) /* Faster, adds insignificant error. */
@@ -98,10 +98,10 @@
 #define _AsArrayI(name, i) (name.m128i_i32[i])
 #define _AsArrayS(name, i) (name.m128i_i16[i])
 
-#ifdef __SSE4_1__
+// Legal to include, must be used conditionally.
+//#ifdef __SSE4_1__
 #include <smmintrin.h>
-#define _Floor _mm_floor_ps
-#endif
+//#endif
 
 #ifdef __SSE4_2__
 #include <nmmintrin.h>
@@ -420,12 +420,112 @@ static __forceinline _Data Mod2PILimited(_Data x)
 
 static __forceinline _Data FastAbs(_Data x)
 {
-  _Data vResult         = _Set(0.f);
-  vResult               = _Sub(vResult, x);
-
-  return _Max(vResult, x);
+  return _And(x, _CastFI(_SetI(0x7FFFFFFF)));
 }
 
+#if 1
+static __forceinline _Data GradCalc2(_Data y, _Data x)
+{
+  /* Fast vl_mod_2pi_f(vl_fast_atan2_f(y, x) + 2*PI), returns [0, 2*PI) */
+  _Data const vC3 = _Set(0.1821f);
+  _Data const vC1 = _Set(0.9675f);
+  _Data const vHighBit = _CastFI(_SetI(0x80000000));
+  _Data const vAbsMask = _CastFI(_SetI(0x7FFFFFFF));
+  _Data const vTwoPI = _Set((float)(2. * VL_PI));
+  _Data const vEps = _Set(1.19209290E-07F);
+
+  /* |y| + epsilon (avoids division by zero) */
+  _Data const vAbsY = _Add(_And(y, vAbsMask), vEps);
+
+  /* sign(x) as a bitmask: 0x80000000 if negative, 0 if positive */
+  _Data const vXsign = _And(x, vHighBit);
+
+  /* abs(x) */
+  _Data const vAbsX = _And(x, vAbsMask);
+
+  /* r = (x - sign(x)*|y|) / (|y| + |x|)
+   *   = (x >= 0) ? (x - |y|)/(|y| + x)  : (x + |y|)/(|y| - x) */
+  _Data const vNum = _Sub(x, _Or(vAbsY, vXsign));
+  _Data const vDen = _Add(vAbsY, vAbsX);
+
+  /* Fast reciprocal + Newton refinement (replaces _Div: ~5 cycles vs ~13) */
+#ifdef __AVX2__
+  _Data const vRcp = _mm256_rcp_ps(vDen);
+#else
+  _Data const vRcp = _mm_rcp_ps(vDen);
+#endif
+  _Data const vRcpRef = _Mul(vRcp, _Sub(_Set(2.0f), _Mul(vDen, vRcp)));
+  _Data const vR = _Mul(vNum, vRcpRef);
+
+  /* angle = (x >= 0) ? pi/4 : 3*pi/4, then polynomial correction */
+  _Data const vBase = _Blend(
+    _Set((float)(3. * VL_PI / 4.)),
+    _Set((float)(VL_PI / 4.)),
+    _CmpGE(x, _Set(0.f))
+  );
+  _Data const vRR = _Mul(vR, vR);
+  _Data const vAngle = _Add(vBase, _Mul(_Sub(_Mul(vC3, vRR), vC1), vR));
+
+  /* Apply sign of y */
+  _Data const vAtan2 = _Xor(vAngle, _And(y, vHighBit));
+
+  /* atan2 is in [-pi, +pi]. Add 2*pi to get [pi, 3*pi].
+   * Subtract 2*pi when >= 2*pi to get [0, 2*pi). */
+  _Data const vShifted = _Add(vAtan2, vTwoPI);
+  return _Sub(vShifted, _And(_CmpGE(vShifted, vTwoPI), vTwoPI));
+}
+
+static __forceinline _Data GradCalc2Offset(_Data y, _Data x, _Data vOffset)
+{
+  /* Computes vl_mod_2pi_f(atan2(y, x) + offset + 2*PI), returns [0, 2*PI)
+   * Equivalent to GradCalc2 but with an angular offset folded in.
+   * Use offset = -angle0 to replace rotation + GradCalc2. */
+  _Data const vC3 = _Set(0.1821f);
+  _Data const vC1 = _Set(0.9675f);
+  _Data const vHighBit = _CastFI(_SetI(0x80000000));
+  _Data const vAbsMask = _CastFI(_SetI(0x7FFFFFFF));
+  _Data const vTwoPI = _Set((float)(2. * VL_PI));
+  _Data const vEps = _Set(1.19209290E-07F);
+
+  /* |y| + epsilon */
+  _Data const vAbsY = _Add(_And(y, vAbsMask), vEps);
+
+  /* sign(x) and |x| */
+  _Data const vXsign = _And(x, vHighBit);
+  _Data const vAbsX = _And(x, vAbsMask);
+
+  /* r = (x - sign(x)*|y|) / (|y| + |x|) */
+  _Data const vNum = _Sub(x, _Or(vAbsY, vXsign));
+  _Data const vDen = _Add(vAbsY, vAbsX);
+
+  /* Fast reciprocal + Newton refinement */
+  _Data const vRcp = _mm_rcp_ps(vDen);
+  _Data const vRcpRef = _Mul(vRcp, _Sub(_Set(2.0f), _Mul(vDen, vRcp)));
+  _Data const vR = _Mul(vNum, vRcpRef);
+
+  /* angle = base + polynomial correction */
+  _Data const vBase = _Blend(
+    _Set((float)(3. * VL_PI / 4.)),
+    _Set((float)(VL_PI / 4.)),
+    _CmpGE(x, _Set(0.f))
+  );
+  _Data const vRR = _Mul(vR, vR);
+  _Data const vAngle = _Add(vBase, _Mul(_Sub(_Mul(vC3, vRR), vC1), vR));
+
+  /* Apply sign of y to get atan2 in [-pi, +pi] */
+  _Data const vAtan2 = _Xor(vAngle, _And(y, vHighBit));
+
+  /* Add offset (e.g. -angle0) and shift to [0, 2pi).
+   * atan2 + offset is in [-2pi, +pi]. Adding 2*pi gives [0, 3*pi].
+   * May need to subtract 2*pi (>= 2pi) or add 2*pi (< 0). */
+  _Data const vShifted = _Add(_Add(vAtan2, vOffset), vTwoPI);
+  _Data const vOver = _And(_CmpGE(vShifted, vTwoPI), vTwoPI);
+  _Data const vResult = _Sub(vShifted, vOver);
+  /* Handle case where offset pushes below zero after first correction */
+  _Data const vUnder = _And(_CmpLT(vResult, _Set(0.f)), vTwoPI);
+  return _Add(vResult, vUnder);
+}
+#else
 static __forceinline _Data GradCalc2(_Data y, _Data x)
 {
   /* An SSE2-comparable variant of vl_mod_2pi_f(vl_fast_atan2_f (gy, gx) + 2*VL_PI) */
@@ -451,6 +551,7 @@ static __forceinline _Data GradCalc2(_Data y, _Data x)
 
   return Mod2PILimited(_Add(atan2, vTwoPI));
 }
+#endif
 
 static __forceinline float Mod2PILimitedS(float x)
 {

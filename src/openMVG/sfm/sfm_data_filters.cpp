@@ -8,1006 +8,1207 @@
 
 #include "openMVG/sfm/sfm_data_filters.hpp"
 #include "openMVG/sfm/sfm_data.hpp"
+#include "openMVG/sfm/sfm_view_priors.hpp"
 #include "openMVG/stl/stl.hpp"
 #include "openMVG/system/logger.hpp"
 #include "openMVG/tracks/union_find.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <utility>
+#include <vector>
 
 namespace openMVG {
-  namespace sfm {
+namespace sfm {
 
-    /// List the view indexes that have valid camera intrinsic and pose.
-    std::set<IndexT> Get_Valid_Views
-    (
-      const SfM_Data& sfm_data
-    )
+/// List the view indexes that have valid camera intrinsic and pose.
+std::set<IndexT> Get_Valid_Views
+(
+  const SfM_Data & sfm_data
+)
+{
+  std::set<IndexT> valid_idx;
+  for (const auto & view_it : sfm_data.GetViews())
+  {
+    const View * v = view_it.second.get();
+    if (sfm_data.IsPoseAndIntrinsicDefined(v))
     {
-      std::set<IndexT> valid_idx;
-      for (const auto& view_it : sfm_data.GetViews())
-      {
-        const View* v = view_it.second.get();
-        if (sfm_data.IsPoseAndIntrinsicDefined(v))
-        {
-          valid_idx.insert(v->id_view);
-        }
-      }
-      return valid_idx;
+      valid_idx.insert(v->id_view);
+    }
+  }
+  return valid_idx;
+}
+
+// Legacy API: pixel-only filter. Implemented as a thin wrapper around the
+// fused RemoveOutliers_PixelAndAngleError with a degenerate angle threshold
+// (any non-negative angle survives) so callers in the v1 sequential, global,
+// and stellar engines keep working without maintaining a duplicate code path.
+IndexT RemoveOutliers_PixelResidualError
+(
+  SfM_Data & sfm_data,
+  const double dThresholdPixel,
+  const unsigned int minTrackLength
+)
+{
+  IndexT removed_by_angle = 0;
+  IndexT removed_by_pixel = 0;
+  RemoveOutliers_PixelAndAngleError(
+    sfm_data,
+    dThresholdPixel,
+    /*dMinAcceptedAngle=*/0.0, // disable angle test
+    minTrackLength,
+    &removed_by_angle,
+    &removed_by_pixel);
+  // Original return semantics: number of removed observations (pixel pass).
+  return removed_by_pixel;
+}
+
+// Legacy API: angle-only filter. Implemented as a thin wrapper around the
+// fused RemoveOutliers_PixelAndAngleError with a degenerate pixel threshold
+// (squared-norm comparison vs +infinity is never true).
+IndexT RemoveOutliers_AngleError
+(
+  SfM_Data & sfm_data,
+  const double dMinAcceptedAngle
+)
+{
+  IndexT removed_by_angle = 0;
+  IndexT removed_by_pixel = 0;
+  RemoveOutliers_PixelAndAngleError(
+    sfm_data,
+    /*dThresholdPixel=*/std::numeric_limits<double>::infinity(),
+    dMinAcceptedAngle,
+    /*minTrackLength=*/0, // legacy AngleError has no track-length prune
+    &removed_by_angle,
+    &removed_by_pixel);
+  // Original return semantics: number of removed tracks (angle pass).
+  return removed_by_angle;
+}
+
+// Fused pass: angle filter (track-level) + pixel residual filter (obs-level).
+// Built to be semantically equivalent to:
+//   RemoveOutliers_AngleError(...);
+//   RemoveOutliers_PixelResidualError(...);
+// but with a single per-view cache build and a single sfm_data.structure
+// traversal. The angle decision is taken on the *original* obs set (matching
+// the legacy ordering); pixel pruning runs only on tracks that survived.
+IndexT RemoveOutliers_PixelAndAngleError
+(
+  SfM_Data & sfm_data,
+  const double dThresholdPixel,
+  const double dMinAcceptedAngle,
+  const unsigned int minTrackLength,
+  IndexT * out_removed_by_angle,
+  IndexT * out_removed_by_pixel
+)
+{
+  const double dThresholdPixelSq = dThresholdPixel * dThresholdPixel;
+
+  // Shared per-view cache. Store a vector indexed by view_id when ids are
+  // dense (typical OpenMVG case: ids are [0..N)), so per-obs lookup is a
+  // single bounds check + array index instead of a hash probe. Fall back
+  // to the Hash_Map path for sparse id ranges. The angle pass calls back
+  // into this cache twice per (obs1, obs2) pair, so the win is real.
+  struct ViewCache {
+    geometry::Pose3 pose;
+    const cameras::IntrinsicBase * intrinsic = nullptr; // nullptr == invalid
+  };
+
+  IndexT max_view_id = 0;
+  bool any_view = false;
+  for (const auto & view_it : sfm_data.views)
+  {
+    if (view_it.first > max_view_id) max_view_id = view_it.first;
+    any_view = true;
+  }
+  const bool use_flat =
+    any_view &&
+    max_view_id != UndefinedIndexT &&
+    static_cast<size_t>(max_view_id) < sfm_data.views.size() * 8 + 64;
+
+  std::vector<ViewCache> view_cache_flat;
+  Hash_Map<IndexT, ViewCache> view_cache_hash;
+  if (use_flat)
+  {
+    view_cache_flat.assign(static_cast<size_t>(max_view_id) + 1, ViewCache{});
+  }
+  else
+  {
+    view_cache_hash.reserve(sfm_data.views.size());
+  }
+
+  for (const auto & view_it : sfm_data.views)
+  {
+    const View * v = view_it.second.get();
+    if (!v || v->id_intrinsic == UndefinedIndexT || v->id_pose == UndefinedIndexT)
+      continue;
+    const auto pose_it = sfm_data.poses.find(v->id_pose);
+    if (pose_it == sfm_data.poses.end()) continue;
+    const auto intr_it = sfm_data.intrinsics.find(v->id_intrinsic);
+    if (intr_it == sfm_data.intrinsics.end()) continue;
+    if (use_flat)
+      view_cache_flat[view_it.first] = { pose_it->second, intr_it->second.get() };
+    else
+      view_cache_hash[view_it.first] = { pose_it->second, intr_it->second.get() };
+  }
+
+  // O(1) lookup. Returns nullptr if the view has no valid (pose,intrinsic).
+  auto get_cache = [&](IndexT view_id) -> const ViewCache * {
+    if (use_flat)
+    {
+      if (view_id > max_view_id) return nullptr;
+      const ViewCache & vc = view_cache_flat[view_id];
+      return vc.intrinsic ? &vc : nullptr;
+    }
+    const auto it = view_cache_hash.find(view_id);
+    return (it != view_cache_hash.end()) ? &it->second : nullptr;
+  };
+
+  IndexT removed_tracks_by_angle = 0;
+  IndexT removed_obs_by_pixel = 0;
+  // Reused per-track scratch for the angle pass: avoid reallocating each
+  // iteration over millions of landmarks. Each entry stores a precomputed
+  // world-space *unit* ray; pair angle then collapses to a single dot
+  // product (cosine domain comparison, no acos in the inner loop).
+  struct RayEntry { Vec3 ray; };
+  std::vector<RayEntry> ray_entries;
+  // Convert the angle threshold to cosine-domain once. cos is monotone
+  // decreasing on [0, pi], so "angle_deg >= threshold_deg" becomes
+  // "dot <= cos_threshold" for unit rays. dMinAcceptedAngle is in degrees.
+  // Clamp the dot range to [-1+eps, 1-eps] like AngleBetweenRay does.
+  const double cos_threshold = std::cos(D2R(dMinAcceptedAngle));
+  Landmarks::iterator iterTracks = sfm_data.structure.begin();
+  while (iterTracks != sfm_data.structure.end())
+  {
+    Observations & obs = iterTracks->second.obs;
+
+    // ---- Angle pass (track-level) -------------------------------------
+    // Three key wins vs. the legacy nested loop:
+    //   1) Undistort each obs's pixel ONCE up front (the inner loop used to
+    //      recompute get_ud_pixel(obs2.x) for every (obs1, obs2) pair, i.e.
+    //      O(K^2) undistortion calls per track; for Brown/Radial/Fisheye
+    //      intrinsics that's an iterative root-find each time).
+    //   2) Precompute the K world-space rays ONCE per track. The legacy
+    //      AngleBetweenRay regenerates BOTH rays per pair (K(K-1) ray ops
+    //      total) even though each ray only depends on a single obs. We do
+    //      K ray ops total + cheap dot products in the inner loop.
+    //   3) Compare in cosine domain. acos is the most expensive op in
+    //      AngleBetweenRay; we skip it entirely by precomputing
+    //      cos(threshold). "angle >= threshold" â‡” "dot <= cos_threshold"
+    //      since cos is monotone decreasing on [0, pi].
+    //   Plus: early-exit as soon as ANY pair meets the threshold. The
+    //   track is kept iff max_angle >= dMinAcceptedAngle (== min_dot
+    //   <= cos_threshold). For well-conditioned scenes most tracks pass
+    //   within the first few pairs, turning the worst-case O(K^2) into
+    //   typical O(K).
+    ray_entries.clear();
+    ray_entries.reserve(obs.size());
+    for (const auto & ob : obs)
+    {
+      const ViewCache * vc = get_cache(ob.first);
+      if (!vc) continue;
+      const Vec2 ud = vc->intrinsic->get_ud_pixel(ob.second.x);
+      // ray in world space: R^T * bearing(ud), normalized. AngleBetweenRay
+      // internally does the same; we hoist it so each obs pays once.
+      ray_entries.push_back({
+        (vc->pose.rotation().transpose() * vc->intrinsic->oneBearing(ud)).normalized()
+      });
     }
 
-#if 1 // original
-    IndexT RemoveOutliers_PixelResidualError
-    (
-      SfM_Data& sfm_data,
-      const double dThresholdPixel,
-      const unsigned int minTrackLength
-    )
+    bool angle_ok = false;
     {
-      // Precompute squared threshold to avoid sqrt per residual
-      const double dThresholdPixelSq = dThresholdPixel * dThresholdPixel;
-
-      // Build a per-view cache of pose + intrinsic (small, ~186 entries)
-      struct ViewCache {
-        geometry::Pose3 pose;
-        const cameras::IntrinsicBase* intrinsic;
-      };
-      Hash_Map<IndexT, ViewCache> view_cache;
-      view_cache.reserve(sfm_data.views.size());
-      for (const auto& view_it : sfm_data.views)
+      const std::size_t n = ray_entries.size();
+      // Track the min observed dot (== max observed angle) across all
+      // pairs we got to before any early-exit. Used to preserve the
+      // legacy "n <= 1 with dMinAcceptedAngle == 0" keep-track behavior.
+      double min_dot = 1.0; // cos(0) -- no pair has been seen yet.
+      for (std::size_t i = 0; i < n && !angle_ok; ++i)
       {
-        const View* v = view_it.second.get();
-        if (v->id_intrinsic == UndefinedIndexT || v->id_pose == UndefinedIndexT)
-          continue;
-        const auto pose_it = sfm_data.poses.find(v->id_pose);
-        if (pose_it == sfm_data.poses.end())
-          continue;
-        const auto intrinsic_it = sfm_data.intrinsics.find(v->id_intrinsic);
-        if (intrinsic_it == sfm_data.intrinsics.end())
-          continue;
-        view_cache[view_it.first] = {
-          pose_it->second,
-          intrinsic_it->second.get()
-        };
-      }
-
-      IndexT outlier_count = 0;
-      Landmarks::iterator iterTracks = sfm_data.structure.begin();
-      while (iterTracks != sfm_data.structure.end())
-      {
-        Observations& obs = iterTracks->second.obs;
-        Observations::iterator itObs = obs.begin();
-        const Vec3& X = iterTracks->second.X;
-        while (itObs != obs.end())
+        const Vec3 & ra = ray_entries[i].ray;
+        for (std::size_t j = i + 1; j < n; ++j)
         {
-          const auto cache_it = view_cache.find(itObs->first);
-          if (cache_it != view_cache.end())
+          const double dot = ra.dot(ray_entries[j].ray);
+          if (dot <= cos_threshold)
           {
-            const Vec2 residual = cache_it->second.intrinsic->residual(
-              cache_it->second.pose(X), itObs->second.x);
-            if (residual.squaredNorm() > dThresholdPixelSq)
-            {
-              ++outlier_count;
-              itObs = obs.erase(itObs);
-              continue;
-            }
+            angle_ok = true;
+            break;
           }
-          ++itObs;
+          if (dot < min_dot) min_dot = dot;
         }
-        if (obs.empty() || obs.size() < minTrackLength)
-          iterTracks = sfm_data.structure.erase(iterTracks);
-        else
-          ++iterTracks;
       }
-      return outlier_count;
+      // Mirror the legacy "if max_angle >= dMinAcceptedAngle keep" check
+      // in cosine domain. Real purpose: when dMinAcceptedAngle == 0
+      // (legacy pixel-only wrapper, cos_threshold == 1.0) AND n <= 1
+      // (no pair was checked, min_dot stays 1.0), this keeps the track.
+      // For dMinAcceptedAngle > 0, cos_threshold < 1.0 < min_dot=1.0, so
+      // the test fails as it should -- a track with no valid pair has
+      // no parallax and is removed.
+      if (!angle_ok && min_dot <= cos_threshold)
+        angle_ok = true;
     }
-#else
-
-    // Remove tracks that have a small angle (tracks with tiny angle leads to instable 3D points)
-    // Return the number of removed tracks
-    IndexT RemoveOutliers_PixelResidualError
-    (
-      SfM_Data& sfm_data,
-      const double dThresholdPixel,
-      const unsigned int minTrackLength
-    )
+    if (!angle_ok)
     {
-      // Precompute squared threshold to avoid sqrt per residual
-      const double dThresholdPixelSq = dThresholdPixel * dThresholdPixel;
-
-      // Build a per-view cache of pose + intrinsic (small, ~186 entries)
-      struct ViewCache {
-        geometry::Pose3 pose;
-        const cameras::IntrinsicBase* intrinsic;
-      };
-      Hash_Map<IndexT, ViewCache> view_cache;
-      view_cache.reserve(sfm_data.views.size());
-      for (const auto& view_it : sfm_data.views)
-      {
-        const View* v = view_it.second.get();
-        if (v->id_intrinsic == UndefinedIndexT || v->id_pose == UndefinedIndexT)
-          continue;
-        const auto pose_it = sfm_data.poses.find(v->id_pose);
-        if (pose_it == sfm_data.poses.end())
-          continue;
-        const auto intrinsic_it = sfm_data.intrinsics.find(v->id_intrinsic);
-        if (intrinsic_it == sfm_data.intrinsics.end())
-          continue;
-        view_cache[view_it.first] = {
-          pose_it->second,
-          intrinsic_it->second.get()
-        };
-      }
-
-      // Collect iterators for parallel random-access
-      std::vector<Landmarks::iterator> workItems;
-      workItems.reserve(sfm_data.structure.size());
-      for (auto it = sfm_data.structure.begin(); it != sfm_data.structure.end(); ++it)
-      {
-        workItems.push_back(it);
-      }
-
-      // Per-landmark result: count of outliers removed, and whether to erase the landmark
-      struct LandmarkResult {
-        IndexT outliers_removed;
-        bool erase_landmark;
-      };
-      std::vector<LandmarkResult> results(workItems.size());
-
-#ifdef OPENMVG_USE_OPENMP
-#pragma omp parallel for schedule(static, 128)
-#endif
-      for (int i = 0; i < static_cast<int>(workItems.size()); ++i)
-      {
-        auto& tracks_it = *workItems[i];
-        Observations& obs = tracks_it.second.obs;
-        const Vec3& X = tracks_it.second.X;
-        IndexT local_outliers = 0;
-
-        Observations::iterator itObs = obs.begin();
-        while (itObs != obs.end())
-        {
-          const auto cache_it = view_cache.find(itObs->first);
-          if (cache_it != view_cache.end())
-          {
-            const Vec2 residual = cache_it->second.intrinsic->residual(
-              cache_it->second.pose(X), itObs->second.x);
-            if (residual.squaredNorm() > dThresholdPixelSq)
-            {
-              ++local_outliers;
-              itObs = obs.erase(itObs);
-              continue;
-            }
-          }
-          ++itObs;
-        }
-
-        results[i].outliers_removed = local_outliers;
-        results[i].erase_landmark = (obs.empty() || obs.size() < minTrackLength);
-      }
-
-      // Sequential accumulation and erasure
-      IndexT outlier_count = 0;
-      for (int i = static_cast<int>(workItems.size()) - 1; i >= 0; --i)
-      {
-        outlier_count += results[i].outliers_removed;
-        if (results[i].erase_landmark)
-          sfm_data.structure.erase(workItems[i]);
-      }
-      return outlier_count;
-    }
-#endif
-
-#if 1 // original
-    IndexT RemoveOutliers_AngleError
-    (
-      SfM_Data& sfm_data,
-      const double dMinAcceptedAngle
-    )
-    {
-      IndexT removedTrack_count = 0;
-
-      // Precompute the cosine squared threshold
-      // angle >= threshold  <=>  cos(angle) <= cos(threshold)
-      // For unit-free rays: dot(a,b)/(|a|*|b|) <= cos(threshold)
-      // Squared (avoiding sqrt): dot^2 >= |a|^2*|b|^2*cos^2(threshold) means angle < threshold (reject)
-      // So a track is convergent when we find a pair where:
-      //   dot < 0  (angle > 90°, always convergent), OR
-      //   dot^2 < |a|^2 * |b|^2 * cos^2(threshold)  (angle > threshold)
-      const double cosThreshold = cos(D2R(dMinAcceptedAngle));
-      const double cos2Threshold = cosThreshold * cosThreshold;
-
-      // Build a per-view cache of R^T + intrinsic (small, ~186 entries)
-      struct ViewCache {
-        Mat3 Rt;  // rotation transposed
-        const cameras::IntrinsicBase* intrinsic;
-      };
-      Hash_Map<IndexT, ViewCache> view_cache;
-      view_cache.reserve(sfm_data.views.size());
-      for (const auto& view_it : sfm_data.views)
-      {
-        const View* v = view_it.second.get();
-        if (v->id_intrinsic == UndefinedIndexT || v->id_pose == UndefinedIndexT)
-          continue;
-        const auto pose_it = sfm_data.poses.find(v->id_pose);
-        if (pose_it == sfm_data.poses.end())
-          continue;
-        const auto intrinsic_it = sfm_data.intrinsics.find(v->id_intrinsic);
-        if (intrinsic_it == sfm_data.intrinsics.end())
-          continue;
-        view_cache[view_it.first] = {
-          pose_it->second.rotation().transpose(),
-          intrinsic_it->second.get()
-        };
-      }
-
-      // Per-track ray storage (unnormalized) + precomputed squared norms
-      std::vector<Vec3> rays;
-      std::vector<double> sqNorms;
-
-      Landmarks::iterator iterTracks = sfm_data.structure.begin();
-      while (iterTracks != sfm_data.structure.end())
-      {
-        Observations& obs = iterTracks->second.obs;
-        bool convergent = false;
-
-        rays.clear();
-        sqNorms.clear();
-        rays.reserve(obs.size());
-        sqNorms.reserve(obs.size());
-        for (const auto& obs_it : obs)
-        {
-          const auto cache_it = view_cache.find(obs_it.first);
-          if (cache_it != view_cache.end())
-          {
-            const auto& vc = cache_it->second;
-            const Vec2 cam_pt = vc.intrinsic->ima2cam(obs_it.second.x);
-            const Vec2 undist_pt = vc.intrinsic->remove_disto(cam_pt);
-            // ray = R^T * [undist_x, undist_y, 1]^T  (unnormalized)
-            rays.emplace_back(vc.Rt * undist_pt.homogeneous());
-            sqNorms.push_back(rays.back().squaredNorm());
-          }
-        }
-
-        // Compare pairs — no sqrt needed:
-        //  convergent when dot < 0  OR  dot^2 < sqNorm_i * sqNorm_j * cos^2(threshold)
-        const size_t rays_size = rays.size();
-        for (size_t i = 0; i < rays_size && !convergent; ++i)
-        {
-          const double sqNorm_i_cos2 = sqNorms[i] * cos2Threshold;
-          for (size_t j = i + 1; j < rays_size; ++j)
-          {
-            const double d = rays[i].dot(rays[j]);
-            if (d < 0.0 || d * d <= sqNorm_i_cos2 * sqNorms[j])
-            {
-              convergent = true;
-              break;
-            }
-          }
-        }
-
-        if (!convergent)
-        {
-          iterTracks = sfm_data.structure.erase(iterTracks);
-          ++removedTrack_count;
-        }
-        else
-          ++iterTracks;
-      }
-      return removedTrack_count;
-    }
-#else
-
-    // Remove tracks that have a small angle (tracks with tiny angle leads to instable 3D points)
-    // Return the number of removed tracks
-    IndexT RemoveOutliers_AngleError
-    (
-      SfM_Data& sfm_data,
-      const double dMinAcceptedAngle
-    )
-    {
-      // Precompute the cosine squared threshold
-      // angle >= threshold  <=>  cos(angle) <= cos(threshold)
-      // For unit-free rays: dot(a,b)/(|a|*|b|) <= cos(threshold)
-      // Squared (avoiding sqrt): dot^2 >= |a|^2*|b|^2*cos^2(threshold) means angle < threshold (reject)
-      // So a track is convergent when we find a pair where:
-      //   dot < 0  (angle > 90°, always convergent), OR
-      //   dot^2 < |a|^2 * |b|^2 * cos^2(threshold)  (angle > threshold)
-      const double cosThreshold = cos(D2R(dMinAcceptedAngle));
-      const double cos2Threshold = cosThreshold * cosThreshold;
-
-      // Build a per-view cache of R^T + intrinsic (small, ~186 entries)
-      struct ViewCache {
-        Mat3 Rt;  // rotation transposed
-        const cameras::IntrinsicBase* intrinsic;
-      };
-      Hash_Map<IndexT, ViewCache> view_cache;
-      view_cache.reserve(sfm_data.views.size());
-      for (const auto& view_it : sfm_data.views)
-      {
-        const View* v = view_it.second.get();
-        if (v->id_intrinsic == UndefinedIndexT || v->id_pose == UndefinedIndexT)
-          continue;
-        const auto pose_it = sfm_data.poses.find(v->id_pose);
-        if (pose_it == sfm_data.poses.end())
-          continue;
-        const auto intrinsic_it = sfm_data.intrinsics.find(v->id_intrinsic);
-        if (intrinsic_it == sfm_data.intrinsics.end())
-          continue;
-        view_cache[view_it.first] = {
-          pose_it->second.rotation().transpose(),
-          intrinsic_it->second.get()
-        };
-      }
-
-      // Collect iterators for parallel random-access
-      std::vector<Landmarks::iterator> workItems;
-      workItems.reserve(sfm_data.structure.size());
-      for (auto it = sfm_data.structure.begin(); it != sfm_data.structure.end(); ++it)
-      {
-        workItems.push_back(it);
-      }
-
-      // Parallel classification: determine which tracks to reject
-      std::vector<IndexT> rejectedIds;
-      rejectedIds.reserve(workItems.size());
-
-#ifdef OPENMVG_USE_OPENMP
-#pragma omp parallel
-#endif
-      {
-        // Thread-local storage to avoid contention
-        std::vector<IndexT> localRejected;
-        std::vector<Vec3> rays;
-        std::vector<double> sqNorms;
-
-#ifdef OPENMVG_USE_OPENMP
-#pragma omp for schedule(static, 128)
-#endif
-        for (int i = 0; i < static_cast<int>(workItems.size()); ++i)
-        {
-          const auto& tracks_it = *workItems[i];
-          const Observations& obs = tracks_it.second.obs;
-          bool convergent = false;
-
-          rays.clear();
-          sqNorms.clear();
-          rays.reserve(obs.size());
-          sqNorms.reserve(obs.size());
-          for (const auto& obs_it : obs)
-          {
-            const auto cache_it = view_cache.find(obs_it.first);
-            if (cache_it != view_cache.end())
-            {
-              const auto& vc = cache_it->second;
-              const Vec2 cam_pt = vc.intrinsic->ima2cam(obs_it.second.x);
-              const Vec2 undist_pt = vc.intrinsic->remove_disto(cam_pt);
-              // ray = R^T * [undist_x, undist_y, 1]^T  (unnormalized)
-              rays.emplace_back(vc.Rt * undist_pt.homogeneous());
-              sqNorms.push_back(rays.back().squaredNorm());
-            }
-          }
-
-          // Compare pairs — no sqrt needed
-          const size_t rays_size = rays.size();
-          for (size_t ri = 0; ri < rays_size && !convergent; ++ri)
-          {
-            const double sqNorm_i_cos2 = sqNorms[ri] * cos2Threshold;
-            for (size_t rj = ri + 1; rj < rays_size; ++rj)
-            {
-              const double d = rays[ri].dot(rays[rj]);
-              if (d < 0.0 || d * d <= sqNorm_i_cos2 * sqNorms[rj])
-              {
-                convergent = true;
-                break;
-              }
-            }
-          }
-
-          if (!convergent)
-          {
-            localRejected.push_back(tracks_it.first);
-          }
-        }
-
-#ifdef OPENMVG_USE_OPENMP
-#pragma omp critical
-#endif
-        {
-          rejectedIds.insert(rejectedIds.end(), localRejected.begin(), localRejected.end());
-        }
-      }
-
-      // Sequential erasure
-      for (const auto& id : rejectedIds)
-      {
-        sfm_data.structure.erase(id);
-      }
-
-      return static_cast<IndexT>(rejectedIds.size());
-    }
-#endif
-    bool eraseMissingPoses
-    (
-      SfM_Data& sfm_data,
-      const IndexT min_points_per_pose
-    )
-    {
-      IndexT removed_elements = 0;
-      const Landmarks& landmarks = sfm_data.structure;
-
-      // Build a flat viewId -> poseId lookup (small, ~186 entries)
-      Hash_Map<IndexT, IndexT> view_to_pose;
-      view_to_pose.reserve(sfm_data.views.size());
-      for (const auto& view_it : sfm_data.views)
-      {
-        view_to_pose[view_it.first] = view_it.second->id_pose;
-      }
-
-      // Count the observation poses occurrence
-      Hash_Map<IndexT, IndexT> map_PoseId_Count;
-      // Init with 0 count (in order to be able to remove non referenced elements)
-      for (const auto& pose_it : sfm_data.GetPoses())
-      {
-        map_PoseId_Count[pose_it.first] = 0;
-      }
-
-      // Count occurrence of the poses in the Landmark observations
-      for (const auto& lanmark_it : landmarks)
-      {
-        const Observations& obs = lanmark_it.second.obs;
-        for (const auto& obs_it : obs)
-        {
-          const auto it = view_to_pose.find(obs_it.first);
-          if (it != view_to_pose.end())
-            map_PoseId_Count[it->second] += 1;
-        }
-      }
-      // If usage count is smaller than the threshold, remove the Pose
-      for (const auto& it : map_PoseId_Count)
-      {
-        if (it.second < min_points_per_pose)
-        {
-          sfm_data.poses.erase(it.first);
-          ++removed_elements;
-        }
-      }
-      return removed_elements > 0;
+      iterTracks = sfm_data.structure.erase(iterTracks);
+      ++removed_tracks_by_angle;
+      continue;
     }
 
-    bool eraseObservationsWithMissingPoses
-    (
-      SfM_Data& sfm_data,
-      const IndexT min_points_per_landmark
-    )
+    // ---- Pixel residual pass (obs-level) ------------------------------
+    // Identical to RemoveOutliers_PixelResidualError's inner body.
+    const Vec3 & X = iterTracks->second.X;
+    Observations::iterator itObs = obs.begin();
+    while (itObs != obs.end())
     {
-      IndexT removed_elements = 0;
-
-      // Build a sorted vector of view ids whose pose exists (small, ~186 elements)
-      std::vector<IndexT> valid_view_ids;
-      valid_view_ids.reserve(sfm_data.views.size());
-      for (const auto& view_it : sfm_data.views)
+      const ViewCache * vc = get_cache(itObs->first);
+      if (vc)
       {
-        if (sfm_data.poses.count(view_it.second->id_pose))
-          valid_view_ids.push_back(view_it.first);
-      }
-      std::sort(valid_view_ids.begin(), valid_view_ids.end());
-
-      // For each landmark:
-      //  - Check if we need to keep the observations & the track
-      Landmarks::iterator itLandmarks = sfm_data.structure.begin();
-      while (itLandmarks != sfm_data.structure.end())
-      {
-        Observations& obs = itLandmarks->second.obs;
-        Observations::iterator itObs = obs.begin();
-        while (itObs != obs.end())
+        const Vec2 residual = vc->intrinsic->residual(
+          vc->pose(X), itObs->second.x);
+        if (residual.squaredNorm() > dThresholdPixelSq)
         {
-          if (!std::binary_search(valid_view_ids.cbegin(), valid_view_ids.cend(), itObs->first))
+          ++removed_obs_by_pixel;
+          itObs = obs.erase(itObs);
+          continue;
+        }
+      }
+      ++itObs;
+    }
+    if (obs.empty() || obs.size() < minTrackLength)
+      iterTracks = sfm_data.structure.erase(iterTracks);
+    else
+      ++iterTracks;
+  }
+
+  if (out_removed_by_angle) *out_removed_by_angle = removed_tracks_by_angle;
+  if (out_removed_by_pixel) *out_removed_by_pixel = removed_obs_by_pixel;
+  return removed_tracks_by_angle + removed_obs_by_pixel;
+}
+
+// COLMAP-style "bad pose" ejection. After a BA, any pose whose median
+// reprojection residual is much worse than the scene-wide median-of-medians
+// is almost certainly a wrongly-resectioned camera or one whose intrinsic
+// drifted. Removing it lets the next BA round re-optimize without its
+// poison, which is the dominant cure for run-to-run "good vs unusable"
+// reconstructions.
+IndexT EjectPosesByMedianResidual
+(
+  SfM_Data & sfm_data,
+  const double k_factor,
+  const double abs_floor_pixels,
+  const IndexT min_points_per_landmark
+)
+{
+  if (sfm_data.poses.empty() || sfm_data.structure.empty())
+    return 0;
+
+  // Per-view (pose, intrinsic*) cache. View ids and pose ids in OpenMVG
+  // are typically dense small integers ([0..N) per image); use the same
+  // flat-vector trick as RemoveOutliers_PixelAndAngleError so the per-obs
+  // lookup over sfm_data.structure (the hot loop) is an array index
+  // instead of a hash probe. Fall back to Hash_Map for sparse id ranges.
+  struct ViewCache {
+    geometry::Pose3 pose;
+    const cameras::IntrinsicBase * intrinsic = nullptr; // nullptr == invalid
+    IndexT pose_id = UndefinedIndexT;
+  };
+
+  IndexT max_view_id = 0;
+  IndexT max_pose_id = 0;
+  bool any_view = false;
+  for (const auto & view_it : sfm_data.views)
+  {
+    if (view_it.first > max_view_id) max_view_id = view_it.first;
+    any_view = true;
+  }
+  for (const auto & pose_it : sfm_data.poses)
+  {
+    if (pose_it.first > max_pose_id) max_pose_id = pose_it.first;
+  }
+  const bool use_flat_view =
+    any_view &&
+    max_view_id != UndefinedIndexT &&
+    static_cast<size_t>(max_view_id) < sfm_data.views.size() * 8 + 64;
+  const bool use_flat_pose =
+    max_pose_id != UndefinedIndexT &&
+    static_cast<size_t>(max_pose_id) < sfm_data.poses.size() * 8 + 64;
+
+  // Buffers below are thread_local-static so allocations amortize across
+  // calls (this function runs once per robust-BA iteration, so the
+  // capacity of the per-pose residual vectors is the dominant win).
+  // ViewCache has no heap (Pose3 is a fixed-size Eigen aggregate), so a
+  // straight assign() doesn't lose anything we wanted to keep.
+  thread_local static std::vector<ViewCache> view_cache_flat;
+  thread_local static Hash_Map<IndexT, ViewCache> view_cache_hash;
+  if (use_flat_view)
+  {
+    view_cache_flat.assign(static_cast<size_t>(max_view_id) + 1, ViewCache{});
+  }
+  else
+  {
+    view_cache_hash.clear();
+    view_cache_hash.reserve(sfm_data.views.size());
+  }
+
+  for (const auto & view_it : sfm_data.views)
+  {
+    const View * v = view_it.second.get();
+    if (!v || v->id_intrinsic == UndefinedIndexT || v->id_pose == UndefinedIndexT)
+      continue;
+    const auto pose_it = sfm_data.poses.find(v->id_pose);
+    if (pose_it == sfm_data.poses.end()) continue;
+    const auto intr_it = sfm_data.intrinsics.find(v->id_intrinsic);
+    if (intr_it == sfm_data.intrinsics.end()) continue;
+    if (use_flat_view)
+      view_cache_flat[view_it.first] = { pose_it->second, intr_it->second.get(), v->id_pose };
+    else
+      view_cache_hash[view_it.first] = { pose_it->second, intr_it->second.get(), v->id_pose };
+  }
+
+  auto get_cache = [&](IndexT view_id) -> const ViewCache * {
+    if (use_flat_view)
+    {
+      if (view_id > max_view_id) return nullptr;
+      const ViewCache & vc = view_cache_flat[view_id];
+      return vc.intrinsic ? &vc : nullptr;
+    }
+    const auto it = view_cache_hash.find(view_id);
+    return (it != view_cache_hash.end()) ? &it->second : nullptr;
+  };
+
+  // Accumulate squared residuals per pose_id. We compare squared values all
+  // the way through (median is monotonic under squaring for non-negatives,
+  // so median(r^2) == (median(r))^2). This avoids one sqrt per observation
+  // -- this loop runs over every obs in sfm_data.structure.
+  //
+  // thread_local-static so the per-pose inner vectors retain their
+  // capacity across calls. We deliberately do NOT use assign(N+1, {})
+  // -- that would destroy every inner vector and throw away exactly the
+  // allocations we want to amortize. Pattern: grow outer if needed, then
+  // clear() each inner in place (size->0, capacity preserved).
+  thread_local static std::vector<std::vector<double>> residuals_sq_per_pose_flat;
+  thread_local static Hash_Map<IndexT, std::vector<double>> residuals_sq_per_pose_hash;
+  if (use_flat_pose)
+  {
+    if (residuals_sq_per_pose_flat.size() < static_cast<size_t>(max_pose_id) + 1)
+      residuals_sq_per_pose_flat.resize(static_cast<size_t>(max_pose_id) + 1);
+    for (auto & v : residuals_sq_per_pose_flat) v.clear();
+  }
+  else
+  {
+    // Keep inner storage; the entry set may shift across calls but for
+    // overlapping pose ids we recycle the existing buffer.
+    for (auto & kv : residuals_sq_per_pose_hash) kv.second.clear();
+    residuals_sq_per_pose_hash.reserve(sfm_data.poses.size());
+  }
+
+  auto push_residual = [&](IndexT pose_id, double r_sq) {
+    if (use_flat_pose)
+      residuals_sq_per_pose_flat[pose_id].push_back(r_sq);
+    else
+      residuals_sq_per_pose_hash[pose_id].push_back(r_sq);
+  };
+
+  for (const auto & landmark_it : sfm_data.structure)
+  {
+    const Vec3 & X = landmark_it.second.X;
+    for (const auto & obs_it : landmark_it.second.obs)
+    {
+      const ViewCache * vc = get_cache(obs_it.first);
+      if (!vc) continue;
+      const double r_sq = vc->intrinsic->residual(vc->pose(X), obs_it.second.x).squaredNorm();
+      push_residual(vc->pose_id, r_sq);
+    }
+  }
+
+  // Per-pose median (of squared residuals). Iterate over actual poses so
+  // we don't waste work on empty flat slots.
+  thread_local static Hash_Map<IndexT, double> median_sq_per_pose;
+  median_sq_per_pose.clear();
+  median_sq_per_pose.reserve(sfm_data.poses.size());
+  thread_local static std::vector<double> medians_sq;
+  medians_sq.clear();
+  medians_sq.reserve(sfm_data.poses.size());
+  auto consume_residuals = [&](IndexT pose_id, std::vector<double> & v) {
+    if (v.empty()) return;
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    const double m_sq = v[v.size() / 2];
+    median_sq_per_pose[pose_id] = m_sq;
+    medians_sq.push_back(m_sq);
+  };
+  if (use_flat_pose)
+  {
+    for (const auto & pose_it : sfm_data.poses)
+      consume_residuals(pose_it.first, residuals_sq_per_pose_flat[pose_it.first]);
+  }
+  else
+  {
+    for (auto & kv : residuals_sq_per_pose_hash)
+      consume_residuals(kv.first, kv.second);
+  }
+  if (medians_sq.empty())
+    return 0;
+
+  // Global median-of-medians (robust scale estimator), still squared.
+  std::nth_element(medians_sq.begin(), medians_sq.begin() + medians_sq.size() / 2, medians_sq.end());
+  const double global_median_sq = medians_sq[medians_sq.size() / 2];
+
+  // Threshold in squared space. Original (linear-space) test was:
+  //   r > max(k_factor * global_median, abs_floor_pixels)
+  // Squaring both sides (both non-negative) and using
+  //   median(r^2) == (median(r))^2  =>  k^2 * median(r^2) == (k * median(r))^2
+  // gives the equivalent test:
+  //   r^2 > max(k_factor^2 * global_median_sq, abs_floor_pixels^2)
+  const double threshold_sq = std::max(
+    k_factor * k_factor * global_median_sq,
+    abs_floor_pixels * abs_floor_pixels);
+
+  // Collect bad pose ids.
+  thread_local static std::vector<IndexT> bad_poses;
+  bad_poses.clear();
+  bad_poses.reserve(median_sq_per_pose.size());
+  for (const auto & kv : median_sq_per_pose)
+  {
+    if (kv.second > threshold_sq)
+      bad_poses.push_back(kv.first);
+  }
+  if (bad_poses.empty())
+    return 0;
+
+  // Erase the offending poses; observations referencing them become
+  // orphans and are cleaned by eraseObservationsWithMissingPoses.
+  for (const IndexT pose_id : bad_poses)
+    sfm_data.poses.erase(pose_id);
+
+  eraseObservationsWithMissingPoses(sfm_data, min_points_per_landmark);
+
+  return static_cast<IndexT>(bad_poses.size());
+}
+
+// Pose-prior outlier ejection. With GPS / motion priors active, a pose can
+// have a clean reprojection median yet sit far from its prior center -- the
+// optimizer locked onto local features for that camera but the global
+// position drifted. EjectPosesByMedianResidual won't catch these; this
+// helper does.
+//
+// Threshold rule (MAD-based for bimodal robustness):
+//     d_i = || pose_i.center - prior_i.pose_center ||
+//     med = median(d_i)
+//     mad = median( | d_i - med | )                    -- spread of good cluster
+//     thresh = max( med + k_factor * 1.4826 * mad, abs_floor_units )
+// MAD is preferred over k * median because a coherent drifted cohort
+// (the "ghost-layer" failure mode) shifts the median upward so much that
+// k * median accepts the drift. MAD reflects the spread of the inlier
+// cluster only and stays small even when up to ~50% of poses are biased
+// in the same direction.
+//
+// Safety cap: never eject more than max_eject_fraction of available poses
+// in a single call (default 15%). If more would be flagged, only the
+// worst max-cap are ejected and a warning is logged. Prevents cascade
+// blowups when the threshold is too tight or the data is genuinely
+// unprior-able.
+IndexT EjectPosesByPriorResidual
+(
+  SfM_Data & sfm_data,
+  const double k_factor,
+  const double abs_floor_units,
+  const IndexT min_points_per_landmark
+)
+{
+  if (sfm_data.poses.empty())
+    return 0;
+
+  // pose_id -> distance between optimized center and prior center.
+  // We work in distance (not squared) so the MAD computation is meaningful.
+  // One entry per pose (first ViewPriors that references it wins).
+  Hash_Map<IndexT, double> dist_per_pose;
+  dist_per_pose.reserve(sfm_data.poses.size());
+  for (const auto & view_it : sfm_data.views)
+  {
+    const ViewPriors * prior =
+      dynamic_cast<const ViewPriors *>(view_it.second.get());
+    if (!prior || !prior->b_use_pose_center_)
+      continue;
+    if (prior->id_pose == UndefinedIndexT) continue;
+    const auto pose_it = sfm_data.poses.find(prior->id_pose);
+    if (pose_it == sfm_data.poses.end()) continue;
+    if (dist_per_pose.count(prior->id_pose)) continue;
+    const double d =
+      (pose_it->second.center() - prior->pose_center_).norm();
+    dist_per_pose[prior->id_pose] = d;
+  }
+
+  if (dist_per_pose.size() < 6) // not enough samples for robust med + MAD
+    return 0;
+
+  // --- median of distances
+  std::vector<double> dists;
+  dists.reserve(dist_per_pose.size());
+  for (const auto & kv : dist_per_pose)
+    dists.push_back(kv.second);
+  std::nth_element(dists.begin(),
+                   dists.begin() + dists.size() / 2,
+                   dists.end());
+  const double med = dists[dists.size() / 2];
+
+  // --- MAD: median of |d_i - med|. 1.4826 is the consistency factor that
+  // makes 1.4826*MAD an unbiased estimator of stddev for Gaussian data.
+  std::vector<double> abs_dev;
+  abs_dev.reserve(dist_per_pose.size());
+  for (const auto & kv : dist_per_pose)
+    abs_dev.push_back(std::abs(kv.second - med));
+  std::nth_element(abs_dev.begin(),
+                   abs_dev.begin() + abs_dev.size() / 2,
+                   abs_dev.end());
+  const double mad = abs_dev[abs_dev.size() / 2];
+  const double sigma = 1.4826 * mad;
+
+  const double threshold = std::max(med + k_factor * sigma, abs_floor_units);
+
+  // Collect (distance, pose_id) for everything above threshold; we may need
+  // to sort by severity if the safety cap kicks in.
+  std::vector<std::pair<double, IndexT>> flagged;
+  flagged.reserve(dist_per_pose.size());
+  for (const auto & kv : dist_per_pose)
+  {
+    if (kv.second > threshold)
+      flagged.emplace_back(kv.second, kv.first);
+  }
+  if (flagged.empty())
+    return 0;
+
+  // Safety cap: never eject more than 15% of priored poses in one call.
+  // Cascade-of-ejection across BA iterations is the failure mode this
+  // guards against.
+  const std::size_t max_eject =
+    std::max<std::size_t>(1, dist_per_pose.size() * 15 / 100);
+  if (flagged.size() > max_eject)
+  {
+    // Keep only the worst max_eject by distance (descending).
+    std::partial_sort(
+      flagged.begin(),
+      flagged.begin() + max_eject,
+      flagged.end(),
+      [](const std::pair<double, IndexT> & a,
+         const std::pair<double, IndexT> & b) { return a.first > b.first; });
+    OPENMVG_LOG_WARNING
+      << "[EjectPosesByPriorResidual] flagged=" << flagged.size()
+      << " > cap=" << max_eject
+      << " (med=" << med << " sigma=" << sigma
+      << " thresh=" << threshold << "); ejecting only the worst.";
+    flagged.resize(max_eject);
+  }
+
+  for (const auto & f : flagged)
+    sfm_data.poses.erase(f.second);
+
+  eraseObservationsWithMissingPoses(sfm_data, min_points_per_landmark);
+
+  return static_cast<IndexT>(flagged.size());
+}
+
+bool eraseMissingPoses
+(
+  SfM_Data & sfm_data,
+  const IndexT min_points_per_pose
+)
+{
+  IndexT removed_elements = 0;
+  const Landmarks & landmarks = sfm_data.structure;
+
+  // Both lookups below are hit once per observation in sfm_data.structure
+  // (potentially millions of probes), so use the same flat-vector trick as
+  // RemoveOutliers_PixelAndAngleError / EjectPosesByMedianResidual: array
+  // index instead of hash probe when ids are dense, fall back to Hash_Map
+  // for sparse id ranges.
+
+  // viewId -> poseId
+  IndexT max_view_id = 0;
+  bool any_view = false;
+  for (const auto & view_it : sfm_data.views)
+  {
+    if (view_it.first > max_view_id) max_view_id = view_it.first;
+    any_view = true;
+  }
+  const bool use_flat_view =
+    any_view &&
+    max_view_id != UndefinedIndexT &&
+    static_cast<size_t>(max_view_id) < sfm_data.views.size() * 8 + 64;
+
+  std::vector<IndexT> view_to_pose_flat;
+  Hash_Map<IndexT, IndexT> view_to_pose_hash;
+  if (use_flat_view)
+    view_to_pose_flat.assign(static_cast<size_t>(max_view_id) + 1, UndefinedIndexT);
+  else
+    view_to_pose_hash.reserve(sfm_data.views.size());
+  for (const auto & view_it : sfm_data.views)
+  {
+    if (use_flat_view)
+      view_to_pose_flat[view_it.first] = view_it.second->id_pose;
+    else
+      view_to_pose_hash[view_it.first] = view_it.second->id_pose;
+  }
+
+  // poseId -> observation count. Init to 0 for every existing pose so we
+  // can detect non-referenced poses (count remains 0 -> removed).
+  IndexT max_pose_id = 0;
+  for (const auto & pose_it : sfm_data.GetPoses())
+  {
+    if (pose_it.first > max_pose_id) max_pose_id = pose_it.first;
+  }
+  const bool use_flat_pose =
+    !sfm_data.poses.empty() &&
+    max_pose_id != UndefinedIndexT &&
+    static_cast<size_t>(max_pose_id) < sfm_data.poses.size() * 8 + 64;
+
+  // Sentinel = std::numeric_limits<IndexT>::max() means "this slot is not
+  // a real pose"; real poses are initialized to 0 below.
+  static constexpr IndexT kNotAPose = std::numeric_limits<IndexT>::max();
+  std::vector<IndexT> count_flat;
+  Hash_Map<IndexT, IndexT> count_hash;
+  if (use_flat_pose)
+  {
+    count_flat.assign(static_cast<size_t>(max_pose_id) + 1, kNotAPose);
+    for (const auto & pose_it : sfm_data.GetPoses())
+      count_flat[pose_it.first] = 0;
+  }
+  else
+  {
+    count_hash.reserve(sfm_data.poses.size());
+    for (const auto & pose_it : sfm_data.GetPoses())
+      count_hash[pose_it.first] = 0;
+  }
+
+  // Count occurrence of the poses in the Landmark observations.
+  for (const auto & lanmark_it : landmarks)
+  {
+    const Observations & obs = lanmark_it.second.obs;
+    for (const auto & obs_it : obs)
+    {
+      IndexT pose_id;
+      if (use_flat_view)
+      {
+        if (obs_it.first > max_view_id) continue;
+        pose_id = view_to_pose_flat[obs_it.first];
+        if (pose_id == UndefinedIndexT) continue;
+      }
+      else
+      {
+        const auto it = view_to_pose_hash.find(obs_it.first);
+        if (it == view_to_pose_hash.end()) continue;
+        pose_id = it->second;
+      }
+      if (use_flat_pose)
+      {
+        if (pose_id > max_pose_id) continue;
+        IndexT & c = count_flat[pose_id];
+        if (c != kNotAPose) ++c;
+      }
+      else
+      {
+        const auto it = count_hash.find(pose_id);
+        if (it != count_hash.end()) ++it->second;
+      }
+    }
+  }
+  // If usage count is smaller than the threshold, remove the Pose. Iterate
+  // poses (not the count container) so the flat path skips empty slots.
+  if (use_flat_pose)
+  {
+    // Snapshot ids first: we mutate sfm_data.poses inside the loop.
+    std::vector<IndexT> pose_ids;
+    pose_ids.reserve(sfm_data.poses.size());
+    for (const auto & pose_it : sfm_data.GetPoses())
+      pose_ids.push_back(pose_it.first);
+    for (const IndexT pid : pose_ids)
+    {
+      if (count_flat[pid] < min_points_per_pose)
+      {
+        sfm_data.poses.erase(pid);
+        ++removed_elements;
+      }
+    }
+  }
+  else
+  {
+    for (const auto & it : count_hash)
+    {
+      if (it.second < min_points_per_pose)
+      {
+        sfm_data.poses.erase(it.first);
+        ++removed_elements;
+      }
+    }
+  }
+  return removed_elements > 0;
+}
+
+bool eraseObservationsWithMissingPoses
+(
+  SfM_Data & sfm_data,
+  const IndexT min_points_per_landmark
+)
+{
+  IndexT removed_elements = 0;
+
+  // Build a presence lookup over view ids whose pose exists. View ids in
+  // OpenMVG are typically dense small integers ([0..N)), so a flat
+  // std::vector<uint8_t> indexed by view id gives O(1) presence checks
+  // with much better cache behavior than std::binary_search on a sorted
+  // vector. Fall back to the sorted-vector path if the id range turns out
+  // to be too sparse (heuristic: max_id > 8 * count + 64 so we don't
+  // allocate a 100MB bitmap for a handful of ids).
+  std::vector<IndexT> valid_view_ids;
+  valid_view_ids.reserve(sfm_data.views.size());
+  IndexT max_view_id = 0;
+  for (const auto & view_it : sfm_data.views)
+  {
+    if (sfm_data.poses.count(view_it.second->id_pose))
+    {
+      valid_view_ids.push_back(view_it.first);
+      if (view_it.first > max_view_id) max_view_id = view_it.first;
+    }
+  }
+
+  const bool use_presence_vector =
+    !valid_view_ids.empty() &&
+    max_view_id != UndefinedIndexT &&
+    static_cast<size_t>(max_view_id) < valid_view_ids.size() * 8 + 64;
+
+  std::vector<uint8_t> view_present;
+  if (use_presence_vector)
+  {
+    view_present.assign(static_cast<size_t>(max_view_id) + 1, 0);
+    for (const IndexT id : valid_view_ids) view_present[id] = 1;
+  }
+  else
+  {
+    std::sort(valid_view_ids.begin(), valid_view_ids.end());
+  }
+
+  auto is_valid = [&](IndexT view_id) -> bool {
+    if (use_presence_vector)
+    {
+      return view_id <= max_view_id && view_present[view_id] != 0;
+    }
+    return std::binary_search(valid_view_ids.cbegin(), valid_view_ids.cend(), view_id);
+  };
+
+  // For each landmark:
+  //  - Check if we need to keep the observations & the track
+  Landmarks::iterator itLandmarks = sfm_data.structure.begin();
+  while (itLandmarks != sfm_data.structure.end())
+  {
+    Observations & obs = itLandmarks->second.obs;
+    Observations::iterator itObs = obs.begin();
+    while (itObs != obs.end())
+    {
+      if (!is_valid(itObs->first))
+      {
+        itObs = obs.erase(itObs);
+        ++removed_elements;
+      }
+      else
+        ++itObs;
+    }
+    if (obs.empty() || obs.size() < min_points_per_landmark)
+      itLandmarks = sfm_data.structure.erase(itLandmarks);
+    else
+      ++itLandmarks;
+  }
+  return removed_elements > 0;
+}
+
+/// Remove unstable content from analysis of the sfm_data structure
+bool eraseUnstablePosesAndObservations
+(
+  SfM_Data & sfm_data,
+  const IndexT min_points_per_pose,
+  const IndexT min_points_per_landmark
+)
+{
+  // First remove orphan observation(s) (observation using an undefined pose)
+  eraseObservationsWithMissingPoses(sfm_data, min_points_per_landmark);
+  // Then iteratively remove orphan poses & observations
+  IndexT remove_iteration = 0;
+  bool bRemovedContent = false;
+  do
+  {
+    bRemovedContent = false;
+    if (eraseMissingPoses(sfm_data, min_points_per_pose))
+    {
+      bRemovedContent = eraseObservationsWithMissingPoses(sfm_data, min_points_per_landmark);
+      // Erase some observations can make some Poses index disappear so perform the process in a loop
+    }
+    remove_iteration += bRemovedContent ? 1 : 0;
+  }
+  while (bRemovedContent);
+
+  return remove_iteration > 0;
+}
+
+/// Tell if the sfm_data structure is one CC or not
+bool IsTracksOneCC
+(
+  const SfM_Data & sfm_data
+)
+{
+  // Compute the Connected Component from the tracks
+
+  // Build a table to have contiguous view index in [0,n]
+  // (Use only the view index used in the observations)
+  Hash_Map<IndexT, IndexT> view_renumbering;
+  IndexT cpt = 0;
+  const Landmarks & landmarks = sfm_data.structure;
+  for (const auto & Landmark_it : landmarks)
+  {
+    const Observations & obs = Landmark_it.second.obs;
+    for (const auto & obs_it : obs)
+    {
+      if (view_renumbering.count(obs_it.first) == 0)
+      {
+        view_renumbering[obs_it.first] = cpt++;
+      }
+    }
+  }
+
+  UnionFind uf_tree;
+  uf_tree.InitSets(view_renumbering.size());
+
+  // Link track observations in connected component
+  for (const auto & Landmark_it : landmarks)
+  {
+    const Observations & obs = Landmark_it.second.obs;
+    std::set<IndexT> id_to_link;
+    for (const auto & obs_it : obs)
+    {
+      id_to_link.insert(view_renumbering.at(obs_it.first));
+    }
+    std::set<IndexT>::const_iterator iterI = id_to_link.cbegin();
+    std::set<IndexT>::const_iterator iterJ = id_to_link.cbegin();
+    std::advance(iterJ, 1);
+    while (iterJ != id_to_link.cend())
+    {
+      // Link I => J
+      uf_tree.Union(*iterI, *iterJ);
+      ++iterJ;
+    }
+  }
+
+  // Run path compression to identify all the CC id belonging to every item
+  for (unsigned int i = 0; i < uf_tree.GetNumNodes(); ++i)
+  {
+    uf_tree.Find(i);
+  }
+
+  // Count the number of CC
+  const std::set<unsigned int> parent_id(uf_tree.m_cc_parent.cbegin(), uf_tree.m_cc_parent.cend());
+  return parent_id.size() == 1;
+}
+
+/// Keep the largest connected component of tracks from the sfm_data structure
+void KeepLargestViewCCTracks
+(
+  SfM_Data & sfm_data
+)
+{
+  // Compute the Connected Component from the tracks
+
+  // Build a table to have contiguous view index in [0,n]
+  // (Use only the view index used in the observations)
+  Hash_Map<IndexT, IndexT> view_renumbering;
+  {
+    IndexT cpt = 0;
+    const Landmarks & landmarks = sfm_data.structure;
+    for (const auto & Landmark_it : landmarks)
+    {
+      const Observations & obs = Landmark_it.second.obs;
+      for (const auto & obs_it : obs)
+      {
+        if (view_renumbering.count(obs_it.first) == 0)
+        {
+          view_renumbering[obs_it.first] = cpt++;
+        }
+      }
+    }
+  }
+
+  UnionFind uf_tree;
+  uf_tree.InitSets(view_renumbering.size());
+
+  // Link track observations in connected component
+  Landmarks & landmarks = sfm_data.structure;
+  for (const auto & Landmark_it : landmarks)
+  {
+    const Observations & obs = Landmark_it.second.obs;
+    std::set<IndexT> id_to_link;
+    for (const auto & obs_it : obs)
+    {
+      id_to_link.insert(view_renumbering.at(obs_it.first));
+    }
+    std::set<IndexT>::const_iterator iterI = id_to_link.cbegin();
+    std::set<IndexT>::const_iterator iterJ = id_to_link.cbegin();
+    std::advance(iterJ, 1);
+    while (iterJ != id_to_link.cend())
+    {
+      // Link I => J
+      uf_tree.Union(*iterI, *iterJ);
+      ++iterJ;
+    }
+  }
+
+  // Count the number of CC
+  const std::set<unsigned int> parent_id(uf_tree.m_cc_parent.cbegin(), uf_tree.m_cc_parent.cend());
+  if (parent_id.size() > 1)
+  {
+    // There is many CC, look the largest one
+    // (if many CC have the same size, export the first that have been seen)
+    std::pair<IndexT, unsigned int> max_cc( UndefinedIndexT, std::numeric_limits<unsigned int>::min());
+    {
+      for (const unsigned int parent_id_it : parent_id)
+      {
+        if (uf_tree.m_cc_size[parent_id_it] > max_cc.second) // Update the component parent id and size
+        {
+          max_cc = {parent_id_it, uf_tree.m_cc_size[parent_id_it]};
+        }
+      }
+    }
+    // Delete track ids that are not contained in the largest CC
+    if (max_cc.first != UndefinedIndexT)
+    {
+      const unsigned int parent_id_largest_cc = max_cc.first;
+      Landmarks::iterator itLandmarks = landmarks.begin();
+      while (itLandmarks != landmarks.end())
+      {
+        // Since we built a view 'track' graph thanks to the UF tree,
+        //  checking the CC of each track is equivalent to check the CC of any observation of it.
+        // So we check only the first
+        const Observations & obs = itLandmarks->second.obs;
+        Observations::const_iterator itObs = obs.begin();
+        if (!obs.empty())
+        {
+          if (uf_tree.Find(view_renumbering.at(itObs->first)) != parent_id_largest_cc)
           {
-            itObs = obs.erase(itObs);
-            ++removed_elements;
+            itLandmarks = landmarks.erase(itLandmarks);
           }
           else
-            ++itObs;
-        }
-        if (obs.empty() || obs.size() < min_points_per_landmark)
-          itLandmarks = sfm_data.structure.erase(itLandmarks);
-        else
-          ++itLandmarks;
-      }
-      return removed_elements > 0;
-    }
-
-    /// Remove unstable content from analysis of the sfm_data structure
-    bool eraseUnstablePosesAndObservations
-    (
-      SfM_Data& sfm_data,
-      const IndexT min_points_per_pose,
-      const IndexT min_points_per_landmark
-    )
-    {
-      const size_t poses_before = sfm_data.poses.size();
-      const size_t tracks_before = sfm_data.structure.size();
-
-      // First remove orphan observation(s) (observation using an undefined pose)
-      eraseObservationsWithMissingPoses(sfm_data, min_points_per_landmark);
-
-      // Early-out: if no poses were removed by the caller (outlier filtering),
-      // and eraseObservationsWithMissingPoses didn't remove anything,
-      // then the cascade loop below cannot remove anything either.
-      if (sfm_data.poses.size() == poses_before &&
-          sfm_data.structure.size() == tracks_before)
-        return false;
-
-      // Then iteratively remove orphan poses & observations
-      IndexT remove_iteration = 0;
-      bool bRemovedContent = false;
-      do
-      {
-        bRemovedContent = false;
-        if (eraseMissingPoses(sfm_data, min_points_per_pose))
-        {
-          bRemovedContent = eraseObservationsWithMissingPoses(sfm_data, min_points_per_landmark);
-        }
-        remove_iteration += bRemovedContent ? 1 : 0;
-      } while (bRemovedContent);
-
-      if (remove_iteration > 0)
-      {
-        OPENMVG_LOG_INFO
-          << "-- eraseUnstablePosesAndObservations: "
-          << remove_iteration << " cascade iteration(s)"
-          << " | #poses: " << poses_before << " -> " << sfm_data.poses.size()
-          << " | #tracks: " << tracks_before << " -> " << sfm_data.structure.size();
-      }
-
-      return remove_iteration > 0;
-    }
-
-    /// Tell if the sfm_data structure is one CC or not
-    bool IsTracksOneCC
-    (
-      const SfM_Data& sfm_data
-    )
-    {
-      // Compute the Connected Component from the tracks
-
-      // Build a table to have contiguous view index in [0,n]
-      // (Use only the view index used in the observations)
-      Hash_Map<IndexT, IndexT> view_renumbering;
-      IndexT cpt = 0;
-      const Landmarks& landmarks = sfm_data.structure;
-      for (const auto& Landmark_it : landmarks)
-      {
-        const Observations& obs = Landmark_it.second.obs;
-        for (const auto& obs_it : obs)
-        {
-          if (view_renumbering.count(obs_it.first) == 0)
           {
-            view_renumbering[obs_it.first] = cpt++;
+            ++itLandmarks;
           }
         }
       }
-
-      UnionFind uf_tree;
-      uf_tree.InitSets(view_renumbering.size());
-
-      // Link track observations in connected component
-      for (const auto& Landmark_it : landmarks)
-      {
-        const Observations& obs = Landmark_it.second.obs;
-        std::set<IndexT> id_to_link;
-        for (const auto& obs_it : obs)
-        {
-          id_to_link.insert(view_renumbering.at(obs_it.first));
-        }
-        std::set<IndexT>::const_iterator iterI = id_to_link.cbegin();
-        std::set<IndexT>::const_iterator iterJ = id_to_link.cbegin();
-        std::advance(iterJ, 1);
-        while (iterJ != id_to_link.cend())
-        {
-          // Link I => J
-          uf_tree.Union(*iterI, *iterJ);
-          ++iterJ;
-        }
-      }
-
-      // Run path compression to identify all the CC id belonging to every item
-      for (unsigned int i = 0; i < uf_tree.GetNumNodes(); ++i)
-      {
-        uf_tree.Find(i);
-      }
-
-      // Count the number of CC
-      const std::set<unsigned int> parent_id(uf_tree.m_cc_parent.cbegin(), uf_tree.m_cc_parent.cend());
-      return parent_id.size() == 1;
-    }
-
-    /// Keep the largest connected component of tracks from the sfm_data structure
-    void KeepLargestViewCCTracks
-    (
-      SfM_Data& sfm_data
-    )
-    {
-      // Compute the Connected Component from the tracks
-
-      // Build a table to have contiguous view index in [0,n]
-      // (Use only the view index used in the observations)
-      Hash_Map<IndexT, IndexT> view_renumbering;
-      {
-        IndexT cpt = 0;
-        const Landmarks& landmarks = sfm_data.structure;
-        for (const auto& Landmark_it : landmarks)
-        {
-          const Observations& obs = Landmark_it.second.obs;
-          for (const auto& obs_it : obs)
-          {
-            if (view_renumbering.count(obs_it.first) == 0)
-            {
-              view_renumbering[obs_it.first] = cpt++;
-            }
-          }
-        }
-      }
-
-      UnionFind uf_tree;
-      uf_tree.InitSets(view_renumbering.size());
-
-      // Link track observations in connected component
-      Landmarks& landmarks = sfm_data.structure;
-      for (const auto& Landmark_it : landmarks)
-      {
-        const Observations& obs = Landmark_it.second.obs;
-        std::set<IndexT> id_to_link;
-        for (const auto& obs_it : obs)
-        {
-          id_to_link.insert(view_renumbering.at(obs_it.first));
-        }
-        std::set<IndexT>::const_iterator iterI = id_to_link.cbegin();
-        std::set<IndexT>::const_iterator iterJ = id_to_link.cbegin();
-        std::advance(iterJ, 1);
-        while (iterJ != id_to_link.cend())
-        {
-          // Link I => J
-          uf_tree.Union(*iterI, *iterJ);
-          ++iterJ;
-        }
-      }
-
-      // Count the number of CC
-      const std::set<unsigned int> parent_id(uf_tree.m_cc_parent.cbegin(), uf_tree.m_cc_parent.cend());
-      if (parent_id.size() > 1)
-      {
-        // There is many CC, look the largest one
-        // (if many CC have the same size, export the first that have been seen)
-        std::pair<IndexT, unsigned int> max_cc(UndefinedIndexT, std::numeric_limits<unsigned int>::min());
-        {
-          for (const unsigned int parent_id_it : parent_id)
-          {
-            if (uf_tree.m_cc_size[parent_id_it] > max_cc.second) // Update the component parent id and size
-            {
-              max_cc = { parent_id_it, uf_tree.m_cc_size[parent_id_it] };
-            }
-          }
-        }
-        // Delete track ids that are not contained in the largest CC
-        if (max_cc.first != UndefinedIndexT)
-        {
-          const unsigned int parent_id_largest_cc = max_cc.first;
-          Landmarks::iterator itLandmarks = landmarks.begin();
-          while (itLandmarks != landmarks.end())
-          {
-            // Since we built a view 'track' graph thanks to the UF tree,
-            //  checking the CC of each track is equivalent to check the CC of any observation of it.
-            // So we check only the first
-            const Observations& obs = itLandmarks->second.obs;
-            Observations::const_iterator itObs = obs.begin();
-            if (!obs.empty())
-            {
-              if (uf_tree.Find(view_renumbering.at(itObs->first)) != parent_id_largest_cc)
-              {
-                itLandmarks = landmarks.erase(itLandmarks);
-              }
-              else
-              {
-                ++itLandmarks;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    /**
-    * @brief Implement a statistical Structure filter that remove 3D points that have:
-    * - a depth that is too large (threshold computed as factor * median ~= X84)
-    * @param sfm_data The sfm scene to filter (inplace filtering)
-    * @param k_factor The factor applied to the median depth per view
-    * @param k_min_point_per_pose Keep only poses that have at least this amount of points
-    * @param k_min_track_length Keep only tracks that have at least this length
-    * @return The min_median_value observed for all the view
-    */
-    double DepthCleaning
-    (
-      SfM_Data& sfm_data,
-      const double k_factor,
-      const IndexT k_min_point_per_pose,
-      const IndexT k_min_track_length
-    )
-    {
-      using DepthAccumulatorT = std::vector<double>;
-      std::map<IndexT, DepthAccumulatorT > map_depth_accumulator;
-
-      // For each landmark accumulate the camera/point depth info for each view
-      for (const auto& landmark_it : sfm_data.structure)
-      {
-        const Observations& obs = landmark_it.second.obs;
-        for (const auto& obs_it : obs)
-        {
-          const View* view = sfm_data.views.at(obs_it.first).get();
-          if (sfm_data.IsPoseAndIntrinsicDefined(view))
-          {
-            const Pose3 pose = sfm_data.GetPoseOrDie(view);
-            const double depth = Depth(pose.rotation(), pose.translation(), landmark_it.second.X);
-            if (depth > 0)
-            {
-              map_depth_accumulator[view->id_view].push_back(depth);
-            }
-          }
-        }
-      }
-
-      double min_median_value = std::numeric_limits<double>::max();
-      std::map<IndexT, double > map_median_depth;
-      for (const auto& iter : sfm_data.GetViews())
-      {
-        const View* v = iter.second.get();
-        const IndexT view_id = v->id_view;
-        if (map_depth_accumulator.count(view_id) == 0)
-          continue;
-        // Compute median from the depth distribution
-        const auto& acc = map_depth_accumulator.at(view_id);
-        double min, max, mean, median;
-        if (minMaxMeanMedian(acc.begin(), acc.end(), min, max, mean, median))
-        {
-
-          min_median_value = std::min(min_median_value, median);
-          // Compute depth threshold for each view: factor * medianDepth
-          map_median_depth[view_id] = k_factor * median;
-        }
-      }
-      map_depth_accumulator.clear();
-
-      // Delete invalid observations
-      size_t cpt = 0;
-      for (auto& landmark_it : sfm_data.structure)
-      {
-        Observations obs;
-        for (auto& obs_it : landmark_it.second.obs)
-        {
-          const View* view = sfm_data.views.at(obs_it.first).get();
-          if (sfm_data.IsPoseAndIntrinsicDefined(view))
-          {
-            const Pose3 pose = sfm_data.GetPoseOrDie(view);
-            const double depth = Depth(pose.rotation(), pose.translation(), landmark_it.second.X);
-            if (depth > 0
-              && map_median_depth.count(view->id_view)
-              && depth < map_median_depth[view->id_view])
-              obs.insert(obs_it);
-            else
-              ++cpt;
-          }
-        }
-        landmark_it.second.obs.swap(obs);
-      }
-
-      // Remove orphans
-      eraseUnstablePosesAndObservations(sfm_data, k_min_point_per_pose, k_min_track_length);
-
-      return min_median_value;
-    }
-
-    // Fused filter: runs both angle and pixel-residual outlier removal in a single
-    // pass over the structure, avoiding redundant unordered_map traversals.
-    // Returns {angle_removed, pixel_removed}.
-    std::pair<IndexT, IndexT> RemoveOutliers_AngleAndPixelError
-    (
-      SfM_Data& sfm_data,
-      const double dMinAcceptedAngle,
-      const double dThresholdPixel,
-      const unsigned int minTrackLength
-    )
-    {
-      // --- Shared precomputation (done once instead of twice) ---
-
-      const double dThresholdPixelSq = dThresholdPixel * dThresholdPixel;
-      const double cosThreshold = cos(D2R(dMinAcceptedAngle));
-      const double cos2Threshold = cosThreshold * cosThreshold;
-
-      // Unified per-view cache with precomputed R, t = -RC, R^T, and intrinsic.
-      // Storing R and t directly avoids the R*(X-C) subtraction in Pose3::operator().
-      struct ViewCache {
-        Mat3 R;
-        Vec3 t;               // t = -R*C, so R*X+t == R*(X-C)
-        Mat3 Rt;              // R^T for ray computation
-        const cameras::IntrinsicBase* intrinsic;
-      };
-
-      // Find the max view id to size a flat lookup table
-      IndexT max_view_id = 0;
-      for (const auto& view_it : sfm_data.views)
-      {
-        if (view_it.first > max_view_id)
-          max_view_id = view_it.first;
-      }
-
-      // Flat vector indexed by view_id — O(1) lookup, no hashing
-      std::vector<ViewCache*> view_lut(max_view_id + 1, nullptr);
-      std::vector<ViewCache> view_cache_storage;
-      view_cache_storage.reserve(sfm_data.views.size());
-      for (const auto& view_it : sfm_data.views)
-      {
-        const View* v = view_it.second.get();
-        if (v->id_intrinsic == UndefinedIndexT || v->id_pose == UndefinedIndexT)
-          continue;
-        const auto pose_it = sfm_data.poses.find(v->id_pose);
-        if (pose_it == sfm_data.poses.end())
-          continue;
-        const auto intrinsic_it = sfm_data.intrinsics.find(v->id_intrinsic);
-        if (intrinsic_it == sfm_data.intrinsics.end())
-          continue;
-        const Mat3& R = pose_it->second.rotation();
-        view_cache_storage.push_back({
-          R,
-          -(R * pose_it->second.center()),
-          R.transpose(),
-          intrinsic_it->second.get()
-        });
-        view_lut[view_it.first] = &view_cache_storage.back();
-      }
-
-      // Single traversal of structure to collect workItems
-      std::vector<Landmarks::iterator> workItems;
-      workItems.reserve(sfm_data.structure.size());
-      for (auto it = sfm_data.structure.begin(); it != sfm_data.structure.end(); ++it)
-      {
-        workItems.push_back(it);
-      }
-
-      // --- Per-landmark results ---
-      struct LandmarkResult {
-        IndexT pixel_outliers_removed;
-        bool erase_angle;       // failed angle test -> erase entire landmark
-        bool erase_pixel;       // too few obs after pixel filtering -> erase
-      };
-      std::vector<LandmarkResult> results(workItems.size());
-
-      // --- Parallel pass: angle check + pixel residual filtering ---
-
-#ifdef OPENMVG_USE_OPENMP
-#pragma omp parallel
-#endif
-      {
-        std::vector<Vec3> rays;
-        std::vector<double> sqNorms;
-        std::vector<const ViewCache*> obs_vc;
-
-#ifdef OPENMVG_USE_OPENMP
-#pragma omp for schedule(static, 128)
-#endif
-        for (int i = 0; i < static_cast<int>(workItems.size()); ++i)
-        {
-          auto& tracks_it = *workItems[i];
-          Observations& obs = tracks_it.second.obs;
-          const Vec3& X = tracks_it.second.X;
-          LandmarkResult& res = results[i];
-          res.pixel_outliers_removed = 0;
-          res.erase_angle = false;
-          res.erase_pixel = false;
-
-          // --- Resolve ViewCache pointers once, reuse in both phases ---
-          obs_vc.clear();
-          obs_vc.reserve(obs.size());
-          for (const auto& obs_it : obs)
-          {
-            const IndexT view_id = obs_it.first;
-            obs_vc.push_back(
-              view_id <= max_view_id ? view_lut[view_id] : nullptr);
-          }
-
-          // --- Phase 1: Angle check ---
-          bool convergent = false;
-          rays.clear();
-          sqNorms.clear();
-          rays.reserve(obs.size());
-          sqNorms.reserve(obs.size());
-
-          size_t obs_idx = 0;
-          for (const auto& obs_it : obs)
-          {
-            const ViewCache* vc = obs_vc[obs_idx++];
-            if (vc)
-            {
-              const Vec2 cam_pt = vc->intrinsic->ima2cam(obs_it.second.x);
-              const Vec2 undist_pt = vc->intrinsic->remove_disto(cam_pt);
-              rays.emplace_back(vc->Rt * undist_pt.homogeneous());
-              sqNorms.push_back(rays.back().squaredNorm());
-            }
-          }
-
-          const size_t rays_size = rays.size();
-          for (size_t ri = 0; ri < rays_size && !convergent; ++ri)
-          {
-            const double sqNorm_i_cos2 = sqNorms[ri] * cos2Threshold;
-            for (size_t rj = ri + 1; rj < rays_size; ++rj)
-            {
-              const double d = rays[ri].dot(rays[rj]);
-              if (d < 0.0 || d * d <= sqNorm_i_cos2 * sqNorms[rj])
-              {
-                convergent = true;
-                break;
-              }
-            }
-          }
-
-          if (!convergent)
-          {
-            res.erase_angle = true;
-            continue;
-          }
-
-          // --- Phase 2: Pixel residual filtering ---
-          // Use push_back_unchecked to skip the O(n) find() per element
-          // since we know keys are unique (copying from an existing SmallMap).
-          Observations inlier_obs;
-          inlier_obs.reserve(obs.size());
-          IndexT local_outliers = 0;
-
-          obs_idx = 0;
-          for (const auto& obs_it : obs)
-          {
-            const ViewCache* vc = obs_vc[obs_idx++];
-            if (vc)
-            {
-              // R*X + t avoids the R*(X-C) subtraction in Pose3::operator()
-              const Vec3 Xc = vc->R * X + vc->t;
-              const Vec2 residual = vc->intrinsic->residual(Xc, obs_it.second.x);
-              if (residual.squaredNorm() > dThresholdPixelSq)
-              {
-                ++local_outliers;
-                continue;
-              }
-            }
-            inlier_obs.push_back_unchecked(obs_it);
-          }
-
-          res.pixel_outliers_removed = local_outliers;
-          if (local_outliers > 0)
-          {
-            obs.swap(inlier_obs);
-          }
-          res.erase_pixel = (obs.empty() || obs.size() < minTrackLength);
-        }
-      }
-
-      // --- Sequential erasure and accumulation ---
-      IndexT angle_removed = 0;
-      IndexT pixel_outlier_count = 0;
-      for (int i = static_cast<int>(workItems.size()) - 1; i >= 0; --i)
-      {
-        const auto& res = results[i];
-        if (res.erase_angle)
-        {
-          sfm_data.structure.erase(workItems[i]);
-          ++angle_removed;
-        }
-        else
-        {
-          pixel_outlier_count += res.pixel_outliers_removed;
-          if (res.erase_pixel)
-            sfm_data.structure.erase(workItems[i]);
-        }
-      }
-      return { angle_removed, pixel_outlier_count };
     }
   }
 }
+
+/**
+* @brief Implement a statistical Structure filter that remove 3D points that have:
+* - a depth that is too large (threshold computed as factor * median ~= X84)
+* @param sfm_data The sfm scene to filter (inplace filtering)
+* @param k_factor The factor applied to the median depth per view
+* @param k_min_point_per_pose Keep only poses that have at least this amount of points
+* @param k_min_track_length Keep only tracks that have at least this length
+* @return The min_median_value observed for all the view
+*/
+double DepthCleaning
+(
+  SfM_Data & sfm_data,
+  const double k_factor,
+  const IndexT k_min_point_per_pose,
+  const IndexT k_min_track_length
+)
+{
+  // Per-view (pose, view_id) cache. The original code did views.at() +
+  // IsPoseAndIntrinsicDefined() + GetPoseOrDie() per observation in *both*
+  // passes (and used std::map for the depth/median accumulators). We use
+  // the same flat-vector trick as the rest of this file: array index by
+  // view_id when ids are dense, Hash_Map fallback for sparse id ranges.
+  // view_cache, depth accumulator and median-depth all share the same
+  // sparseness decision since they're all keyed by view_id.
+  struct ViewCache {
+    geometry::Pose3 pose;
+    IndexT view_id = UndefinedIndexT; // == sentinel "invalid slot" on flat path
+  };
+
+  IndexT max_view_id = 0;
+  bool any_view = false;
+  for (const auto & view_it : sfm_data.views)
+  {
+    if (view_it.first > max_view_id) max_view_id = view_it.first;
+    any_view = true;
+  }
+  const bool use_flat =
+    any_view &&
+    max_view_id != UndefinedIndexT &&
+    static_cast<size_t>(max_view_id) < sfm_data.views.size() * 8 + 64;
+
+  // thread_local-static buffers: DepthCleaning is called multiple times
+  // per stellar reconstruction; per-view depth-accumulator inner vectors
+  // are the main capacity we want to retain across calls. ViewCache and
+  // median_depth contain no heap, so plain assign() is fine for those.
+  thread_local static std::vector<ViewCache> view_cache_flat;
+  thread_local static Hash_Map<IndexT, ViewCache> view_cache_hash;
+  if (use_flat)
+  {
+    view_cache_flat.assign(static_cast<size_t>(max_view_id) + 1, ViewCache{});
+  }
+  else
+  {
+    view_cache_hash.clear();
+    view_cache_hash.reserve(sfm_data.views.size());
+  }
+
+  for (const auto & view_it : sfm_data.views)
+  {
+    const View * v = view_it.second.get();
+    if (!v || v->id_intrinsic == UndefinedIndexT || v->id_pose == UndefinedIndexT)
+      continue;
+    const auto pose_it = sfm_data.poses.find(v->id_pose);
+    if (pose_it == sfm_data.poses.end()) continue;
+    if (sfm_data.intrinsics.find(v->id_intrinsic) == sfm_data.intrinsics.end())
+      continue;
+    if (use_flat)
+      view_cache_flat[view_it.first] = { pose_it->second, v->id_view };
+    else
+      view_cache_hash[view_it.first] = { pose_it->second, v->id_view };
+  }
+
+  auto get_cache = [&](IndexT view_id) -> const ViewCache * {
+    if (use_flat)
+    {
+      if (view_id > max_view_id) return nullptr;
+      const ViewCache & vc = view_cache_flat[view_id];
+      return (vc.view_id != UndefinedIndexT) ? &vc : nullptr;
+    }
+    const auto it = view_cache_hash.find(view_id);
+    return (it != view_cache_hash.end()) ? &it->second : nullptr;
+  };
+
+  // Per-view depth accumulator. Keyed by ViewCache::view_id (which equals
+  // v->id_view, matching the original std::map<IndexT, ...> behavior).
+  // thread_local-static + clear() each inner so the per-view capacity
+  // (typically thousands of depths) is retained across calls. Avoid
+  // assign(N+1, {}) which would destroy every inner vector.
+  thread_local static std::vector<std::vector<double>> depth_accum_flat;
+  thread_local static Hash_Map<IndexT, std::vector<double>> depth_accum_hash;
+  if (use_flat)
+  {
+    if (depth_accum_flat.size() < static_cast<size_t>(max_view_id) + 1)
+      depth_accum_flat.resize(static_cast<size_t>(max_view_id) + 1);
+    for (auto & v : depth_accum_flat) v.clear();
+  }
+  else
+  {
+    for (auto & kv : depth_accum_hash) kv.second.clear();
+    depth_accum_hash.reserve(sfm_data.views.size());
+  }
+
+  auto push_depth = [&](IndexT view_id, double d) {
+    if (use_flat) depth_accum_flat[view_id].push_back(d);
+    else          depth_accum_hash[view_id].push_back(d);
+  };
+
+  // Pass 1: accumulate per-view depths.
+  for (const auto & landmark_it : sfm_data.structure)
+  {
+    const Vec3 & X = landmark_it.second.X;
+    for (const auto & obs_it : landmark_it.second.obs)
+    {
+      const ViewCache * vc = get_cache(obs_it.first);
+      if (!vc) continue;
+      const double depth = Depth(vc->pose.rotation(), vc->pose.translation(), X);
+      if (depth > 0)
+        push_depth(vc->view_id, depth);
+    }
+  }
+
+  // Per-view median depth -> threshold (k_factor * median). Sentinel
+  // kNoMedian (negative) marks views with no usable accumulator. Negative
+  // sentinel is safe because all real thresholds are k_factor*positive
+  // depths > 0.
+  static constexpr double kNoMedian = -1.0;
+  thread_local static std::vector<double> median_depth_flat;
+  thread_local static Hash_Map<IndexT, double> median_depth_hash;
+  if (use_flat)
+  {
+    median_depth_flat.assign(static_cast<size_t>(max_view_id) + 1, kNoMedian);
+  }
+  else
+  {
+    median_depth_hash.clear();
+    median_depth_hash.reserve(sfm_data.views.size());
+  }
+
+  double min_median_value = std::numeric_limits<double>::max();
+  auto consume_acc = [&](IndexT view_id, std::vector<double> & acc) {
+    if (acc.empty()) return;
+    double mn, mx, mean, median;
+    if (minMaxMeanMedian(acc.begin(), acc.end(), mn, mx, mean, median))
+    {
+      min_median_value = std::min(min_median_value, median);
+      const double thresh = k_factor * median;
+      if (use_flat) median_depth_flat[view_id] = thresh;
+      else          median_depth_hash[view_id] = thresh;
+    }
+  };
+  if (use_flat)
+  {
+    for (size_t vid = 0; vid <= static_cast<size_t>(max_view_id); ++vid)
+      consume_acc(static_cast<IndexT>(vid), depth_accum_flat[vid]);
+  }
+  else
+  {
+    for (auto & kv : depth_accum_hash)
+      consume_acc(kv.first, kv.second);
+  }
+  // Note: the accumulator is intentionally NOT freed between passes here.
+  // It's a thread_local cache reused across calls; freeing it would
+  // defeat the amortization. Peak working set is the same as before since
+  // the cache would have been re-allocated by the next call anyway.
+
+  auto get_median = [&](IndexT view_id) -> double {
+    if (use_flat)
+    {
+      if (view_id > max_view_id) return kNoMedian;
+      return median_depth_flat[view_id];
+    }
+    const auto it = median_depth_hash.find(view_id);
+    return (it != median_depth_hash.end()) ? it->second : kNoMedian;
+  };
+
+  // Pass 2: in-place erase. Original semantics:
+  //   - obs without a valid view cache entry -> drop.
+  //   - obs with depth <= 0, missing median, or depth >= threshold -> drop.
+  //   - else keep.
+  // The original built a fresh Observations map per landmark and swapped
+  // it in, paying an insert per kept obs. In-place erase is O(1) per
+  // kept obs.
+  for (auto & landmark_it : sfm_data.structure)
+  {
+    const Vec3 & X = landmark_it.second.X;
+    Observations & obs = landmark_it.second.obs;
+    auto itObs = obs.begin();
+    while (itObs != obs.end())
+    {
+      bool keep = false;
+      const ViewCache * vc = get_cache(itObs->first);
+      if (vc)
+      {
+        const double depth = Depth(vc->pose.rotation(), vc->pose.translation(), X);
+        const double thresh = get_median(vc->view_id);
+        keep = (depth > 0) && (thresh >= 0.0) && (depth < thresh);
+      }
+      if (keep)
+        ++itObs;
+      else
+        itObs = obs.erase(itObs);
+    }
+  }
+
+  // Remove orphans
+  eraseUnstablePosesAndObservations(sfm_data, k_min_point_per_pose, k_min_track_length);
+
+  return min_median_value;
+}
+
+} // namespace sfm
+} // namespace openMVG

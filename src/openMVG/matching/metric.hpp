@@ -68,6 +68,11 @@ struct L2<uint8_t>
     }
     #endif
 
+    if (size == 128)
+    {
+      return L2_SSE2_uint8(a, b, size);
+    }
+
     ResultType result = ResultType();
     ResultType diff0, diff1, diff2, diff3;
     Iterator1 last = a + size;

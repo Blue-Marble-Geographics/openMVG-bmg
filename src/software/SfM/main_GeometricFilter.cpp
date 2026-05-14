@@ -63,6 +63,10 @@ enum EGeometricModel
 /// - Export computed data
 int main( int argc, char** argv )
 {
+  // -- Diagnostic: force INFO-level logging so [Diagnostic] lines are always visible.
+  openMVG::system::logger::logger_severity =
+      openMVG::system::logger::ELogMode::VERBOSITY_INFO;
+
   CmdLine cmd;
 
   // The scene
@@ -204,6 +208,21 @@ int main( int argc, char** argv )
     OPENMVG_LOG_ERROR << "The input SfM_Data file \"" << sSfM_Data_Filename << "\" cannot be read.";
     return EXIT_FAILURE;
   }
+  // -- Diagnostic: report what was loaded from the SfM_Data file
+  OPENMVG_LOG_INFO << "[Diagnostic] SfM_Data loaded from \"" << sSfM_Data_Filename << "\"\n"
+                   << "             #views      : " << sfm_data.GetViews().size() << "\n"
+                   << "             #intrinsics : " << sfm_data.GetIntrinsics().size() << "\n"
+                   << "             #poses      : " << sfm_data.GetPoses().size();
+  if ( sfm_data.GetViews().empty() )
+  {
+    OPENMVG_LOG_ERROR << "[Diagnostic] SfM_Data contains no views, cannot continue.";
+    return EXIT_FAILURE;
+  }
+  if ( sfm_data.GetIntrinsics().empty() )
+  {
+    OPENMVG_LOG_WARNING << "[Diagnostic] SfM_Data contains no intrinsics; "
+                           "essential/angular/ortho/upright models will likely fail.";
+  }
 
   //---------------------------------------
   // Load SfM Scene regions
@@ -218,6 +237,9 @@ int main( int argc, char** argv )
     OPENMVG_LOG_ERROR << "Invalid: " << sImage_describer << " regions type file.";
     return EXIT_FAILURE;
   }
+  OPENMVG_LOG_INFO << "[Diagnostic] Region type initialized from \"" << sImage_describer << "\""
+                   << " (Type_id=" << regions_type->Type_id()
+                   << ", IsBinary=" << (regions_type->IsBinary() ? "true" : "false") << ")";
 
   //---------------------------------------
   // a. Compute putative descriptor matches
@@ -246,6 +268,7 @@ int main( int argc, char** argv )
     OPENMVG_LOG_ERROR << "Invalid regions.";
     return EXIT_FAILURE;
   }
+  OPENMVG_LOG_INFO << "[Diagnostic] Regions loaded from \"" << sMatchesDirectory << "\"";
 
   PairWiseMatches map_PutativeMatches;
   //---------------------------------------
@@ -256,6 +279,20 @@ int main( int argc, char** argv )
     OPENMVG_LOG_ERROR << "Failed to load the initial matches file.";
     return EXIT_FAILURE;
   }
+  // -- Diagnostic: summarize the putative matches that were loaded
+  {
+    std::size_t total_putative_corr = 0;
+    for ( const auto& it : map_PutativeMatches )
+      total_putative_corr += it.second.size();
+    OPENMVG_LOG_INFO << "[Diagnostic] Putative matches loaded from \"" << sPutativeMatchesFilename << "\"\n"
+                     << "             #pairs        : " << map_PutativeMatches.size() << "\n"
+                     << "             #correspondences : " << total_putative_corr;
+    if ( map_PutativeMatches.empty() )
+    {
+      OPENMVG_LOG_ERROR << "[Diagnostic] No putative matches available, geometric filtering would be a no-op.";
+      return EXIT_FAILURE;
+    }
+  }
 
   if ( !sInputPairsFilename.empty() )
   {
@@ -263,10 +300,19 @@ int main( int argc, char** argv )
     OPENMVG_LOG_INFO << "Loading input pairs ...";
     Pair_Set input_pairs;
     loadPairs( sfm_data.GetViews().size(), sInputPairsFilename, input_pairs );
+    OPENMVG_LOG_INFO << "[Diagnostic] Input pairs loaded: " << input_pairs.size();
 
     // Filter matches with the given pairs
     OPENMVG_LOG_INFO << "Filtering matches with the given pairs.";
+    const std::size_t before = map_PutativeMatches.size();
     map_PutativeMatches = getPairs( map_PutativeMatches, input_pairs );
+    OPENMVG_LOG_INFO << "[Diagnostic] Putative pairs after input-pairs filtering: "
+                     << map_PutativeMatches.size() << " (was " << before << ")";
+    if ( map_PutativeMatches.empty() )
+    {
+      OPENMVG_LOG_ERROR << "[Diagnostic] Input pairs filter removed all putative matches.";
+      return EXIT_FAILURE;
+    }
   }
 
   //---------------------------------------
@@ -371,10 +417,36 @@ int main( int argc, char** argv )
     //---------------------------------------
     //-- Export geometric filtered matches
     //---------------------------------------
+    {
+      std::size_t total_geom_corr = 0;
+      for ( const auto& it : map_GeometricMatches )
+        total_geom_corr += it.second.size();
+      OPENMVG_LOG_INFO << "[Diagnostic] Geometric matches to export\n"
+                       << "             #pairs           : " << map_GeometricMatches.size() << "\n"
+                       << "             #correspondences : " << total_geom_corr;
+      if ( map_GeometricMatches.empty() )
+      {
+        OPENMVG_LOG_WARNING << "[Diagnostic] No geometric matches survived filtering. "
+                               "Check feature quality, geometric model choice, or max_iteration.";
+      }
+    }
     if ( !Save( map_GeometricMatches, sFilteredMatchesFilename ) )
     {
       OPENMVG_LOG_ERROR << "Cannot save filtered matches in: " << sFilteredMatchesFilename;
       return EXIT_FAILURE;
+    }
+    // -- Diagnostic: confirm the file actually landed on disk and is non-empty
+    if ( !stlplus::file_exists( sFilteredMatchesFilename ) )
+    {
+      OPENMVG_LOG_ERROR << "[Diagnostic] Save reported success but the file does not exist: "
+                        << sFilteredMatchesFilename;
+      return EXIT_FAILURE;
+    }
+    else
+    {
+      OPENMVG_LOG_INFO << "[Diagnostic] Filtered matches written to \""
+                       << sFilteredMatchesFilename << "\" ("
+                       << stlplus::file_size( sFilteredMatchesFilename ) << " bytes)";
     }
 
     // -- export Geometric View Graph statistics
@@ -410,6 +482,9 @@ int main( int argc, char** argv )
         OPENMVG_LOG_ERROR << "Failed to write pairs file";
         return EXIT_FAILURE;
       }
+      OPENMVG_LOG_INFO << "[Diagnostic] Output pairs written: " << outputPairs.size()
+                       << " pair(s) to \"" << sOutputPairsFilename << "\" ("
+                       << stlplus::file_size( sOutputPairsFilename ) << " bytes)";
     }
   }
   return EXIT_SUCCESS;

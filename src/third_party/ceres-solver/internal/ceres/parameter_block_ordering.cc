@@ -47,9 +47,32 @@ using std::map;
 using std::set;
 using std::vector;
 
-#if 1
+// Optimized drop-in replacement for the reference implementation that
+// builds an explicit Graph<ParameterBlock*> and then calls
+// StableIndependentSetOrdering.  Produces the identical ordering but
+// avoids:
+//   - Building HashSet/HashMap-based Graph (per-vertex hash-table allocs).
+//   - Calling graph.Neighbors(v).size() twice per stable_sort compare
+//     (hash-map lookup with pointer hashing).
+//   - HashMap<Vertex, char> vertex_color lookups in the greedy loops.
+//
+// The algorithm is semantically identical to
+//   scoped_ptr<Graph<ParameterBlock*>> g(CreateHessianGraph(program));
+//   ordering = {non-const params in program order};
+//   StableIndependentSetOrdering(*g, ordering);
+//   append constants in program order;
+//
+// Correctness invariants preserved:
+//   1. "degree" = number of distinct non-constant parameter blocks that
+//      share at least one residual with this vertex.  Matches
+//      graph.Neighbors(v).size() exactly.
+//   2. stable_sort by ascending degree; ties broken by insertion order
+//      (= program order of non-constant blocks), matching the reference.
+//   3. Greedy pass and remainder pass walk vertexQueue in the same
+//      sorted order as the reference's vertex_queue.
+//   4. Constants appended in program order at the end.
 int ComputeStableSchurOrdering(const Program& program,
-  vector<ParameterBlock*>* ordering) {
+                               vector<ParameterBlock*>* ordering) {
   CHECK_NOTNULL(ordering)->clear();
   EventLogger eventLogger("ComputeStableSchurOrdering");
 
@@ -59,6 +82,7 @@ int ComputeStableSchurOrdering(const Program& program,
   const int numParameterBlocks = static_cast<int>(parameterBlocks.size());
   const int numResidualBlocks = static_cast<int>(residualBlocks.size());
 
+  // Count non-constant parameter blocks for precise reservation.
   int numNonConstant = 0;
   for (int i = 0; i < numParameterBlocks; ++i) {
     if (!parameterBlocks[i]->IsConstant()) {
@@ -66,6 +90,7 @@ int ComputeStableSchurOrdering(const Program& program,
     }
   }
 
+  // Degenerate case: nothing to order; just append constants.
   if (numNonConstant == 0) {
     for (int i = 0; i < numParameterBlocks; ++i) {
       if (parameterBlocks[i]->IsConstant()) {
@@ -75,6 +100,8 @@ int ComputeStableSchurOrdering(const Program& program,
     return 0;
   }
 
+  // Map each non-constant ParameterBlock* to a dense [0, numNonConstant)
+  // index so the rest of the computation uses small integers.
   HashMap<ParameterBlock*, int> blockToIndex;
   blockToIndex.reserve(numNonConstant);
 
@@ -86,17 +113,21 @@ int ComputeStableSchurOrdering(const Program& program,
     if (pb->IsConstant()) {
       continue;
     }
-
     const int idx = static_cast<int>(nonConstantBlocks.size());
     nonConstantBlocks.push_back(pb);
     blockToIndex.emplace(pb, idx);
   }
 
+  // Packed CSR-like adjacency:
+  //   residualAdj[r] = {offset, count} into residualBlockIds giving
+  //     the indices of the non-constant parameter blocks referenced
+  //     by residual r (residuals with < 2 non-constant blocks are
+  //     skipped entirely since they contribute no edges).
+  //   residualsForBlock[v] = list of residual ids incident on vertex v.
   struct ResidualAdj {
     int offset;
     int count;
   };
-
   vector<ResidualAdj> residualAdj;
   residualAdj.reserve(numResidualBlocks);
 
@@ -114,23 +145,24 @@ int ComputeStableSchurOrdering(const Program& program,
     int count = 0;
 
     if (numPb == 2) {
+      // Fast path: almost all SfM reprojection residuals.
       if (!pb[0]->IsConstant() && !pb[1]->IsConstant()) {
         residualBlockIds.push_back(blockToIndex.find(pb[0])->second);
         residualBlockIds.push_back(blockToIndex.find(pb[1])->second);
         count = 2;
       }
-    }
-    else {
+    } else {
       for (int j = 0; j < numPb; ++j) {
         if (pb[j]->IsConstant()) {
           continue;
         }
-
         residualBlockIds.push_back(blockToIndex.find(pb[j])->second);
         ++count;
       }
     }
 
+    // Residuals touching fewer than 2 non-constant blocks contribute
+    // no edges; drop them so they do not inflate degrees.
     if (count < 2) {
       residualBlockIds.resize(start);
       continue;
@@ -148,6 +180,9 @@ int ComputeStableSchurOrdering(const Program& program,
   }
   eventLogger.AddEvent("BuildInverseIncidence");
 
+  // Compute each vertex's degree = number of DISTINCT non-self neighbors
+  // across all incident residuals.  The mark[] array implements the
+  // classic O(sum degrees) unique-count pattern.
   vector<int> degree(numNonConstant, 0);
   vector<int> mark(numNonConstant, -1);
 
@@ -168,27 +203,28 @@ int ComputeStableSchurOrdering(const Program& program,
         if (mark[nbr] == i) {
           continue;
         }
-
         mark[nbr] = i;
         ++deg;
       }
     }
-
     degree[i] = deg;
   }
   eventLogger.AddEvent("ComputeDegrees");
 
+  // Stable sort by ascending degree; ties break by original (program)
+  // order since stable_sort preserves relative order of equal elements.
   vector<int> vertexQueue(numNonConstant);
   for (int i = 0; i < numNonConstant; ++i) {
     vertexQueue[i] = i;
   }
-
   std::stable_sort(vertexQueue.begin(), vertexQueue.end(),
-    [&](int lhs, int rhs) {
-      return degree[lhs] < degree[rhs];
-    });
+                   [&](int lhs, int rhs) {
+                     return degree[lhs] < degree[rhs];
+                   });
   eventLogger.AddEvent("DegreeSort");
 
+  // Classic greedy independent-set pass with white/grey/black colors.
+  // Identical in structure to StableIndependentSetOrdering.
   const char kWhite = 0;
   const char kGrey = 1;
   const char kBlack = 2;
@@ -206,6 +242,9 @@ int ComputeStableSchurOrdering(const Program& program,
     ordering->push_back(nonConstantBlocks[v]);
     color[v] = kBlack;
 
+    // Mark every non-self neighbor grey.  Walking residualsForBlock
+    // and the packed adjacency is the flat-array equivalent of the
+    // reference's graph.Neighbors(vertex) HashSet iteration.
     const vector<int>& incidentResiduals = residualsForBlock[v];
     for (int rr = 0; rr < static_cast<int>(incidentResiduals.size()); ++rr) {
       const ResidualAdj& adj = residualAdj[incidentResiduals[rr]];
@@ -224,6 +263,9 @@ int ComputeStableSchurOrdering(const Program& program,
   const int independentSetSize = static_cast<int>(ordering->size());
   eventLogger.AddEvent("StableIndependentSet");
 
+  // Append remaining (non-independent-set) non-constant blocks in
+  // sorted-queue order.  Matches the reference's final vertex_queue
+  // walk that pushes kGrey vertices.
   for (int q = 0; q < numNonConstant; ++q) {
     const int v = vertexQueue[q];
     DCHECK(color[v] != kWhite);
@@ -233,6 +275,7 @@ int ComputeStableSchurOrdering(const Program& program,
   }
   eventLogger.AddEvent("RemainingNonConstantParameterBlocks");
 
+  // Finally, append constants in program order.
   for (int i = 0; i < numParameterBlocks; ++i) {
     ParameterBlock* const pb = parameterBlocks[i];
     if (pb->IsConstant()) {
@@ -243,38 +286,6 @@ int ComputeStableSchurOrdering(const Program& program,
 
   return independentSetSize;
 }
-#else
-int ComputeStableSchurOrdering(const Program& program,
-                         vector<ParameterBlock*>* ordering) {
-  CHECK_NOTNULL(ordering)->clear();
-  EventLogger event_logger("ComputeStableSchurOrdering");
-  scoped_ptr<Graph< ParameterBlock*> > graph(CreateHessianGraph(program));
-  event_logger.AddEvent("CreateHessianGraph");
-
-  const vector<ParameterBlock*>& parameter_blocks = program.parameter_blocks();
-  const HashSet<ParameterBlock*>& vertices = graph->vertices();
-  for (int i = 0; i < parameter_blocks.size(); ++i) {
-    if (vertices.count(parameter_blocks[i]) > 0) {
-      ordering->push_back(parameter_blocks[i]);
-    }
-  }
-  event_logger.AddEvent("Preordering");
-
-  int independent_set_size = StableIndependentSetOrdering(*graph, ordering);
-  event_logger.AddEvent("StableIndependentSet");
-
-  // Add the excluded blocks to back of the ordering vector.
-  for (int i = 0; i < parameter_blocks.size(); ++i) {
-    ParameterBlock* parameter_block = parameter_blocks[i];
-    if (parameter_block->IsConstant()) {
-      ordering->push_back(parameter_block);
-    }
-  }
-  event_logger.AddEvent("ConstantParameterBlocks");
-
-  return independent_set_size;
-}
-#endif
 
 int ComputeSchurOrdering(const Program& program,
                          vector<ParameterBlock*>* ordering) {
@@ -320,31 +331,6 @@ void ComputeRecursiveIndependentSetOrdering(const Program& program,
 Graph<ParameterBlock*>* CreateHessianGraph(const Program& program) {
   Graph<ParameterBlock*>* graph = CHECK_NOTNULL(new Graph<ParameterBlock*>);
   const vector<ParameterBlock*>& parameter_blocks = program.parameter_blocks();
-  const vector<ResidualBlock*>& residual_blocks = program.residual_blocks();
-
-  // Count non-constant vertices for precise reservation.
-  int num_vertices = 0;
-  for (int i = 0; i < parameter_blocks.size(); ++i) {
-    if (!parameter_blocks[i]->IsConstant()) {
-      ++num_vertices;
-    }
-  }
-
-  // Count edges (upper bound: one per pair of non-constant params per residual).
-  int num_edges = 0;
-  for (int i = 0; i < residual_blocks.size(); ++i) {
-    const int npb = residual_blocks[i]->NumParameterBlocks();
-    // For typical SfM residuals npb=2, so edges_per_residual=1
-    int non_const = 0;
-    ParameterBlock* const* pb = residual_blocks[i]->parameter_blocks();
-    for (int j = 0; j < npb; ++j) {
-      if (!pb[j]->IsConstant()) ++non_const;
-    }
-    num_edges += non_const * (non_const - 1) / 2;
-  }
-
-  graph->Reserve(num_vertices, num_edges);
-
   for (int i = 0; i < parameter_blocks.size(); ++i) {
     ParameterBlock* parameter_block = parameter_blocks[i];
     if (!parameter_block->IsConstant()) {
@@ -352,29 +338,23 @@ Graph<ParameterBlock*>* CreateHessianGraph(const Program& program) {
     }
   }
 
-  const int num_residual_blocks = static_cast<int>(residual_blocks.size());
-  for (int i = 0; i < num_residual_blocks; ++i) {
+  const vector<ResidualBlock*>& residual_blocks = program.residual_blocks();
+  for (int i = 0; i < residual_blocks.size(); ++i) {
     const ResidualBlock* residual_block = residual_blocks[i];
-    const int num_pb = residual_block->NumParameterBlocks();
-    ParameterBlock* const* pb = residual_block->parameter_blocks();
-
-    // Fast path: most SfM residuals have exactly 2 non-constant parameter blocks.
-    if (num_pb == 2) {
-      if (!pb[0]->IsConstant() && !pb[1]->IsConstant()) {
-        graph->AddEdge(pb[0], pb[1]);
-      }
-      continue;
-    }
-
-    for (int j = 0; j < num_pb; ++j) {
-      if (pb[j]->IsConstant()) {
+    const int num_parameter_blocks = residual_block->NumParameterBlocks();
+    ParameterBlock* const* parameter_blocks =
+        residual_block->parameter_blocks();
+    for (int j = 0; j < num_parameter_blocks; ++j) {
+      if (parameter_blocks[j]->IsConstant()) {
         continue;
       }
-      for (int k = j + 1; k < num_pb; ++k) {
-        if (pb[k]->IsConstant()) {
+
+      for (int k = j + 1; k < num_parameter_blocks; ++k) {
+        if (parameter_blocks[k]->IsConstant()) {
           continue;
         }
-        graph->AddEdge(pb[j], pb[k]);
+
+        graph->AddEdge(parameter_blocks[j], parameter_blocks[k]);
       }
     }
   }

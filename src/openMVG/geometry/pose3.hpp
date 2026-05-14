@@ -11,6 +11,32 @@
 
 #include "openMVG/multiview/projection.hpp"
 
+// [POSE3-PERF] Force-inline marker for the world-to-camera transform
+// operator() below. Pose3::operator()(const Vec3&) is the innermost call
+// in nearly every reprojection-residual loop in the codebase (BA cost
+// functions, RemoveOutliers_*, EjectPosesByMedianResidual, triangulation,
+// resection inlier counting). MSVC at /O2 will usually inline a plain
+// `inline` member but does not guarantee it for templated callers and
+// across-TU paths; __forceinline removes that uncertainty. GCC/Clang map
+// to __attribute__((always_inline)). Output is bit-identical -- this is
+// a code-generation hint only.
+//
+// Toggle: set OPENMVG_POSE3_FORCEINLINE to 0 to revert to plain `inline`.
+#ifndef OPENMVG_POSE3_FORCEINLINE
+#define OPENMVG_POSE3_FORCEINLINE 1
+#endif
+#if OPENMVG_POSE3_FORCEINLINE
+  #if defined(_MSC_VER)
+    #define OPENMVG_POSE3_INLINE __forceinline
+  #elif defined(__GNUC__) || defined(__clang__)
+    #define OPENMVG_POSE3_INLINE inline __attribute__((always_inline))
+  #else
+    #define OPENMVG_POSE3_INLINE inline
+  #endif
+#else
+  #define OPENMVG_POSE3_INLINE inline
+#endif
+
 namespace openMVG
 {
 namespace geometry
@@ -98,12 +124,12 @@ class Pose3
     * @return transformed point
     */
     template<typename T>
-    __forceinline typename T::PlainObject operator() (const T& p) const
+    inline typename T::PlainObject operator() (const T& p) const
     {
       return rotation_ * ( p.colwise() - center_ );
     }
     /// Specialization for Vec3
-    __forceinline typename Vec3::PlainObject operator() (const Vec3& p) const
+    OPENMVG_POSE3_INLINE typename Vec3::PlainObject operator() (const Vec3& p) const
     {
       return rotation_ * ( p - center_ );
     }

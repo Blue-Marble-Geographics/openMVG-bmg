@@ -47,10 +47,12 @@ struct Similarity3
   */
   Mat3X operator () ( const Mat3X & point ) const;
 
-  __forceinline Vec3 AsVec3( const Vec3& point ) const
-  {
-    return scale_ * pose_( point );
-  }
+  /**
+  * @brief Apply transformation to a single point (scalar fast path).
+  *        Avoids the Vec3 -> Mat3X conversion (heap alloc) incurred by the
+  *        Mat3X overload above. Numerically identical.
+  */
+  Vec3 operator () ( const Vec3 & point ) const;
 
   /**
   * @brief Concatenation of pose

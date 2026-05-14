@@ -199,7 +199,7 @@ int main(int argc, char **argv)
           for (Mat::Index i = 0; i < X_SfM.cols(); ++i)
           {
             if (geometry::kernel::Similarity3ErrorSquaredMetric::Error(sim, X_SfM.col(i), X_GPS.col(i)) < lmeds_median)
-              vec_fitting_errors.push_back((X_GPS.col(i) - sim(X_SfM.col(i))).norm());
+              vec_fitting_errors.push_back((X_GPS.col(i) - sim(Vec3(X_SfM.col(i)))).norm());
           }
           std::cout << "\nFound: " << vec_fitting_errors.size() << " inliers"
            << " from " << X_SfM.cols() << " points." << std::endl;

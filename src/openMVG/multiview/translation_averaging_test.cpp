@@ -20,7 +20,7 @@
 using namespace openMVG;
 
 TEST(translation_averaging, globalTi_from_tijs_Triplets_softL1_Ceres) {
-#if 0 // JPB
+
   const int focal = 1000;
   const int principal_Point = 500;
   //-- Setup a circular camera rig or "cardioid".
@@ -66,11 +66,10 @@ TEST(translation_averaging, globalTi_from_tijs_Triplets_softL1_Ceres) {
      EXPECT_NEAR(0.0, DistanceLInfinity(C_computed.normalized(), C_GT.normalized()), 1e-6);
     }
   }
-#endif
 }
 
 TEST(translation_averaging, globalTi_from_tijs_softl1_Ceres) {
-#if 0 // JPB
+
   const int focal = 1000;
   const int principal_Point = 500;
   //-- Setup a circular camera rig or "cardiod".
@@ -116,11 +115,10 @@ TEST(translation_averaging, globalTi_from_tijs_softl1_Ceres) {
      EXPECT_NEAR(0.0, DistanceLInfinity(C_computed.normalized(), C_GT.normalized()), 1e-6);
     }
   }
-#endif
 }
 
 TEST(translation_averaging, globalTi_from_tijs_l2_chordal) {
-#if 0 // JPB
+
   const int focal = 1000;
   const int principal_Point = 500;
   //-- Setup a circular camera rig or "cardiod".
@@ -204,7 +202,6 @@ TEST(translation_averaging, globalTi_from_tijs_l2_chordal) {
       EXPECT_NEAR(0.0, DistanceLInfinity(t_computed.normalized(), t_GT.normalized()), 1e-6);
     }
   }
-#endif
 }
 
 /* ************************************************************************* */

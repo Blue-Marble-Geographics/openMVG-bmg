@@ -117,33 +117,33 @@ using class_type = Intrinsic_Spherical;
     Mat3X bearing(3, points.cols());
     for (Mat2X::Index i(0); i < points.cols(); ++i)
     {
-      bearing.col(i) = Intrinsic_Spherical::oneBearing(points.col(i));
-    }
-    return bearing;
-  }
-
-  void allBearings( Mat3X& result, const Mat2X& points ) const override
-  {
-    result.resize( 3, points.cols() );
-    for (Mat2X::Index i( 0 ); i < points.cols(); ++i)
-    {
-      result.col( i ) = Intrinsic_Spherical::oneBearing( points.col( i ) );
-    }
-  }
-
-  Vec3 oneBearing(const Vec2& p) const override
-  {
-    const Vec2 uv = ima2cam(p);
+      const Vec2 uv = ima2cam(points.col(i));
 
       const double
         lon = uv.x() * 2 * M_PI,
         lat = - uv.y() * 2 * M_PI;
 
-    return Vec3(
+      bearing.col(i) <<
         std::cos(lat) * std::sin(lon),
         -std::sin(lat),
-      std::cos(lat) * std::cos(lon)
-    );
+        std::cos(lat) * std::cos(lon);
+    }
+    return bearing;
+  }
+
+  /**
+  * @brief Scalar bearing fast path (avoids Mat2X/Mat3X allocation).
+  */
+  Vec3 oneBearing( const Vec2 & x ) const override
+  {
+    const Vec2 uv = ima2cam(x);
+    const double
+      lon = uv.x() * 2 * M_PI,
+      lat = - uv.y() * 2 * M_PI;
+    return Vec3(
+      std::cos(lat) * std::sin(lon),
+      -std::sin(lat),
+      std::cos(lat) * std::cos(lon));
   }
 
   /**

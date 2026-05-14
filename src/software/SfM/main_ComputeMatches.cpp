@@ -148,7 +148,41 @@ int main( int argc, char** argv )
     OPENMVG_LOG_ERROR << "The input SfM_Data file \""<< sSfM_Data_Filename << "\" cannot be read.";
     return EXIT_FAILURE;
   }
+
+  // -- Diagnostic: validate the SfM_Data input (always printed)
+  {
+    std::cout << "[diag][input] SfM_Data loaded: \"" << sSfM_Data_Filename << "\""
+      << " | #views: "      << sfm_data.GetViews().size()
+      << " | #intrinsics: " << sfm_data.GetIntrinsics().size()
+      << " | #poses: "      << sfm_data.GetPoses().size()
+      << " | root_path: \"" << sfm_data.s_root_path << "\"\n" << std::flush;
+
+    if (sfm_data.GetViews().empty())
+    {
+      std::cout << "[diag][input] ERROR: SfM_Data has 0 views - nothing to match.\n" << std::flush;
+      return EXIT_FAILURE;
+    }
+    if (sfm_data.GetIntrinsics().empty())
+    {
+      std::cout << "[diag][input] WARNING: SfM_Data has 0 intrinsics - downstream geometric filtering may fail.\n" << std::flush;
+    }
+    if (!sfm_data.s_root_path.empty() && !stlplus::folder_exists(sfm_data.s_root_path))
+    {
+      std::cout << "[diag][input] WARNING: SfM_Data root_path does not exist on disk: \""
+        << sfm_data.s_root_path << "\"\n" << std::flush;
+    }
+  }
+
   const std::string sMatchesDirectory = stlplus::folder_part( sOutputMatchesFilename );
+
+  // -- Diagnostic: validate the output directory (always printed)
+  if (!sMatchesDirectory.empty() && !stlplus::folder_exists(sMatchesDirectory))
+  {
+    std::cout << "[diag][output] ERROR: Output directory does not exist: \"" << sMatchesDirectory << "\"\n" << std::flush;
+    return EXIT_FAILURE;
+  }
+  std::cout << "[diag][output] Output directory: \""
+    << (sMatchesDirectory.empty() ? std::string("<cwd>") : sMatchesDirectory) << "\"\n" << std::flush;
 
   //---------------------------------------
   // Load SfM Scene regions
@@ -198,6 +232,30 @@ int main( int argc, char** argv )
   if (!regions_provider->load(sfm_data, sMatchesDirectory, regions_type, &progress)) {
     OPENMVG_LOG_ERROR << "Cannot load view regions from: " << sMatchesDirectory << ".";
     return EXIT_FAILURE;
+  }
+
+  // -- Diagnostic: confirm regions are actually available for every view (always printed)
+  {
+    size_t missing = 0, empty_regions = 0, total_features = 0;
+    for (const auto & view_it : sfm_data.GetViews())
+    {
+      const IndexT view_id = view_it.second->id_view;
+      const auto regions = regions_provider->get(view_id);
+      if (!regions) { ++missing; continue; }
+      const size_t n = regions->RegionCount();
+      if (n == 0) ++empty_regions;
+      total_features += n;
+    }
+    std::cout << "[diag][input] Regions provider ready"
+      << " | views: "          << sfm_data.GetViews().size()
+      << " | missing: "        << missing
+      << " | empty: "          << empty_regions
+      << " | total features: " << total_features << "\n" << std::flush;
+    if (missing > 0)
+    {
+      std::cout << "[diag][input] ERROR: " << missing << " view(s) have no regions loaded.\n" << std::flush;
+      return EXIT_FAILURE;
+    }
   }
 
   PairWiseMatches map_PutativeMatches;
@@ -351,6 +409,19 @@ int main( int argc, char** argv )
           << sOutputMatchesFilename;
         return EXIT_FAILURE;
       }
+
+      // -- Diagnostic: verify the output match file made it to disk (always printed)
+      if (!stlplus::file_exists(sOutputMatchesFilename) ||
+           stlplus::file_size(sOutputMatchesFilename) == 0)
+      {
+        std::cout << "[diag][output] ERROR: Match file missing or empty after Save(): \""
+          << sOutputMatchesFilename << "\"\n" << std::flush;
+        return EXIT_FAILURE;
+      }
+      std::cout << "[diag][output] Wrote matches: \"" << sOutputMatchesFilename
+        << "\" (" << stlplus::file_size(sOutputMatchesFilename) << " bytes, #pairs: "
+        << map_PutativeMatches.size() << ")\n" << std::flush;
+
       // Save pairs
       const std::string sOutputPairFilename =
         stlplus::create_filespec( sMatchesDirectory, "preemptive_pairs", "txt" );
@@ -363,6 +434,17 @@ int main( int argc, char** argv )
           << sOutputPairFilename;
         return EXIT_FAILURE;
       }
+
+      // -- Diagnostic: verify the pair file made it to disk
+      if (!stlplus::file_exists(sOutputPairFilename) ||
+           stlplus::file_size(sOutputPairFilename) == 0)
+      {
+        std::cout << "[diag][output] ERROR: Pair file missing or empty after savePairs(): \""
+          << sOutputPairFilename << "\"\n" << std::flush;
+        return EXIT_FAILURE;
+      }
+      std::cout << "[diag][output] Wrote pairs: \"" << sOutputPairFilename
+        << "\" (" << stlplus::file_size(sOutputPairFilename) << " bytes)\n" << std::flush;
     }
     OPENMVG_LOG_INFO << "Task (Regions Matching) done in (s): " << timer.elapsed();
   }

@@ -404,8 +404,8 @@ bool Stellar_Solver::Optimize
           && triplet_poses.count(view_J->id_pose))
       {
         // Collect matches
-        const Pair pose_pair(std::min(view_I->id_pose, view_J->id_pose),
-                             std::max(view_I->id_pose, view_J->id_pose));
+        const Pair pose_pair(std::min(view_I->id_pose,view_J->id_pose),
+                             std::max(view_I->id_pose,view_J->id_pose));
         const matching::IndMatches & pair_matches = matches_it.second;
         if (!use_all_matches_)
         {
@@ -471,12 +471,8 @@ bool Stellar_Solver::Optimize
   Bundle_Adjustment_Ceres::BA_Ceres_options options(false, use_threading_);
   options.linear_solver_type_ = ceres::DENSE_SCHUR;
   options.max_linear_solver_iterations_ = 100;
-  options.max_num_iterations_ = 50;
-  options.function_tolerance_ = 1e-6;
-  options.gradient_tolerance_ = 1e-10;
-  options.parameter_tolerance_ = 1e-8;
-  options.use_nonmonotonic_steps_ = false;
-
+  options.parameter_tolerance_ = 0.0;
+  options.gradient_tolerance_ = 1.0;
   Bundle_Adjustment_Ceres bundle_adjustment_obj(options);
   const Optimize_Options ba_refine_parameter_options
   (

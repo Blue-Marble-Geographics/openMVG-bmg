@@ -64,10 +64,50 @@ features::EDESCRIBER_PRESET stringToEnum(const std::string & sPreset)
   return preset;
 }
 
+extern "C" int hasAVX2 = -1;
+extern "C" int hasSSE41 = -1;
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+
+static int
+CpuHasAVX2()
+{
+#if defined(_MSC_VER)
+  int cpuInfo[4];
+  __cpuid(cpuInfo, 0);
+  if (cpuInfo[0] < 7) return 0;
+
+  __cpuidex(cpuInfo, 7, 0);
+  return (cpuInfo[1] & (1 << 5)) != 0;
+#else
+  unsigned eax, ebx, ecx, edx;
+  if (!__get_cpuid_max(0, 0) || __get_cpuid_max(0, 0) < 7)
+    return 0;
+
+  __cpuid_count(7, 0, eax, ebx, ecx, edx);
+  return (ebx & (1 << 5)) != 0;
+#endif
+}
+
+static int
+CpuHasSSE41(void)
+{
+  int info[4];
+  __cpuid(info, 1);
+  return (info[2] & (1 << 19)) != 0;  /* ECX bit 19 = SSE4.1 */
+}
+
 /// - Compute view image description (feature & descriptor extraction)
 /// - Export computed data
 int main(int argc, char **argv)
 {
+  hasAVX2 = CpuHasAVX2();
+  hasSSE41 = CpuHasSSE41();
+
   CmdLine cmd;
 
   std::string sSfM_Data_Filename;
@@ -272,7 +312,7 @@ int main(int argc, char **argv)
         omp_set_num_threads(nb_max_thread);
     }
 
-    #pragma omp parallel for schedule(dynamic) if (iNumThreads > 0) private(imageGray)
+    #pragma omp parallel for schedule(dynamic) private(imageGray)
 #endif
 #endif
 #if (TEST_CF_MAX_IMAGES==0)

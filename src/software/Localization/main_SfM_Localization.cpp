@@ -29,6 +29,9 @@ using namespace openMVG::sfm;
 
 #include <cstdlib>
 
+extern "C" int hasAVX2 = -1;
+extern "C" int hasSSE41 = -1;
+
 #ifdef OPENMVG_USE_OPENMP
 #include <omp.h>
 #endif

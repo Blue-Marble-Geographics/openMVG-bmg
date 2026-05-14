@@ -51,7 +51,6 @@ TEST(Tracks, Simple) {
   // Unit Test check
   //-------------------
 
-#if 0 // JPB WIP
   //0, {(0,0) (1,0) (2,0)}
   //1, {(0,1) (1,1) (2,6)}
   //2, {(0,2) (1,3)}
@@ -63,7 +62,6 @@ TEST(Tracks, Simple) {
   };
   // Check that computed tracks are the desired one
   CHECK(GT_Tracks == map_tracks);
-#endif
 }
 
 TEST(Tracks, filter_3viewAtLeast) {
@@ -132,7 +130,7 @@ TEST(Tracks, Conflict) {
   //-------------------
   // Unit Test check
   //-------------------
-#if 0 // JPB WIP
+
   //0, {(0,0) (1,0) (2,0)}
   //1, {(0,1) (1,1) (2,6)}
   const STLMAPTracks GT_Tracks =
@@ -142,10 +140,8 @@ TEST(Tracks, Conflict) {
   };
   // Check that computed tracks are the desired one
   CHECK(GT_Tracks == map_tracks);
-#endif
 }
 
-#if 0 // JPB WIP
 
 TEST(Tracks, TracksInImages) {
 
@@ -214,7 +210,7 @@ TEST(Tracks, TracksInImages) {
     EXPECT_EQ(0, tracks_out_image0.size());
   }
 }
-#endif
+
 /* ************************************************************************* */
 int main() { TestResult tr; return TestRegistry::runAllTests(tr);}
 /* ************************************************************************* */

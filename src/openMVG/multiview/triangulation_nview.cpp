@@ -60,26 +60,4 @@ bool TriangulateNViewAlgebraic
   return eigen_solver.info() == Eigen::Success;
 }
 
-bool TriangulateNViewAlgebraic2
-(
-  const Mat3X & points,
-  const Mat34* poses,
-  Vec4 *X
-)
-{
-  Mat4 AtA = Mat4::Zero();
-  for (Mat3X::Index i = 0; i < points.cols(); ++i)
-  {
-    const Vec3 point_norm = points.col(i).normalized();
-    const Mat34 cost =
-        poses[i] -
-        point_norm * point_norm.transpose() * poses[i];
-    AtA += cost.transpose() * cost;
-  }
-
-  Eigen::SelfAdjointEigenSolver<Mat4> eigen_solver(AtA);
-  *X = eigen_solver.eigenvectors().col(0);
-  return eigen_solver.info() == Eigen::Success;
-}
-
 }  // namespace openMVG

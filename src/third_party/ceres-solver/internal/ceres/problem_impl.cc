@@ -262,6 +262,11 @@ ResidualBlock* ProblemImpl::AddResidualBlockImpl(
         << "that the cost function expects.";
 
     // Check for duplicate parameter blocks.
+    // sorted_parameter_blocks is a fixed-size stack buffer; bound the write.
+    CHECK_LE(num_parameter_blocks, ResidualBlock::kMaxParameterBlocks)
+        << "Residual blocks with more than "
+        << ResidualBlock::kMaxParameterBlocks
+        << " parameter blocks are not supported in this build.";
     double* sorted_parameter_blocks[ResidualBlock::kMaxParameterBlocks];
     for (int i = 0; i < num_parameter_blocks; ++i) {
       sorted_parameter_blocks[i] = parameter_blocks[i];

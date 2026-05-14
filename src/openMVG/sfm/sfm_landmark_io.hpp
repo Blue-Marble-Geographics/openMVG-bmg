@@ -12,42 +12,10 @@
 #include "openMVG/sfm/sfm_landmark.hpp"
 
 #include <cereal/cereal.hpp> // Serialization
+#include <cereal/types/map.hpp>
 
+#include <map>
 #include <vector>
-
-template <class Archive, typename Key, typename Value, size_t InlineCapacity>
-void save(Archive& ar, const SmallMap<Key, Value, InlineCapacity>& map)
-{
-  const size_t count = map.size();
-  ar(cereal::make_nvp("size", count));
-
-  for (typename SmallMap<Key, Value, InlineCapacity>::const_iterator it = map.begin();
-    it != map.end();
-    ++it)
-  {
-    ar(cereal::make_nvp("key", it->first));
-    ar(cereal::make_nvp("value", it->second));
-  }
-}
-
-template <class Archive, typename Key, typename Value, size_t InlineCapacity>
-void load(Archive& ar, SmallMap<Key, Value, InlineCapacity>& map)
-{
-  size_t count = 0;
-  ar(cereal::make_nvp("size", count));
-
-  map.clear();
-  map.reserve(count);
-
-  for (size_t i = 0; i < count; ++i)
-  {
-    Key key;
-    Value value;
-    ar(cereal::make_nvp("key", key));
-    ar(cereal::make_nvp("value", value));
-    map.insert(std::make_pair(key, value));
-  }
-}
 
 template <class Archive>
 void openMVG::sfm::Observation::save( Archive & ar) const
@@ -72,7 +40,12 @@ void openMVG::sfm::Landmark::save( Archive & ar) const
 {
   const std::vector<double> point { X(0), X(1), X(2) };
   ar(cereal::make_nvp("X", point ));
-  ar(cereal::make_nvp("observations", obs));
+  // Serialize through a std::map so cereal's built-in ordered-map support is
+  // used (the Observations backing store is ankerl::unordered_dense::map which
+  // cereal does not know about). Using std::map also gives a deterministic,
+  // view_id-sorted on-disk order.
+  const std::map<IndexT, Observation> obs_ordered(obs.begin(), obs.end());
+  ar(cereal::make_nvp("observations", obs_ordered));
 }
 
 
@@ -82,7 +55,12 @@ void openMVG::sfm::Landmark::load( Archive & ar)
   std::vector<double> point(3);
   ar(cereal::make_nvp("X", point ));
   X = Eigen::Map<const Vec3>(&point[0]);
-  ar(cereal::make_nvp("observations", obs));
+  std::map<IndexT, Observation> obs_ordered;
+  ar(cereal::make_nvp("observations", obs_ordered));
+  obs.clear();
+  obs.reserve(obs_ordered.size());
+  for (auto & kv : obs_ordered)
+    obs.emplace(kv.first, std::move(kv.second));
 }
 
 #endif // OPENMVG_SFM_SFM_LANDMARK_IO_HPP

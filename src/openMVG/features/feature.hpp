@@ -152,18 +152,43 @@ static bool loadFeatsFromBinFile(
 {
   vec_feat.clear();
 
-  std::ifstream fileIn(sfileNameFeats.c_str(), std::ios::in | std::ios::binary);
-  if (!fileIn.is_open())
-      return false;
-  std::size_t numFeats = 0;
-  fileIn.read(reinterpret_cast<char*>(&numFeats), sizeof(numFeats));
-  vec_feat.resize(numFeats);
-  for (auto & it :vec_feat) {
-      fileIn.read(reinterpret_cast<char*>(&it),sizeof(it));
+  std::ifstream fileIn(sfileNameFeats.c_str(), std::ios::binary);
+  if (!fileIn.is_open()) {
+    return false;
   }
-  const bool bOk = !fileIn.bad();
-  fileIn.close();
-  return bOk;
+
+  std::size_t numFeats = 0;
+  if (!fileIn.read(reinterpret_cast<char*>(&numFeats), sizeof(numFeats))) {
+    return false;
+  }
+
+  if (numFeats == 0) {
+    return true;
+  }
+
+  struct FeatureRecord {
+    float x;
+    float y;
+    float scale;
+    float orientation;
+  };
+
+  std::unique_ptr<FeatureRecord[]> buffer(new FeatureRecord[numFeats]);
+
+  const std::streamsize byteCount =
+    static_cast<std::streamsize>(numFeats * sizeof(FeatureRecord));
+
+  if (!fileIn.read(reinterpret_cast<char*>(buffer.get()), byteCount)) {
+    return false;
+  }
+
+  vec_feat.reserve(numFeats);
+  for (std::size_t i = 0; i < numFeats; ++i) {
+    const auto & rec = buffer[i];
+    vec_feat.emplace_back(rec.x, rec.y, rec.scale, rec.orientation);
+  }
+
+  return true;
 }
 #else
 template<typename FeaturesT>
@@ -190,22 +215,40 @@ static bool loadFeatsFromFile(
 
 /// Write feats to file
 #if BINARY_FEATURES
-template<typename FeaturesT >
+template<typename FeaturesT>
 static bool saveFeatsToBinFile(
   const std::string & sfileNameFeats,
   FeaturesT & vec_feat)
 {
-  std::ofstream file(sfileNameFeats.c_str(), std::ios::out | std::ios::binary);
-  if (!file.is_open())
+  std::ofstream file(sfileNameFeats.c_str(), std::ios::binary);
+  if (!file.is_open()) {
     return false;
-  const std::size_t numFeats = vec_feat.size();
-  file.write((const char*) &numFeats,  sizeof(numFeats));
-  for (const auto& iter : vec_feat) {
-      file.write((const char*) &iter, sizeof(iter));
   }
-  const bool bOk = file.good();
-  file.close();
-  return bOk;
+
+  const std::size_t numFeats = vec_feat.size();
+  if (!file.write(reinterpret_cast<const char*>(&numFeats), sizeof(numFeats))) {
+    return false;
+  }
+
+  std::unique_ptr<float[]> buffer(new float[numFeats * 4]);
+
+  std::size_t outIdx = 0;
+  for (const auto & feat : vec_feat) {
+    buffer[outIdx++] = feat.x();
+    buffer[outIdx++] = feat.y();
+    buffer[outIdx++] = feat.scale();
+    buffer[outIdx++] = feat.orientation();
+  }
+
+  if (numFeats > 0) {
+    if (!file.write(
+      reinterpret_cast<const char*>(buffer.get()),
+      static_cast<std::streamsize>(numFeats * 4 * sizeof(float)))) {
+      return false;
+    }
+  }
+
+  return file.good();
 }
 #else
 template<typename FeaturesT >

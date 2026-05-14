@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstddef>
+#include <random>
 #include <vector>
 
 #include "flann/general.h"
@@ -117,7 +118,12 @@ public:
         for (int i = 0; i < size_; ++i) vals_[i] = i;
 
         // shuffle the elements in the array
-        std::random_shuffle(vals_.begin(), vals_.end(), generator);
+        // std::random_shuffle was removed in C++17; use std::shuffle with a
+        // mt19937 reseeded from std::rand() so seed_random() still controls
+        // the sequence (flann's seed_random calls std::srand).
+        (void)generator; // keep legacy symbol alive; no longer drives the shuffle
+        std::mt19937 rng(static_cast<std::mt19937::result_type>(std::rand()));
+        std::shuffle(vals_.begin(), vals_.end(), rng);
 
         counter_ = 0;
     }

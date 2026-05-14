@@ -354,9 +354,13 @@ Degree2MaximumSpanningForest(const WeightedGraph<Vertex>& graph) {
 
     // This edge can be added, add an edge in either direction with
     // the same weight as the original graph.
+    // WeightedGraph::AddEdge already inserts both adjacency directions
+    // and assigns the edge weight under the canonical (min,max) key,
+    // so a single call is sufficient -- the symmetric reverse call is
+    // a no-op (returns false on the duplicate insert + reassigns the
+    // same weight).
     const double edge_weight = graph.EdgeWeight(vertex1, vertex2);
     forest->AddEdge(vertex1, vertex2, edge_weight);
-    forest->AddEdge(vertex2, vertex1, edge_weight);
 
     // Connected the two connected components by updating the
     // disjoint_set structure. Always connect the connected component

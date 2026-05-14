@@ -46,6 +46,7 @@
 #include <map>
 #endif
 #include <math.h>
+#include <random>
 #include <stddef.h>
 
 #include "flann/util/dynamic_bitset.h"
@@ -364,7 +365,11 @@ inline LshTable<unsigned char>::LshTable(unsigned int feature_size, unsigned int
     // A bit brutal but fast to code
     std::vector<size_t> indices(feature_size * CHAR_BIT);
     for (size_t i = 0; i < feature_size * CHAR_BIT; ++i) indices[i] = i;
-    std::random_shuffle(indices.begin(), indices.end());
+    // std::random_shuffle was removed in C++17; use std::shuffle.
+    {
+        std::mt19937 rng(static_cast<std::mt19937::result_type>(std::rand()));
+        std::shuffle(indices.begin(), indices.end(), rng);
+    }
 
     // Generate a random set of order of subsignature_size_ bits
     for (unsigned int i = 0; i < key_size_; ++i) {

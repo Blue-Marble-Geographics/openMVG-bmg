@@ -173,6 +173,14 @@ if (BLAS_FOUND AND LAPACK_FOUND)
   list(APPEND CERES_LIBRARY_PRIVATE_DEPENDENCIES ${BLAS_LIBRARIES})
 endif (BLAS_FOUND AND LAPACK_FOUND)
 
+# ---------------------------------------------------------------------------
+# openMVG/Ceres fork: per-thread shadow LHS for the Schur eliminator.
+# Toggle is now defined directly in internal/ceres/schur_eliminator.h
+# (CERES_SCHUR_PER_THREAD_LHS) along with the rest of the Schur
+# optimisation knobs (CACHE_INVERSE_ETE, CACHE_CELL_LOOKUPS,
+# BACKSUB_INPLACE, SHARDED_SPINLOCKS). Edit the header to flip.
+# ---------------------------------------------------------------------------
+
 if (OPENMP_FOUND)
   # OpenMP support in Clang requires a non-GNU OpenMP library.
   if (CMAKE_COMPILER_IS_GNUCXX)

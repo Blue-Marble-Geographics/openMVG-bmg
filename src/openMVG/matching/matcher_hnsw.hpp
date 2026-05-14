@@ -13,7 +13,9 @@
 #ifdef OPENMVG_USE_OPENMP
 #include <omp.h>
 #endif
+#include <queue>
 #include <typeindex>
+#include <utility>
 #include <vector>
 
 #include "openMVG/matching/matching_interface.hpp"
@@ -192,6 +194,35 @@ public:
     }
     return true;
   };
+
+  /**
+   * Per-query N-NN search that returns hnswlib's raw result priority queue.
+   *
+   * Unlike SearchNeighbours (which parallelises the query loop internally via
+   * OpenMP and wraps the result into IndMatches), this overload is intended
+   * for callers that already parallelise across pairs or queries and want to
+   * avoid nested OpenMP regions. It is safe to call concurrently from
+   * multiple threads on a built index (hnswlib::HierarchicalNSW::searchKnn is
+   * read-only once construction is done).
+   *
+   * \param[in] query  Pointer to a single descriptor of length dimension_.
+   * \param[in] NN     Number of nearest neighbours to retrieve.
+   * \return  A max-priority-queue of (distance, label) pairs as returned by
+   *          hnswlib, with the farthest neighbour at top(). Empty if the
+   *          index has not been built.
+   */
+  std::priority_queue<std::pair<DistanceType, hnswlib::labeltype>>
+  SearchKnn(const Scalar * query, size_t NN)
+  {
+    if (!HNSW_matcher_)
+      return {};
+    if (NN <= 2) {
+      HNSW_matcher_->setEf(16);
+    } else {
+      HNSW_matcher_->setEf(NN * 2);
+    }
+    return HNSW_matcher_->searchKnn(static_cast<const void *>(query), NN);
+  }
 
 private:
   int dimension_;

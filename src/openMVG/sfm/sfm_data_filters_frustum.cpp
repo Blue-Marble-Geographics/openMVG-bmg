@@ -96,6 +96,17 @@ const
   std::transform(z_near_z_far_perView.cbegin(), z_near_z_far_perView.cend(),
     std::back_inserter(viewIds), stl::RetrieveKey());
 
+  // Hoist `frustum_perView.at(viewIds[k])` once per view: the original code
+  // re-hashed for every (i, j) pair (O(N^2) hash probes -- ~4M for a 2k-view
+  // scene, all serialized DRAM probes). Lookup is now a flat-array index by
+  // position. frustum_perView is not mutated here (this method is const), so
+  // the pointers stay valid for the duration of the function. Same Frustum
+  // objects are passed to intersect() in the same order; semantics identical.
+  std::vector<const geometry::Frustum *> frustum_ptrs;
+  frustum_ptrs.reserve(viewIds.size());
+  for (const IndexT id : viewIds)
+    frustum_ptrs.push_back(&frustum_perView.at(id));
+
   system::LoggerProgress my_progress_bar(
     viewIds.size() * (viewIds.size()-1)/2,
     "Computing frustum intersection");
@@ -107,14 +118,14 @@ const
   for (int i = 0; i < (int)viewIds.size(); ++i)
   {
     // Prepare vector of intersecting objects (within loop to keep it
-    // thread-safe)
+    // thread-safe). Outer-loop frustum is hoisted out of the j loop.
     std::vector<HalfPlaneObject> objects = bounding_volume;
     objects.insert(objects.end(),
-                   { frustum_perView.at(viewIds[i]), HalfPlaneObject() });
+                   { *frustum_ptrs[i], HalfPlaneObject() });
 
     for (size_t j = i+1; j < viewIds.size(); ++j)
     {
-      objects.back() = frustum_perView.at(viewIds[j]);
+      objects.back() = *frustum_ptrs[j];
       if (intersect(objects))
       {
 #ifdef OPENMVG_USE_OPENMP
@@ -234,6 +245,63 @@ void Frustum_Filter::init_z_near_z_far_depth
   const bool bComputed_Z = (zNear == -1. && zFar == -1.) && !sfm_data.structure.empty();
   if (bComputed_Z)  // Compute the near & far planes from the structure and view observations
   {
+    // Per-view (R, t) cache resolved once. Original per-obs path:
+    //   views.at + IsPoseAndIntrinsicDefined (2 hashed finds) + GetPoseOrDie
+    //   (1 hashed find) = 4 hash probes per observation, repeated over the
+    // entire structure. We hoist them so per-obs cost becomes one id->index
+    // lookup + the existing z_near_z_far_perView find/insert.
+    //
+    // Use a flat std::vector indexed by view_id when ids are dense (typical
+    // OpenMVG case: ids are [0..N)); fall back to Hash_Map otherwise. Same
+    // sparseness heuristic as the rest of the codebase.
+    struct ViewRT { Mat3 R; Vec3 t; bool valid = false; };
+
+    IndexT max_view_id = 0;
+    bool any_view = false;
+    for (const auto & v_it : sfm_data.GetViews())
+    {
+      if (v_it.first > max_view_id) max_view_id = v_it.first;
+      any_view = true;
+    }
+    const bool use_flat =
+      any_view &&
+      max_view_id != UndefinedIndexT &&
+      static_cast<size_t>(max_view_id) < sfm_data.GetViews().size() * 8 + 64;
+
+    std::vector<ViewRT> view_rt_flat;
+    Hash_Map<IndexT, ViewRT> view_rt_hash;
+    if (use_flat)
+      view_rt_flat.assign(static_cast<size_t>(max_view_id) + 1, ViewRT{});
+    else
+      view_rt_hash.reserve(sfm_data.GetViews().size());
+
+    for (const auto & v_it : sfm_data.GetViews())
+    {
+      const View * view = v_it.second.get();
+      if (!sfm_data.IsPoseAndIntrinsicDefined(view))
+        continue;
+      const Pose3 pose = sfm_data.GetPoseOrDie(view);
+      ViewRT r;
+      r.R = pose.rotation();
+      r.t = pose.translation();
+      r.valid = true;
+      if (use_flat)
+        view_rt_flat[v_it.first] = r;
+      else
+        view_rt_hash[v_it.first] = r;
+    }
+
+    auto get_rt = [&](IndexT view_id) -> const ViewRT * {
+      if (use_flat)
+      {
+        if (view_id > max_view_id) return nullptr;
+        const ViewRT & r = view_rt_flat[view_id];
+        return r.valid ? &r : nullptr;
+      }
+      const auto it = view_rt_hash.find(view_id);
+      return (it != view_rt_hash.end()) ? &it->second : nullptr;
+    };
+
     for (Landmarks::const_iterator itL = sfm_data.GetLandmarks().begin();
       itL != sfm_data.GetLandmarks().end(); ++itL)
     {
@@ -243,12 +311,10 @@ void Frustum_Filter::init_z_near_z_far_depth
         iterO != landmark.obs.end(); ++iterO)
       {
         const IndexT id_view = iterO->first;
-        const View * view = sfm_data.GetViews().at(id_view).get();
-        if (!sfm_data.IsPoseAndIntrinsicDefined(view))
-          continue;
+        const ViewRT * rt = get_rt(id_view);
+        if (!rt) continue;
 
-        const Pose3 pose = sfm_data.GetPoseOrDie(view);
-        const double z = Depth(pose.rotation(), pose.translation(), X);
+        const double z = Depth(rt->R, rt->t, X);
         NearFarPlanesT::iterator itZ = z_near_z_far_perView.find(id_view);
         if (itZ != z_near_z_far_perView.end())
         {

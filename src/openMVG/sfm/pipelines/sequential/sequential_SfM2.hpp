@@ -11,6 +11,7 @@
 
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "openMVG/sfm/pipelines/sfm_engine.hpp"
@@ -18,6 +19,17 @@
 #include "openMVG/multiview/solver_resection.hpp"
 #include "openMVG/multiview/triangulation_method.hpp"
 #include "openMVG/tracks/tracks.hpp"
+
+#define OPENMVG_SFM_PIPELINE_DIAG 1 // JPB WIP BUG
+
+// Toggle: use FAST/BALANCED presets on intermediate BAs vs. STRICT-everywhere.
+//   1 = current optimisation (fewer iters, looser tols on intermediate BAs).
+//   0 = S3 reference behaviour (every BA is STRICT). Use 0 to recover the
+//       last ~5K tracks lost on dataset where intermediate BAs under-converge
+//       and the post-BA outlier filter then ejects too many observations.
+#ifndef OPENMVG_SFM2_FAST_INTERMEDIATE_BA
+#define OPENMVG_SFM2_FAST_INTERMEDIATE_BA 1
+#endif
 
 namespace htmlDocument { class htmlDocumentStream; }
 
@@ -27,6 +39,12 @@ namespace sfm {
 struct Features_Provider;
 struct Matches_Provider;
 class SfMSceneInitializer;
+
+#if OPENMVG_SFM_PIPELINE_DIAG
+// Forward-declare at NAMESPACE scope so the .cpp's namespace-scope
+// definition matches. The full definition is kept private to the .cpp.
+struct ViewDiagRecord;
+#endif
 
 /// Sequential SfM Pipeline Reconstruction Engine.
 /// This engine uses existing poses or starts from scratch the reconstruction
@@ -54,10 +72,27 @@ public:
   bool Triangulation();
 
   /// Adding missing view (Try to find the pose of the missing camera)
+#if OPENMVG_SFM_PIPELINE_DIAG
+  bool AddingMissingView(
+    const float & track_inlier_ratio,
+    Hash_Map<IndexT, ViewDiagRecord> * diag_records = nullptr);
+#else
   bool AddingMissingView(const float & track_inlier_ratio);
+#endif
+
+  /// BA preset selector for intermediate vs final BA passes.
+  ///   STRICT   = reference defaults (50 iter, 1e-8 param tol, 1e-6 func tol, max_invalid=5).
+  ///              Used for the final BA and historically for every intermediate BA.
+  ///   BALANCED = 30 iter, 1e-7 param tol, 1e-5 func tol, max_invalid=4. Converges well
+  ///              even when motion-prior penalties are active (the prior term needs more
+  ///              LM iterations to balance reprojection than FAST allows). Roughly 30%
+  ///              faster than STRICT on prior workflows with no observed quality loss.
+  ///   FAST     = 15 iter, 1e-6 param tol, 1e-4 func tol, max_invalid=2. Fastest, but
+  ///              under-converges on prior workflows -- never use when b_use_motion_prior_.
+  enum class BAPreset { STRICT, BALANCED, FAST };
 
   /// Adjust intrinsics, landmark and extrinsics according the user config.
-  bool BundleAdjustment();
+  bool BundleAdjustment(BAPreset preset = BAPreset::STRICT);
 
   /**
    * Set the default lens distortion type to use if it is declared unknown
@@ -80,6 +115,20 @@ public:
   void SetResectionMethod(const resection::SolverType method)
   {
     resection_method_ = method;
+  }
+
+  /// Enable/disable the "fast" intermediate BA preset (looser Ceres stopping
+  /// criteria, fewer iterations). The final BA at the end of Process() is
+  /// unaffected and always runs with strict defaults. Default: true.
+  /// Set to false to retest at the original (strict) quality level.
+  void SetUseFastIntermediateBA(bool enable)
+  {
+    b_use_fast_intermediate_ba_ = enable;
+  }
+
+  bool GetUseFastIntermediateBA() const
+  {
+    return b_use_fast_intermediate_ba_;
   }
 
 private:
@@ -108,11 +157,66 @@ private:
   openMVG::tracks::STLMAPTracks map_tracks_;
   /// Helper to compute fast 2D-3D visibility
   std::unique_ptr<openMVG::tracks::SharedTrackVisibilityHelper> shared_track_visibility_helper_;
+  /// Set of view ids that appear in at least one entry of `map_tracks_`.
+  /// Built once in InitTracksAndLandmarks. Views not in this set have zero
+  /// reconstructable tracks and would deterministically hit the
+  /// NoVisibleTracks branch on every AddingMissingView() iteration; we
+  /// skip them up front to avoid the per-view GetTracksInImages +
+  /// set_intersection overhead. Output-preserving by construction.
+  std::unordered_set<IndexT> views_with_tracks_;
+  /// Per-view sorted vector of track ids visible in that view. Built
+  /// once in InitTracksAndLandmarks from `map_tracks_`. Lets the
+  /// resection-candidate scan in AddingMissingView() compute the
+  /// 2D-3D ratio gate without calling shared_track_visibility_helper_
+  /// ->GetTracksInImages() per (view, outer-iteration). The expensive
+  /// helper call is then deferred until *after* the gate passes, when
+  /// the full STLMAPTracks is genuinely needed for the feature-index
+  /// lookup. Output-preserving: the cached vector contains exactly the
+  /// same track ids GetTracksIdVector() would have extracted, in the
+  /// same sorted order, so the downstream set_intersection produces a
+  /// bit-identical track_id_for_resection.
+  Hash_Map<IndexT, std::vector<IndexT>> view_track_ids_cache_;
+
+  /// Per-view cached score (intersection vector + ratio) for the
+  /// resection-candidate scan. Indexed by view_id directly so concurrent
+  /// writes from different threads in the OMP-parallel scoring loop are
+  /// data-race-free (each thread mutates only its own slot). The slot is
+  /// re-used across AddingMissingView() invocations; we only recompute
+  /// when the score could have changed (delta-cache invalidation below).
+  struct ResectionScoreCache
+  {
+    std::vector<IndexT> track_id_for_resection; // sorted intersection
+    double track_ratio = 0.0;
+  };
+  std::vector<ResectionScoreCache> resection_score_cache_;
+
+  /// Snapshot of the sorted reconstructed-track-id list at the end of the
+  /// previous AddingMissingView() call. Compared against the current list
+  /// via std::set_difference to obtain the (added, removed) deltas, which
+  /// determine which views' cached scores are stale.
+  std::vector<IndexT> prev_reconstructed_track_ids_;
+
+  /// Snapshot of the set of view ids in `view_with_no_pose` at the end of
+  /// the previous AddingMissingView() call. A view that re-enters
+  /// view_with_no_pose (e.g. via eraseUnstablePosesAndObservations) was
+  /// not scored last round, so its cache may not reflect intermediate
+  /// changes to the reconstructed-track set; we force a recompute for
+  /// such views regardless of the delta.
+  std::unordered_set<IndexT> prev_view_with_no_pose_;
 
   /// 2View triangulation method used in the robust triangulation engine
   ETriangulationMethod triangulation_method_ = ETriangulationMethod::DEFAULT;
 
   resection::SolverType resection_method_ = resection::SolverType::DEFAULT;
+
+  /// If true, the BAs run inside the AddingMissingView() loop use a looser
+  /// "fast" preset (see BundleAdjustment in the .cpp). The final BA at the
+  /// end of Process() always runs with strict defaults regardless.
+  ///
+  /// Default controlled by OPENMVG_SFM2_FAST_INTERMEDIATE_BA (defined in
+  /// sequential_SfM2.cpp). Set to 0 there for STRICT-on-every-BA (S3
+  /// reference behaviour, ~5K more tracks observed on test scene).
+  bool b_use_fast_intermediate_ba_ = OPENMVG_SFM2_FAST_INTERMEDIATE_BA;
 };
 
 } // namespace sfm

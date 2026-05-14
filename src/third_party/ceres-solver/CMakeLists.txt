@@ -602,8 +602,6 @@ if (MSVC)
   # much about. The real solution is to link static versions of Google Log and
   # Google Test, but that seems tricky on Windows. So, disable the warning.
   add_definitions("/wd4251")
-  
-  add_definitions("/openmp:experimental")
 
   # Google Flags doesn't have their DLL import/export stuff set up correctly,
   # which results in linker warnings. This is irrelevant for Ceres, so ignore

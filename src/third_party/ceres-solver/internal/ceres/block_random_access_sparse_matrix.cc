@@ -53,7 +53,8 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
     const vector<int>& blocks,
     const set<pair<int, int> >& block_pairs)
     : kMaxRowBlocks(10 * 1000 * 1000),
-      blocks_(blocks) {
+      blocks_(blocks),
+      cell_info_pool_(NULL) {
   CHECK_LT(blocks.size(), kMaxRowBlocks);
 
   // Build the row/column layout vector and count the number of scalar
@@ -87,6 +88,24 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
   int* cols = tsm_->mutable_cols();
   double* values = tsm_->mutable_values();
 
+  // Bulk-initialise the values array to 1.0. Bit-identical to writing 1.0
+  // per element inside the layout loop below; here it's a single trivially
+  // vectorisable pass instead of being interleaved with rows/cols stores.
+  // (These values are placeholders: every meaningful numeric write into
+  // the matrix is performed by the Schur eliminator after SetZero().)
+  std::fill_n(values, num_nonzeros, 1.0);
+
+  // Final size is known: one cell per block pair.  Reserve up front
+  // to avoid log2(N) reallocations as the vector grows.
+  cell_values_.reserve(block_pairs.size());
+
+  // Single contiguous allocation for all CellInfo objects, replacing what
+  // was an individual `new CellInfo(...)` per block pair (and matching
+  // `delete` per pair in the dtor).  block_pairs.size() may be 0 here;
+  // `new CellInfo[0]` is well-formed and `delete[]` on it is well-formed.
+  cell_info_pool_ = new CellInfo[block_pairs.size()];
+  size_t cell_idx = 0;
+
   // Single pass: build layout, cell_values, AND fill sparsity pattern.
   int pos = 0;
   for (set<pair<int, int> >::const_iterator it = block_pairs.begin();
@@ -99,17 +118,18 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
 
     cell_values_.push_back(make_pair(make_pair(row_block_id, col_block_id),
                                      values + pos));
-    layout_[IntPairToLong(row_block_id, col_block_id)] =
-        new CellInfo(values + pos);
+    CellInfo* const cell_info = &cell_info_pool_[cell_idx++];
+    cell_info->values = values + pos;
+    layout_[IntPairToLong(row_block_id, col_block_id)] = cell_info;
 
-    // Fill sparsity pattern for this block in-place.
+    // Fill sparsity pattern for this block in-place. (values[] is already
+    // initialised to 1.0 by the std::fill_n above.)
     const int row_start = block_positions_[row_block_id];
     const int col_start = block_positions_[col_block_id];
     for (int r = 0; r < row_block_size; ++r) {
       for (int c = 0; c < col_block_size; ++c, ++pos) {
         rows[pos] = row_start + r;
         cols[pos] = col_start + c;
-        values[pos] = 1.0;
       }
     }
   }
@@ -118,11 +138,10 @@ BlockRandomAccessSparseMatrix::BlockRandomAccessSparseMatrix(
 // Assume that the user does not hold any locks on any cell blocks
 // when they are calling SetZero.
 BlockRandomAccessSparseMatrix::~BlockRandomAccessSparseMatrix() {
-  for (LayoutType::iterator it = layout_.begin();
-       it != layout_.end();
-       ++it) {
-    delete it->second;
-  }
+  // CellInfo objects live in the contiguous cell_info_pool_ array; their
+  // destructors (notably ~Mutex) run via delete[] on that array.  Nothing
+  // owned individually by layout_ entries.
+  delete[] cell_info_pool_;
 }
 
 CellInfo* BlockRandomAccessSparseMatrix::GetCell(int row_block_id,

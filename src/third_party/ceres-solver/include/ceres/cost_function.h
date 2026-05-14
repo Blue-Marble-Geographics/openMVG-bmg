@@ -115,12 +115,10 @@ class CERES_EXPORT CostFunction {
                         double* residuals,
                         double** jacobians) const = 0;
 
+  // Thread-safe: returns a reference to a vector that is only ever
+  // mutated through add_parameter_block_size() during construction.
+  // Const callers (evaluators on multiple threads) only read it.
   const std::vector<int32>& parameter_block_sizes() const {
-    // Reconstruct the vector on demand for API compatibility.
-    // Hot-path internal Ceres code should use the inline accessors instead.
-    parameter_block_sizes_vec_.assign(
-      parameter_block_sizes_inline_,
-      parameter_block_sizes_inline_ + num_parameter_blocks_);
     return parameter_block_sizes_vec_;
   }
 
@@ -128,7 +126,7 @@ class CERES_EXPORT CostFunction {
     return num_residuals_;
   }
 
-  // Fast inline accessors for hot paths (avoids vector overhead)
+  // Fast inline accessors for hot paths (avoids vector indirection)
   int num_parameter_blocks() const {
     return num_parameter_blocks_;
   }
@@ -147,8 +145,12 @@ class CERES_EXPORT CostFunction {
   }
 
   // Direct inline storage write for SizedCostFunction and DynamicCostFunction.
+  // Writes to BOTH the inline array and the vector so that both
+  // parameter_block_sizes() and the inline accessors are valid and
+  // can be read concurrently by evaluator threads after construction.
   void add_parameter_block_size(int32 size) {
     parameter_block_sizes_inline_[num_parameter_blocks_++] = size;
+    parameter_block_sizes_vec_.push_back(size);
   }
 
  private:
@@ -156,8 +158,10 @@ class CERES_EXPORT CostFunction {
   int32 parameter_block_sizes_inline_[kMaxParameterBlocks] = {};
   int num_parameter_blocks_;
   int num_residuals_;
-  // Lazy reconstruction buffer for parameter_block_sizes() const& return.
-  mutable std::vector<int32> parameter_block_sizes_vec_;
+  // Populated in lock-step with the inline array during construction;
+  // never mutated after AddResidualBlock returns, so safe for concurrent
+  // read access from parallel evaluators.
+  std::vector<int32> parameter_block_sizes_vec_;
   CERES_DISALLOW_COPY_AND_ASSIGN(CostFunction);
 };
 
