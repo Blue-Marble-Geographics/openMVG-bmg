@@ -391,6 +391,17 @@ if (OpenMVG_USE_INTERNAL_OSI AND OpenMVG_USE_INTERNAL_CLP AND OpenMVG_USE_INTERN
   set_property(TARGET lib_CoinUtils PROPERTY FOLDER OpenMVG/3rdParty/lib_CoinUtils)
   set_property(TARGET lib_Osi PROPERTY FOLDER OpenMVG/3rdParty/lib_Osi)
   set_property(TARGET lib_OsiClpSolver PROPERTY FOLDER OpenMVG/3rdParty/lib_OsiClpSolver)
+
+  # COIN-OR sources predate C++17 and use symbols removed in C++17
+  # (std::bind2nd, std::unary_function, std::auto_ptr, ...). Compile them
+  # as C++14 regardless of the top-level CMAKE_CXX_STANDARD. Safe because
+  # these are static libs with a C-style / basic-types interface.
+  foreach(_osi_clp_t lib_CoinUtils lib_Osi lib_clp lib_OsiClpSolver)
+    set_target_properties(${_osi_clp_t} PROPERTIES
+      CXX_STANDARD 14
+      CXX_STANDARD_REQUIRED YES
+      CXX_EXTENSIONS NO)
+  endforeach()
 endif()
 
 # ==============================================================================
