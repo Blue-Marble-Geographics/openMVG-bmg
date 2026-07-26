@@ -218,13 +218,19 @@ _vl_sift_smooth(
   /* Handle in-place case: the ring-buffer approach reads inputImage
    * rows lazily while writing outputImage rows.  When they alias,
    * earlier output overwrites not-yet-read input, causing double-
-   * smoothing.  Copy to a temp buffer to break the alias. */
-  vl_sift_pix* inputBuf = NULL;
+   * smoothing.  Break the alias with the caller-provided scratch
+   * buffer (self->temp, already sized to the full octave) instead of
+   * a per-call heap allocation; fall back to malloc only if that
+   * scratch is missing or itself aliases the images. */
+  vl_sift_pix* inputBuf = NULL; /* set only when we heap-allocate */
   if (inputImage == outputImage) {
     size_t nbytes = sizeof(vl_sift_pix) * width * height;
-    inputBuf = (vl_sift_pix*)vl_malloc(nbytes);
-    memcpy(inputBuf, inputImage, nbytes);
-    inputImage = inputBuf;
+    vl_sift_pix* alias = tempImage;
+    if (alias == NULL || alias == inputImage || alias == outputImage) {
+      alias = inputBuf = (vl_sift_pix*)vl_malloc(nbytes);
+    }
+    memcpy(alias, inputImage, nbytes);
+    inputImage = alias;
   }
 
   if (hasAVX2) {
@@ -233,8 +239,6 @@ _vl_sift_smooth(
   else {
     gGaussianRowFn = GaussianRowSymmetricClampSSE2;
   }
-
-  (void)tempImage;
 
   /* ------------------------------------------------------------
    * Build symmetric Gaussian kernel (half only)
@@ -286,8 +290,17 @@ _vl_sift_smooth(
      * ------------------------------------------------------------ */
     {
       const int R = 2 * W + 1;
-      float* VL_RESTRICT rowBuf =
-        (float*)vl_malloc(sizeof(float) * (size_t)R * width);
+      /* Horizontally-filtered ring buffer.  Cache it on the filter and
+       * grow on demand (mirrors the gaussFilter caching) so we don't
+       * malloc/free (2W+1)*width floats on every smooth call -- this
+       * matters for large images with many levels/octaves. */
+      size_t rowBufBytes = sizeof(float) * (size_t)R * width;
+      if (rowBufBytes > self->smoothRowBufSize) {
+        if (self->smoothRowBuf) vl_free(self->smoothRowBuf);
+        self->smoothRowBuf = (float*)vl_malloc(rowBufBytes);
+        self->smoothRowBufSize = rowBufBytes;
+      }
+      float* VL_RESTRICT rowBuf = self->smoothRowBuf;
 
       const int Wplus1 = W + 1;
       int center = W;
@@ -734,7 +747,7 @@ _vl_sift_smooth(
         }
       }
 
-      vl_free(rowBuf);
+      /* rowBuf is owned by the filter (self->smoothRowBuf); not freed here. */
     }
   }
 
@@ -876,7 +889,7 @@ vl_sift_new (int width, int height,
   f-> o_cur   = o_min ;
 
 #ifdef REDUCE_MEMORY
-  /* grad is no longer needed — orientations and descriptors compute
+  /* grad is no longer needed ï¿½ orientations and descriptors compute
    * gradients on-the-fly from the octave data.
    * dog and temp share a single allocation; temp lives just past dog. */
   {
@@ -907,6 +920,9 @@ vl_sift_new (int width, int height,
   f-> gaussFilterSize = 0;
   f-> gaussFilterSigma = 0 ;
   f-> gaussFilterWidth = 0 ;
+
+  f-> smoothRowBuf = NULL ;
+  f-> smoothRowBufSize = 0 ;
 
   f-> octave_width  = 0 ;
   f-> octave_height = 0 ;
@@ -947,6 +963,7 @@ vl_sift_delete (VlSiftFilt* f)
     if (f->temp) vl_free(f->temp);
 #endif
     if (f->gaussFilter) vl_free(f->gaussFilter);
+    if (f->smoothRowBuf) vl_free(f->smoothRowBuf);
     vl_free(f);
   }
 }
@@ -1223,8 +1240,8 @@ vl_sift_detect(VlSiftFilt* f)
 
   float const tolerance = (float)(0.8 * tp);
 
-  /* Tile height: chosen so 3 DoG planes × tileH rows × w floats fits in L2.
-   * For w=2048, tileH=32 ? 3×34×2048×4 = 835 KB (fits comfortably in 1MB L2).
+  /* Tile height: chosen so 3 DoG planes ï¿½ tileH rows ï¿½ w floats fits in L2.
+   * For w=2048, tileH=32 ? 3ï¿½34ï¿½2048ï¿½4 = 835 KB (fits comfortably in 1MB L2).
    * The +2 accounts for the 1-pixel border needed by the extrema scan. */
   int const tileH = (w > 512) ? 32 : h; /* only tile large octaves */
 
@@ -1244,7 +1261,7 @@ vl_sift_detect(VlSiftFilt* f)
       DogSubtract(dst, src_a, src_b, w, dogRowCount, w);
     }
 
-    /* Scan for extrema in this strip — only interior rows [1, h-2] */
+    /* Scan for extrema in this strip ï¿½ only interior rows [1, h-2] */
     int const scanYStart = max(tyStart, 1);
     int const scanYEnd = min(tyEnd, h - 1);
 
@@ -1268,7 +1285,7 @@ vl_sift_detect(VlSiftFilt* f)
           int maskNeg = _mm_movemask_ps(_mm_cmple_ps(vV, vNegTol));
 
           if (maskPos | maskNeg) {
-            /* At least one pixel passed threshold — check each scalar */
+            /* At least one pixel passed threshold ï¿½ check each scalar */
             int lane;
             for (lane = 0; lane < 4; ++lane) {
               if (maskPos & (1 << lane)) {
@@ -1354,7 +1371,7 @@ vl_sift_detect(VlSiftFilt* f)
           pt += 4;
         } /* for xIdx SSE */
 
-        /* Scalar tail for remaining 1–3 pixels */
+        /* Scalar tail for remaining 1ï¿½3 pixels */
         for (; xIdx < innerCount; ++xIdx) {
           v = *pt;
 
@@ -1907,7 +1924,7 @@ vl_sift_update_gradient (VlSiftFilt *f)
 
     vl_sift_pix *src, *end, *grad, gx, gy ;
 
-    /* Store raw (gx, gy) — no sqrt, no atan2 */
+    /* Store raw (gx, gy) ï¿½ no sqrt, no atan2 */
 #define SAVE_BACK                                                       \
     *grad++ = gx ;                                                      \
     *grad++ = gy ;                                                      \
@@ -2119,7 +2136,7 @@ vl_sift_calc_keypoint_orientations(VlSiftFilt* f,
       /* Circular window mask: zero weight where r2 >= threshold */
       __m128 vMask = _mm_cmplt_ps(vR2, vW2thresh);
 
-      /* mod = sqrt(gx*gx + gy*gy) — issue early */
+      /* mod = sqrt(gx*gx + gy*gy) ï¿½ issue early */
       __m128 vModSq = _mm_add_ps(_mm_mul_ps(vGx, vGx), _mm_mul_ps(vGy, vGy));
       __m128 vMod = _mm_sqrt_ps(vModSq);
 
@@ -2134,7 +2151,7 @@ vl_sift_calc_keypoint_orientations(VlSiftFilt* f,
       __m128 vP = _mm_add_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(vExpC0, vF), vExpC1), vF), vExpC2);
       __m128 vWgt = _mm_castsi128_ps(_mm_add_epi32(_mm_slli_epi32(vI, 23), _mm_castps_si128(vP)));
 
-      /* atan2 inlined — drop Newton refinement (matches descriptor) */
+      /* atan2 inlined ï¿½ drop Newton refinement (matches descriptor) */
       __m128 vAbsY = _mm_add_ps(_mm_and_ps(vGy, vAbsMask), vEps);
       __m128 vAbsX = _mm_and_ps(vGx, vAbsMask);
       __m128 vNum = _mm_sub_ps(vGx, _mm_or_ps(vAbsY, _mm_and_ps(vGx, vHighBit)));
@@ -2157,7 +2174,7 @@ vl_sift_calc_keypoint_orientations(VlSiftFilt* f,
       __m128 vWmod = _mm_and_ps(_mm_mul_ps(vMod, vWgt), vMask);
 
       /* Bilinear scatter into histogram (scalar extract) */
-      /* Spill to arrays — avoids 8 shuffle instructions */
+      /* Spill to arrays ï¿½ avoids 8 shuffle instructions */
       __declspec(align(16)) float fbinArr[4], wmodArr[4];
       _mm_store_ps(fbinArr, vFbin);
       _mm_store_ps(wmodArr, vWmod);
@@ -2189,7 +2206,7 @@ vl_sift_calc_keypoint_orientations(VlSiftFilt* f,
       remaining -= 4;
     }
 
-    /* Scalar tail for remaining 1–3 pixels */
+    /* Scalar tail for remaining 1ï¿½3 pixels */
     for (; remaining > 0; --remaining, ++pSrc) {
       /* dx from the maintained SSE register */
       float dxVal = _mm_cvtss_f32(vDxBase);
@@ -2618,7 +2635,7 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
 
       // Doing two groups of 4 at once improves the function by about 5%
       while (remaining >= 8) {
-        /* ============ GROUP A: pixels 0–3 ============ */
+        /* ============ GROUP A: pixels 0ï¿½3 ============ */
         __m128 vLeftA = _mm_loadu_ps(pSrc - 1);
         __m128 vRightA = _mm_loadu_ps(pSrc + 1);
         __m128 vGxA = _mm_mul_ps(vHalf, _mm_sub_ps(vRightA, vLeftA));
@@ -2630,9 +2647,9 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
         __m128 vRgyA = _mm_add_ps(_mm_mul_ps(vNegSt0, vGxA), _mm_mul_ps(vCt0, vGyA));
 
         __m128 vModSqA = _mm_add_ps(_mm_mul_ps(vRgxA, vRgxA), _mm_mul_ps(vRgyA, vRgyA));
-        __m128 vModA = _mm_sqrt_ps(vModSqA); /* 11-cyc latency — fill below */
+        __m128 vModA = _mm_sqrt_ps(vModSqA); /* 11-cyc latency ï¿½ fill below */
 
-        /* ============ GROUP B: pixels 4–7 (loads during A's sqrt) ============ */
+        /* ============ GROUP B: pixels 4ï¿½7 (loads during A's sqrt) ============ */
         __m128 vLeftB = _mm_loadu_ps(pSrc + 4 - 1);
         __m128 vRightB = _mm_loadu_ps(pSrc + 4 + 1);
         __m128 vGxB = _mm_mul_ps(vHalf, _mm_sub_ps(vRightB, vLeftB));
@@ -2644,7 +2661,7 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
         __m128 vRgyB = _mm_add_ps(_mm_mul_ps(vNegSt0, vGxB), _mm_mul_ps(vCt0, vGyB));
 
         __m128 vModSqB = _mm_add_ps(_mm_mul_ps(vRgxB, vRgxB), _mm_mul_ps(vRgyB, vRgyB));
-        __m128 vModB = _mm_sqrt_ps(vModSqB); /* 11-cyc latency — fill below */
+        __m128 vModB = _mm_sqrt_ps(vModSqB); /* 11-cyc latency ï¿½ fill below */
 
         /* ============ GROUP A: spatial + atan2 (fills A's sqrt window) ============ */
         __m128 vNxA = _mm_mul_ps(
@@ -2654,7 +2671,7 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
         __m128 vR2A = _mm_add_ps(_mm_mul_ps(vNxA, vNxA), _mm_mul_ps(vNyA, vNyA));
 
         /* FastExp inlined for A: exp(-r2 * invSig2) */
-        __m128 vExpArgA = _mm_mul_ps(vR2A, vNegInvSig2); /* negative arg ? exp(-r²/2s²) */
+        __m128 vExpArgA = _mm_mul_ps(vR2A, vNegInvSig2); /* negative arg ? exp(-rï¿½/2sï¿½) */
         __m128 vT_A = _mm_mul_ps(vExpArgA, vExpL2e);
         __m128i vI_A = _mm_cvttps_epi32(vT_A);
         __m128i vJ_A = _mm_srli_epi32(_mm_castps_si128(vExpArgA), 31);
@@ -2664,7 +2681,7 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
         __m128 vP_A = _mm_add_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(vExpC0, vF_A), vExpC1), vF_A), vExpC2);
         __m128 vWinA = _mm_castsi128_ps(_mm_add_epi32(_mm_slli_epi32(vI_A, 23), _mm_castps_si128(vP_A)));
 
-        /* atan2 for A — no Newton refinement on rcp */
+        /* atan2 for A ï¿½ no Newton refinement on rcp */
         __m128 vAbsYA = _mm_add_ps(_mm_and_ps(vRgyA, vAbsMask), vEpsA);
         __m128 vAbsXA = _mm_and_ps(vRgxA, vAbsMask);
         __m128 vNumA = _mm_sub_ps(vRgxA, _mm_or_ps(vAbsYA, _mm_and_ps(vRgxA, vHighBit)));
@@ -2703,7 +2720,7 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
         __m128 vP_B = _mm_add_ps(_mm_mul_ps(_mm_add_ps(_mm_mul_ps(vExpC0, vF_B), vExpC1), vF_B), vExpC2);
         __m128 vWinB = _mm_castsi128_ps(_mm_add_epi32(_mm_slli_epi32(vI_B, 23), _mm_castps_si128(vP_B)));
 
-        /* atan2 for B — no Newton refinement on rcp */
+        /* atan2 for B ï¿½ no Newton refinement on rcp */
         __m128 vAbsYB = _mm_add_ps(_mm_and_ps(vRgyB, vAbsMask), vEpsA);
         __m128 vAbsXB = _mm_and_ps(vRgxB, vAbsMask);
         __m128 vNumB = _mm_sub_ps(vRgxB, _mm_or_ps(vAbsYB, _mm_and_ps(vRgxB, vHighBit)));
@@ -2807,7 +2824,7 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
           __m128 vWt0 = _mm_mul_ps(vWmodA, _mm_sub_ps(vOne, vRbint));
           __m128 vWt1 = _mm_mul_ps(vWmodA, vRbint);
 
-          /* Spill to aligned stack arrays — avoids 24 shuffle instructions */
+          /* Spill to aligned stack arrays ï¿½ avoids 24 shuffle instructions */
           __declspec(align(16)) float wx0Arr[4], wx1Arr[4], wy0Arr[4], wy1Arr[4];
           __declspec(align(16)) float wt0Arr[4], wt1Arr[4];
           __declspec(align(16)) int   bxiArr[4], byiArr[4], btiArr[4];
@@ -2877,7 +2894,7 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
         __m128 vModSq = _mm_add_ps(_mm_mul_ps(vRgx, vRgx), _mm_mul_ps(vRgy, vRgy));
         __m128 vMod = _mm_sqrt_ps(vModSq);
 
-        /* atan2 inlined — no Newton refinement on rcp (matches main loop) */
+        /* atan2 inlined ï¿½ no Newton refinement on rcp (matches main loop) */
         __m128 vAbsY = _mm_add_ps(_mm_and_ps(vRgy, vAbsMask), vEpsA);
         __m128 vAbsX = _mm_and_ps(vRgx, vAbsMask);
         __m128 vNum = _mm_sub_ps(vRgx, _mm_or_ps(vAbsY, _mm_and_ps(vRgx, vHighBit)));
@@ -2932,7 +2949,7 @@ vl_sift_calc_keypoint_descriptor(VlSiftFilt* __restrict f,
         __m128 vWt0 = _mm_mul_ps(vWmod, _mm_sub_ps(vOne, vRbint));
         __m128 vWt1 = _mm_mul_ps(vWmod, vRbint);
 
-        /* Spill to aligned stack arrays — matches main loop approach */
+        /* Spill to aligned stack arrays ï¿½ matches main loop approach */
         __declspec(align(16)) float wx0Arr[4], wx1Arr[4], wy0Arr[4], wy1Arr[4];
         __declspec(align(16)) float wt0Arr[4], wt1Arr[4];
         __declspec(align(16)) int   bxiArr[4], byiArr[4], btiArr[4];

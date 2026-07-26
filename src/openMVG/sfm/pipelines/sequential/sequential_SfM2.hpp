@@ -20,7 +20,13 @@
 #include "openMVG/multiview/triangulation_method.hpp"
 #include "openMVG/tracks/tracks.hpp"
 
-#define OPENMVG_SFM_PIPELINE_DIAG 1 // JPB WIP BUG
+// Pipeline-health diagnostics. Cheap per-checkpoint, but the per-view
+// `#pragma omp critical` writes into `view_diag_records` inside the parallel
+// resection loop serialize the loop on heavily threaded runs. Off by default
+// for release; flip to 1 to triage pipeline regressions.
+#ifndef OPENMVG_SFM_PIPELINE_DIAG
+#define OPENMVG_SFM_PIPELINE_DIAG 0
+#endif
 
 // Toggle: use FAST/BALANCED presets on intermediate BAs vs. STRICT-everywhere.
 //   1 = current optimisation (fewer iters, looser tols on intermediate BAs).
@@ -143,6 +149,13 @@ private:
 
   // Parameter
   cameras::EINTRINSIC cam_type_; // The camera type for the unknown cameras
+  // Runtime-adjustable minimum track length for the selective short-track cut
+  // (SelectiveShortTrackCut). Initialized from OPENMVG_SFM2_TRACKS_MIN_LENGTH.
+  // Process() auto-lowers this to 2 (cut disabled -> keep every length-2 track)
+  // and re-inits if the seed triangulation is starved to 0 landmarks by the
+  // cut, so dense scenes keep the fast cut while thin-overlap scenes (e.g.
+  // Randy) recover automatically without a per-dataset flag or global slowdown.
+  uint32_t track_min_length_;
 
   //-- Data provider
   Features_Provider * features_provider_;
@@ -196,13 +209,38 @@ private:
   /// determine which views' cached scores are stale.
   std::vector<IndexT> prev_reconstructed_track_ids_;
 
+  /// Scratch buffer for the current call's sorted reconstructed-track-id
+  /// list. Built fresh each AddingMissingView() invocation, then swapped
+  /// with `prev_reconstructed_track_ids_` at the end (so next call's
+  /// `prev_` is this call's `cur_`, with no copy). `clear()` preserves
+  /// capacity across calls so the per-call alloc is amortised away after
+  /// the first reconstruction round.
+  std::vector<IndexT> cur_reconstructed_track_ids_;
+
   /// Snapshot of the set of view ids in `view_with_no_pose` at the end of
   /// the previous AddingMissingView() call. A view that re-enters
   /// view_with_no_pose (e.g. via eraseUnstablePosesAndObservations) was
   /// not scored last round, so its cache may not reflect intermediate
   /// changes to the reconstructed-track set; we force a recompute for
   /// such views regardless of the delta.
-  std::unordered_set<IndexT> prev_view_with_no_pose_;
+  ///
+  /// Stored as a bit-vector keyed by view_id (same indexing scheme as
+  /// `resection_score_cache_`). O(1) test, O(views) reset, no hashing or
+  /// per-call bucket allocation -- replaces the previous
+  /// `std::unordered_set<IndexT>`.
+  std::vector<uint8_t> prev_view_with_no_pose_mask_;
+
+  /// Scratch bit-vector used to build the next round's no-pose mask.
+  /// Sized identically to `prev_view_with_no_pose_mask_`; at the end of
+  /// AddingMissingView() the two are swapped so the freshly-built bits
+  /// become `prev_` with no heap turnover. Reused across calls.
+  std::vector<uint8_t> cur_view_with_no_pose_mask_;
+
+  /// Scratch bit-vector marking views whose cached resection score is
+  /// invalidated by this round's reconstructed-track-id delta. Sized to
+  /// `max_view_id + 1` (same as `resection_score_cache_`). Reused across
+  /// AddingMissingView() calls; cleared at the start of each call.
+  std::vector<uint8_t> dirty_view_mask_;
 
   /// 2View triangulation method used in the robust triangulation engine
   ETriangulationMethod triangulation_method_ = ETriangulationMethod::DEFAULT;

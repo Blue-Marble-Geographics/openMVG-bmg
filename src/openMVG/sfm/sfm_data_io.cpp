@@ -15,7 +15,9 @@
 #include "openMVG/sfm/sfm_data_io.hpp"
 #include "openMVG/sfm/sfm_data_io_baf.hpp"
 #include "openMVG/sfm/sfm_data_io_cereal.hpp"
+#include "openMVG/sfm/sfm_data_io_gmp.hpp"
 #include "openMVG/sfm/sfm_data_io_ply.hpp"
+#include "openMVG/sfm/sfm_data_io_xml_fast.hpp"
 #include "openMVG/stl/stlMap.hpp"
 #include "openMVG/system/logger.hpp"
 #include "openMVG/types.hpp"
@@ -103,9 +105,11 @@ bool Save(const SfM_Data & sfm_data, const std::string & filename, ESfM_Data fla
   else if (ext == "bin")
     return Save_Cereal<cereal::PortableBinaryOutputArchive>(sfm_data, filename, flags_part);
   else if (ext == "xml")
-    return Save_Cereal<cereal::XMLOutputArchive>(sfm_data, filename, flags_part);
+    return Save_XML_Fast(sfm_data, filename, flags_part);
   else if (ext == "ply")
     return Save_PLY(sfm_data, filename, flags_part);
+  else if (ext == "gmpcam") // Global Mapper compact camera binary
+    return Save_GMP_Binary(sfm_data, filename, flags_part);
   else if (ext == "baf") // Bundle Adjustment file
     return Save_BAF(sfm_data, filename, flags_part);
   else

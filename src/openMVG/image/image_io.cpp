@@ -169,6 +169,85 @@ int ReadJpgStream(FILE * file,
   return 1;
 }
 
+// Zero-copy JPEG decode. The caller supplies a `resizer` callback that, given
+// the JPEG's (w, h), returns a pointer to a tightly packed row-major buffer
+// of at least w*h*expected_depth bytes; libjpeg writes scanlines directly
+// into that buffer. Returns 0 (without invoking the resizer) when the JPEG's
+// component count does not match `expected_depth` -- this is how the caller
+// implements the grayscale/RGB fallback without re-decoding.
+int ReadJpgRawInto(const char * filename,
+                   int expected_depth,
+                   unsigned char * (*resizer)(int w, int h, void * user),
+                   void * user) {
+  if (!resizer) return 0;
+  FILE * file = fopen(filename, "rb");
+  if (!file) {
+    OPENMVG_LOG_ERROR << "Couldn't open " << filename << " fopen returned 0";
+    return 0;
+  }
+
+  jpeg_decompress_struct cinfo;
+  struct my_error_mgr jerr;
+  cinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = &jpeg_error;
+
+  if (setjmp(jerr.setjmp_buffer)) {
+    OPENMVG_LOG_ERROR << "Error JPG: Failed to decompress.";
+    jpeg_destroy_decompress(&cinfo);
+    fclose(file);
+    return 0;
+  }
+
+  jpeg_create_decompress(&cinfo);
+  jpeg_stdio_src(&cinfo, file);
+  jpeg_read_header(&cinfo, TRUE);
+
+  // Bail out before allocating any output buffer if the component count
+  // doesn't match what the caller wants. This lets a typical RGB-first /
+  // gray-fallback pattern peek at the file cheaply.
+  if (static_cast<int>(cinfo.num_components) != expected_depth) {
+    jpeg_destroy_decompress(&cinfo);
+    fclose(file);
+    return 0;
+  }
+
+  jpeg_start_decompress(&cinfo);
+
+  if (static_cast<int>(cinfo.output_components) != expected_depth) {
+    jpeg_destroy_decompress(&cinfo);
+    fclose(file);
+    return 0;
+  }
+
+  const int w = static_cast<int>(cinfo.output_width);
+  const int h = static_cast<int>(cinfo.output_height);
+  unsigned char * base = resizer(w, h, user);
+  if (!base) {
+    jpeg_destroy_decompress(&cinfo);
+    fclose(file);
+    return 0;
+  }
+  const size_t row_bytes = static_cast<size_t>(w) * static_cast<size_t>(expected_depth);
+
+  // Batch scanlines to amortize libjpeg call overhead. libjpeg writes directly
+  // into the caller's row pointers -- no intermediate buffer or memcpy.
+  constexpr JDIMENSION kBatch = 16;
+  JSAMPROW rows[kBatch];
+  while (cinfo.output_scanline < cinfo.output_height) {
+    const JDIMENSION remaining = cinfo.output_height - cinfo.output_scanline;
+    const JDIMENSION n = remaining < kBatch ? remaining : kBatch;
+    unsigned char * row_base = base + static_cast<size_t>(cinfo.output_scanline) * row_bytes;
+    for (JDIMENSION k = 0; k < n; ++k)
+      rows[k] = row_base + static_cast<size_t>(k) * row_bytes;
+    jpeg_read_scanlines(&cinfo, rows, n);
+  }
+
+  jpeg_finish_decompress(&cinfo);
+  jpeg_destroy_decompress(&cinfo);
+  fclose(file);
+  return 1;
+}
+
 
 int WriteJpg(const char * filename,
              const std::vector<unsigned char> & array,
@@ -192,6 +271,32 @@ int WriteJpgStream(FILE *file,
                    int h,
                    int depth,
                    int quality) {
+  if (array.empty()) return 0;
+  return WriteJpgRawStream(file, array.data(), w, h, depth, quality);
+}
+
+int WriteJpgRaw(const char * filename,
+                const unsigned char * ptr,
+                int w,
+                int h,
+                int depth,
+                int quality) {
+  FILE *file = fopen(filename, "wb");
+  if (!file) {
+    OPENMVG_LOG_ERROR << "Couldn't open " << filename << " fopen returned 0";
+    return 0;
+  }
+  int res = WriteJpgRawStream(file, ptr, w, h, depth, quality);
+  fclose(file);
+  return res;
+}
+
+int WriteJpgRawStream(FILE *file,
+                      const unsigned char * ptr,
+                      int w,
+                      int h,
+                      int depth,
+                      int quality) {
   if (quality < 0 || quality > 100)
     OPENMVG_LOG_ERROR << "The quality parameter should be between 0 and 100";
 
@@ -218,20 +323,28 @@ int WriteJpgStream(FILE *file,
 
   jpeg_set_defaults(&cinfo);
   jpeg_set_quality(&cinfo, quality, TRUE);
+  // Faster integer DCT. ~10-15% encode speedup vs the default JDCT_ISLOW,
+  // with no visible quality difference at quality >= 80 (per libjpeg docs).
+  cinfo.dct_method = JDCT_IFAST;
+
   jpeg_start_compress(&cinfo, TRUE);
 
-  const unsigned char *ptr = &array[0];
-  int row_bytes = cinfo.image_width*cinfo.input_components;
-
-  JSAMPLE *row = new JSAMPLE[row_bytes];
-
+  const int row_bytes = w * depth;
+  // Feed scanlines in batches directly from the source buffer -- no per-row
+  // memcpy, no temporary scanline allocation. libjpeg only reads from the
+  // row pointers so the const_cast is safe.
+  constexpr JDIMENSION kBatch = 16;
+  JSAMPROW rows[kBatch];
   while (cinfo.next_scanline < cinfo.image_height) {
-    std::memcpy(&row[0], &ptr[0], row_bytes * sizeof(unsigned char));
-    jpeg_write_scanlines(&cinfo, &row, 1);
-    ptr += row_bytes;
+    const JDIMENSION remaining = cinfo.image_height - cinfo.next_scanline;
+    const JDIMENSION n = remaining < kBatch ? remaining : kBatch;
+    unsigned char * base = const_cast<unsigned char *>(ptr)
+                         + static_cast<size_t>(cinfo.next_scanline)
+                         * static_cast<size_t>(row_bytes);
+    for (JDIMENSION k = 0; k < n; ++k)
+      rows[k] = base + static_cast<size_t>(k) * static_cast<size_t>(row_bytes);
+    jpeg_write_scanlines(&cinfo, rows, n);
   }
-
-  delete [] row;
 
   jpeg_finish_compress(&cinfo);
   jpeg_destroy_compress(&cinfo);

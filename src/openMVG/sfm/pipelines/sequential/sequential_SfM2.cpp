@@ -11,6 +11,7 @@
 #include "openMVG/sfm/pipelines/sfm_features_provider.hpp"
 #include "openMVG/sfm/pipelines/sfm_matches_provider.hpp"
 #include "openMVG/sfm/pipelines/sequential/SfmSceneInitializer.hpp"
+#include "openMVG/sfm/pipelines/sequential/SfmSceneInitializerMaxPair.hpp"
 #include "openMVG/sfm/sfm_data.hpp"
 #include "openMVG/sfm/sfm_data_BA.hpp"
 #include "openMVG/sfm/sfm_data_BA_ceres.hpp"
@@ -25,16 +26,9 @@
 
 #include <array>
 #include <ceres/types.h>
+#include <chrono>
 #include <functional>
 #include <iostream>
-
-// Pipeline-health diagnostics. Cheap per-checkpoint, but the per-view
-// `#pragma omp critical` writes into `view_diag_records` inside the parallel
-// resection loop serialize the loop on heavily threaded runs. Off by default
-// for release; flip to 1 to triage pipeline regressions.
-#ifndef OPENMVG_SFM_PIPELINE_DIAG
-#define OPENMVG_SFM_PIPELINE_DIAG 0
-#endif
 
 // Toggle: relaxed angle thresholds for foliage / narrow-baseline scenes.
 //   1 = current optimisation (1.5deg in-loop post-BA, 3.0deg post-init).
@@ -42,6 +36,35 @@
 //   Defined here as a single switch so all four call sites flip together.
 #ifndef OPENMVG_SFM2_RELAXED_ANGLE_THRESHOLDS
 #define OPENMVG_SFM2_RELAXED_ANGLE_THRESHOLDS 0
+#endif
+
+// Minimum parallax (triangulation) angle, in DEGREES, required to KEEP a
+// landmark in the post-Triangulation / pre-BA seed filter. Upstream hard-codes
+// 4.0 deg here (Square(2.0)). That is fine for well-separated seed pairs but
+// wipes the ENTIRE seed on low-parallax / near-nadir aerial pairs: the seed
+// triangulates fine (thousands of points at <4px reprojection) yet every point
+// has parallax < 4 deg, so the filter removes all of them and the engine stalls
+// at 2 cameras / 0 tracks. Lowering the floor only affects datasets whose seed
+// parallax is below the old 4 deg -- i.e. exactly the ones that were failing;
+// high-parallax seeds have all points well above this and are unchanged. Keep
+// this consistent with the MaxPair seed-validation gate
+// (OPENMVG_MAXPAIR_SEED_MIN_PARALLAX_DEG) and the in-loop post-BA filter
+// (1.5-2.0 deg).
+#ifndef OPENMVG_SFM2_SEED_MIN_ANGLE_DEG
+#define OPENMVG_SFM2_SEED_MIN_ANGLE_DEG 2.0
+#endif
+
+// Minimum parallax angle, in DEGREES, required to KEEP a landmark in the
+// IN-LOOP post-BA outlier filter run each resection round (and the end-of-band
+// flush). Same rationale as OPENMVG_SFM2_SEED_MIN_ANGLE_DEG but applied to
+// growing structure: on low-parallax / near-nadir aerial scenes a 2.0 deg floor
+// keeps pruning legitimate short-baseline tie points every round, so the final
+// sparse cloud comes out thin (structure never accumulates). Lowering to
+// 1.0-1.5 deg densifies such scenes; high-parallax datasets are unaffected
+// (their kept structure is well above this). Leave at 2.0 to match the
+// historical behaviour.
+#ifndef OPENMVG_SFM2_TRACK_MIN_ANGLE_DEG
+#define OPENMVG_SFM2_TRACK_MIN_ANGLE_DEG 2.0
 #endif
 
 // Toggle: freeze intrinsics on intermediate BAs (speed optimisation).
@@ -53,6 +76,109 @@
 //       calibrated.
 #ifndef OPENMVG_SFM2_FREEZE_INTRINSICS_ON_INTERMEDIATE_BA
 #define OPENMVG_SFM2_FREEZE_INTRINSICS_ON_INTERMEDIATE_BA 0
+#endif
+
+// A/B toggle: pretend no sparse linear-algebra library is available, even
+// when Ceres reports otherwise. Forces every BundleAdjustment() call onto
+// the DENSE_SCHUR path -- the exact behaviour of a Ceres build without
+// SuiteSparse/EIGEN_SPARSE. Useful for measuring whether the SuiteSparse
+// link is actually winning on a given scene without rebuilding Ceres.
+//   0 = honour Ceres' runtime probe (production default)
+//   1 = force DENSE_SCHUR everywhere
+#ifndef OPENMVG_SFM2_FORCE_NO_SPARSE_BA
+#define OPENMVG_SFM2_FORCE_NO_SPARSE_BA 0
+#endif
+
+// Diagnostic toggle: time every Triangulation() call (INERT -- logging only,
+// no effect on output). Set to 1 to confirm whether triangulation is actually
+// a wall-clock hotspot before committing to the incremental-triangulation
+// rewrite. Each call logs its own duration plus a running cumulative total and
+// the per-call structure size, so you can see how the cost scales as the scene
+// matures. Gated off by default: zero overhead, byte-identical reconstruction.
+//   0 = off (production default)
+//   1 = log "[TRI-TIME] ..." once per Triangulation() call
+#ifndef OPENMVG_SFM2_TIME_TRIANGULATION
+#define OPENMVG_SFM2_TIME_TRIANGULATION 0
+#endif
+
+// Minimum number of observations a track must have to survive the initial
+// TracksBuilder::Filter() pass in InitTracksAndLandmarks().
+//
+// CHANGES OUTPUT: this is a semantic knob, not a pure perf toggle.
+//   2 = reference / safe default. Keeps every length-2+ track. Bit-identical
+//       to upstream behaviour. Restore this value if you see ghost layers,
+//       lost coverage, or fewer calibrated cameras after enabling the cut.
+//   3 = drop length-2 tracks before triangulation. On drone scenes this
+//       typically halves the track count and shrinks BA residual count by
+//       30-50% with little or no loss of calibrated views, because the
+//       short tracks dropped here are usually already pruned by the
+//       post-Triangulation pixel/angle filter a few lines later anyway.
+//       The wins propagate into every intermediate BA *and* the final
+//       STRICT BA. Expected: -30 to -80 s on a 368-pose drone scene.
+//   4+ = aggressive; only safe on very dense scenes.
+//
+// Flip this back to 2 if downstream MVS shows degraded output.
+//
+// HISTORY: briefly forced to 2 to confirm the cut was the cause of an
+// intermittent non-convergence on the Randy dataset. Confirmed, then restored
+// to 3 (the speed win) with a SOFTENED coverage guard below (MIN_CELL_SUPPORT
+// 4->6, BORDER_PCT 12->20) so the load-bearing peripheral short tracks Randy
+// needs are retained while the redundant interior ones are still dropped.
+#ifndef OPENMVG_SFM2_TRACKS_MIN_LENGTH
+#define OPENMVG_SFM2_TRACKS_MIN_LENGTH 3
+#endif
+
+// Coverage guard for the SELECTIVE short-track cut, measured by per-view
+// IMAGE-SPACE occupancy. Strong (length>=MIN_LENGTH) observations are binned
+// into a fixed-size pixel grid per view; a short track is dropped only if every
+// one of its observations lands in a cell already holding at least
+// OPENMVG_SFM2_TRACKS_MIN_CELL_SUPPORT strong observations. Short tracks in
+// sparse cells (frame edges/corners with little redundant structure) are kept
+// -- this is what prevents the right-edge blow-up a global cut produces.
+//
+//   0   = DISABLE the guard -> unconditional global cut. Equivalent to the old
+//         tracksBuilder.Filter(MIN_LENGTH): fastest, but can splay sparsely-
+//         covered edges. Only safe on uniformly dense scenes.
+//   ~4  = balanced DEFAULT. Cells already packed with redundant strong
+//         structure shed their short tracks for the speed win; sparse cells
+//         keep theirs for stability.
+//   higher = safer / less aggressive (fewer short tracks dropped). Raise this
+//            if you still see edge drift; lower it toward 0 for more speed on
+//            scenes you trust are dense.
+//
+// Tune per-dataset at build time, e.g.:
+//   -DOPENMVG_SFM2_TRACKS_MIN_CELL_SUPPORT=6
+//
+// Raised 4->6 after the Randy non-convergence: a cell now needs 6 strong obs
+// before its short tracks are considered redundant, so more peripheral short
+// tracks survive and the BA conditioning margin stays wide enough to absorb
+// the pipeline's run-to-run nondeterminism.
+#ifndef OPENMVG_SFM2_TRACKS_MIN_CELL_SUPPORT
+#define OPENMVG_SFM2_TRACKS_MIN_CELL_SUPPORT 6
+#endif
+
+// Pixel size of the square image-grid cell used by the coverage guard above.
+// Larger cells = coarser coverage test = more short tracks judged redundant
+// (more aggressive); smaller cells = finer, safer. ~1/20th of the image width
+// is a reasonable starting point.
+#ifndef OPENMVG_SFM2_TRACKS_COVERAGE_CELL_PX
+#define OPENMVG_SFM2_TRACKS_COVERAGE_CELL_PX 96
+#endif
+
+// Frame-border margin, as a percentage of each image's min-dimension, for the
+// coverage guard's border refinement. A short track is protected only if one
+// of its sparse-cell observations also lies within this margin of a frame edge;
+// sparse cells in the image interior do NOT protect (they are surrounded by
+// structure and do not drive the scene-edge divergence). Smaller = more
+// aggressive (only the very outermost rim protects); larger = safer. Set to
+// >= 50 to disable the border test entirely (revert to "any sparse cell
+// protects").
+//
+// Raised 12->20 alongside the Randy fix: a wider border band protects short
+// tracks further in from the frame edge, covering the peripheral structure
+// Randy depends on without protecting the dense interior.
+#ifndef OPENMVG_SFM2_TRACKS_COVERAGE_BORDER_PCT
+#define OPENMVG_SFM2_TRACKS_COVERAGE_BORDER_PCT 20
 #endif
 
 namespace openMVG {
@@ -306,7 +432,8 @@ SequentialSfMReconstructionEngine2::SequentialSfMReconstructionEngine2(
   : ReconstructionEngine(sfm_data, soutDirectory),
     scene_initializer_(scene_initializer),
     sLogging_file_(sloggingFile),
-    cam_type_(EINTRINSIC(PINHOLE_CAMERA_RADIAL3))
+    cam_type_(EINTRINSIC(PINHOLE_CAMERA_RADIAL3)),
+    track_min_length_(OPENMVG_SFM2_TRACKS_MIN_LENGTH)
 {
   if (!sLogging_file_.empty())
   {
@@ -384,15 +511,37 @@ bool SequentialSfMReconstructionEngine2::Process() {
   //- 1. Init the reconstruction with a Seed
   //--
   {
-    if (!scene_initializer_ || !scene_initializer_->Process())
-    {
-      OPENMVG_LOG_ERROR << "Initialization status: Failed";
-      return false;
-    }
-    else
+    const bool primary_init_ok = scene_initializer_ && scene_initializer_->Process();
+    if (primary_init_ok)
     {
       OPENMVG_LOG_INFO << "Initialization status : Success";
       sfm_data_.poses = scene_initializer_->Get_sfm_data().GetPoses();
+    }
+    else
+    {
+      // Fallback: the configured initializer produced no seed. This happens
+      // with STELLAR on HIGH-feature / low-parallax aerial graphs, where too
+      // few of the putative pod's edges yield a relative pose to form a
+      // solvable star (only a scattered handful succeed -> largest star is a
+      // single edge -> Stellar_Solver::Solve returns false). Failing here
+      // would abort the engine and drop the surrounding pipeline to the GLOBAL
+      // engine. Instead retry with MaxPair, which only needs one
+      // well-conditioned pair and is robust on this data (lazy widest-baseline
+      // seed + adaptive GPS prior). Its constructor clears any partial poses
+      // the failed initializer left, and it writes directly into sfm_data_.
+      OPENMVG_LOG_WARNING
+        << "Primary scene initializer produced no seed; falling back to MaxPair.";
+      SfMSceneInitializerMaxPair maxpair_fallback(
+        sfm_data_, features_provider_, matches_provider_);
+      if (!maxpair_fallback.Process())
+      {
+        OPENMVG_LOG_ERROR
+          << "Initialization status: Failed (primary initializer and MaxPair"
+          << " fallback both produced no seed).";
+        return false;
+      }
+      OPENMVG_LOG_INFO << "Initialization status : Success (MaxPair fallback)";
+      // MaxPair wrote the seed poses directly into sfm_data_ (shared by ref).
     }
 
 #if OPENMVG_SFM_PIPELINE_DIAG
@@ -440,7 +589,8 @@ bool SequentialSfMReconstructionEngine2::Process() {
 
     if (!sfm_data_.GetPoses().empty())
     {
-      const bool bTriangulation = Triangulation();
+      bool bTriangulation = Triangulation();
+
       Save(sfm_data_, stlplus::create_filespec(sOut_directory_, "Initialization", ".ply"), ESfM_Data(ALL));
       // Fused angle + pixel filter: one structure traversal, one cache build.
       // Semantically equivalent to the legacy upstream pair at this site:
@@ -450,11 +600,44 @@ bool SequentialSfMReconstructionEngine2::Process() {
       // structure was just triangulated and hasn't been BA'd yet -- residuals
       // are coarse, and tighter thresholds would over-prune before BA gets a
       // chance to refine. The in-loop post-BA filter uses 2.0 / 4.0.
+      // NOTE: the angle floor is OPENMVG_SFM2_SEED_MIN_ANGLE_DEG (default
+      // 2.0 deg), NOT the upstream 4.0 (Square(2.0)) -- 4 deg wipes the entire
+      // seed on low-parallax aerial pairs (see the macro's comment).
 #if OPENMVG_SFM2_RELAXED_ANGLE_THRESHOLDS // Relaxed angle threshold for foliage/narrow-baseline scenes
       RemoveOutliers_PixelAndAngleError(sfm_data_, Square(4.0), 3.0);
 #else
-      RemoveOutliers_PixelAndAngleError(sfm_data_, Square(4.0), Square(2.0));
+      RemoveOutliers_PixelAndAngleError(sfm_data_, Square(4.0), OPENMVG_SFM2_SEED_MIN_ANGLE_DEG);
 #endif
+
+      // Auto-fallback for the selective short-track cut, evaluated on the
+      // POST-FILTER structure. On thin-overlap scenes the seed pair's covisible
+      // tracks are mostly length-2, which the cut (track_min_length_ > 2) drops;
+      // the few length-3+ tracks that survive triangulation are then culled by
+      // the loose outlier filter above, leaving 0 usable landmarks so the
+      // resection loop can never bootstrap (ends at 2 cameras / 0 tracks).
+      // Detect the empty structure here (checked AFTER the filter, since
+      // triangulation itself may yield a handful the filter then removes) and
+      // retry ONCE with the cut disabled (min_len=2 keeps every length-2 track),
+      // redoing triangulation + the same filter. Dense scenes keep thousands of
+      // landmarks and never enter this branch, so the fast cut stays the
+      // default; only starved scenes pay the one-time re-init cost.
+      if (sfm_data_.GetLandmarks().empty() && track_min_length_ > 2)
+      {
+        OPENMVG_LOG_WARNING
+          << "[TRACKS-CUT] seed produced 0 usable landmarks with min_len="
+          << track_min_length_ << " (short-track cut starved the seed)."
+          << " Falling back to min_len=2 (keep all length-2 tracks) and"
+          << " rebuilding tracks.";
+        track_min_length_ = 2;
+        if (!InitTracksAndLandmarks())
+          return false;
+        bTriangulation = Triangulation();
+#if OPENMVG_SFM2_RELAXED_ANGLE_THRESHOLDS // Relaxed angle threshold for foliage/narrow-baseline scenes
+        RemoveOutliers_PixelAndAngleError(sfm_data_, Square(4.0), 3.0);
+#else
+        RemoveOutliers_PixelAndAngleError(sfm_data_, Square(4.0), OPENMVG_SFM2_SEED_MIN_ANGLE_DEG);
+#endif
+      }
 
       //-- Display some statistics
       OPENMVG_LOG_INFO
@@ -556,7 +739,7 @@ bool SequentialSfMReconstructionEngine2::Process() {
 #if OPENMVG_SFM2_RELAXED_ANGLE_THRESHOLDS // Relaxed angle threshold for foliage/narrow-baseline scenes
         RemoveOutliers_PixelAndAngleError(sfm_data_, 4.0, 1.5);
 #else
-        RemoveOutliers_PixelAndAngleError(sfm_data_, 4.0, 2.0);
+        RemoveOutliers_PixelAndAngleError(sfm_data_, 4.0, OPENMVG_SFM2_TRACK_MIN_ANGLE_DEG);
 #endif
         eraseUnstablePosesAndObservations(sfm_data_);
       }
@@ -606,7 +789,7 @@ bool SequentialSfMReconstructionEngine2::Process() {
 #if OPENMVG_SFM2_RELAXED_ANGLE_THRESHOLDS // Relaxed angle threshold for foliage/narrow-baseline scenes
       RemoveOutliers_PixelAndAngleError(sfm_data_, 4.0, 1.5);
 #else
-      RemoveOutliers_PixelAndAngleError(sfm_data_, 4.0, 2.0);
+      RemoveOutliers_PixelAndAngleError(sfm_data_, 4.0, OPENMVG_SFM2_TRACK_MIN_ANGLE_DEG);
 #endif
       eraseUnstablePosesAndObservations(sfm_data_);
       poses_since_last_ba = 0;
@@ -759,14 +942,162 @@ bool SequentialSfMReconstructionEngine2::Process() {
   return true;
 }
 
+// Coverage-aware short-track cut, measured by per-view IMAGE-SPACE occupancy
+// with a FRAME-BORDER refinement.
+//
+// Covisibility metrics proved useless on dense drone match graphs: every
+// length-2 track links a view pair that already shares many strong tracks, so
+// any covisibility floor classifies ALL short tracks as redundant (the global
+// cut, which blows up the scene edge). The true discriminator is spatial: the
+// load-bearing short tracks sit in IMAGE REGIONS (frame edges/corners) that
+// strong tracks do not cover. A length-2 observation in an otherwise-empty
+// patch of its view is the only thing constraining that part of the frustum.
+//
+// Refinement: a SPARSE cell in the image *interior* is surrounded by strong
+// structure and is not what diverges -- the right-edge blow-up happens at the
+// image *border* (peripheral field of view -> scene periphery), where there is
+// nothing beyond to constrain the frustum. So a short observation protects its
+// track only when it is BOTH in a sparse cell AND near the frame border. Short
+// tracks whose only sparse observations are interior are dropped too, which
+// recovers most of the remaining speedup safely.
+//
+// Method: bin every strong (length >= min_len) observation into a fixed
+// `cell_px`-pixel grid per view. A short track is KEPT iff at least one of its
+// observations is (a) in a cell holding < `min_cell_support` strong obs AND
+// (b) within `border_pct`% of the image min-dimension from a frame edge.
+// Otherwise it is dropped. `min_cell_support == 0` reproduces the global cut;
+// `border_pct >= 50` disables the border test (any sparse cell protects).
+static void SelectiveShortTrackCut(
+    tracks::STLMAPTracks & map_tracks,
+    Features_Provider * features,
+    const SfM_Data & sfm_data,
+    const uint32_t min_len,
+    const uint32_t min_cell_support,
+    const uint32_t cell_px,
+    const uint32_t border_pct)
+{
+  if (min_len <= 2)
+    return; // nothing to cut: every length-2+ track is kept
+  if (min_cell_support == 0 || features == nullptr || cell_px == 0)
+  {
+    // Degenerate: unconditional global length cut.
+    size_t dropped = 0;
+    for (auto it = map_tracks.begin(); it != map_tracks.end(); )
+    {
+      if (it->second.size() < min_len) { it = map_tracks.erase(it); ++dropped; }
+      else                             { ++it; }
+    }
+    OPENMVG_LOG_INFO
+      << "[TRACKS-CUT] global: min_len=" << min_len
+      << " dropped=" << dropped << " kept_short=0";
+    return;
+  }
+
+  // Pack (view, cell_x, cell_y) into a 64-bit key: view:32 | cx:16 | cy:16.
+  const float inv_cell = 1.0f / static_cast<float>(cell_px);
+  const auto cell_key =
+    [inv_cell](uint32_t view, float x, float y) -> uint64_t {
+      const uint32_t cx = static_cast<uint32_t>(x * inv_cell) & 0xFFFFu;
+      const uint32_t cy = static_cast<uint32_t>(y * inv_cell) & 0xFFFFu;
+      return (static_cast<uint64_t>(view) << 32) |
+             (static_cast<uint64_t>(cx) << 16) |
+              static_cast<uint64_t>(cy);
+    };
+
+  const auto obs_coords =
+    [features](uint32_t view, uint32_t feat, float & x, float & y) -> bool {
+      const auto vit = features->feats_per_view.find(view);
+      if (vit == features->feats_per_view.end() ||
+          feat >= vit->second.size())
+        return false;
+      const auto c = vit->second[feat].coords();
+      x = static_cast<float>(c.x());
+      y = static_cast<float>(c.y());
+      return true;
+    };
+
+  // Per-view frame-border margin in pixels (border_pct% of the image
+  // min-dimension, at least one cell). Returns false if dimensions unknown.
+  const auto & views = sfm_data.GetViews();
+  const auto near_border =
+    [&views, border_pct, cell_px](uint32_t view, float x, float y) -> bool {
+      const auto vit = views.find(view);
+      if (vit == views.end() || !vit->second) return true; // unknown -> protect
+      const float W = static_cast<float>(vit->second->ui_width);
+      const float H = static_cast<float>(vit->second->ui_height);
+      if (W <= 0.f || H <= 0.f) return true;
+      if (border_pct >= 50) return true; // border test disabled
+      const float margin =
+        std::max(static_cast<float>(cell_px),
+                 std::min(W, H) * (static_cast<float>(border_pct) / 100.f));
+      return (x < margin) || (x > W - margin) ||
+             (y < margin) || (y > H - margin);
+    };
+
+  // Pass 1: per-view, per-cell count of strong observations.
+  std::unordered_map<uint64_t, uint32_t> cell_strong;
+  for (const auto & trk : map_tracks)
+  {
+    if (trk.second.size() < min_len) continue;
+    for (const auto & obs : trk.second)
+    {
+      float x, y;
+      if (obs_coords(obs.first, obs.second, x, y))
+        ++cell_strong[cell_key(obs.first, x, y)];
+    }
+  }
+
+  // Pass 2: keep a short track only if at least one observation is in a sparse
+  // cell AND near the frame border; otherwise drop it.
+  size_t dropped = 0, kept_short = 0, kept_no_coords = 0;
+  for (auto it = map_tracks.begin(); it != map_tracks.end(); )
+  {
+    if (it->second.size() >= min_len) { ++it; continue; }
+    bool protective = false; // found a sparse + border observation
+    bool had_coords = true;
+    for (const auto & obs : it->second)
+    {
+      float x, y;
+      if (!obs_coords(obs.first, obs.second, x, y)) { had_coords = false; break; }
+      const auto s = cell_strong.find(cell_key(obs.first, x, y));
+      const uint32_t c = (s == cell_strong.end()) ? 0u : s->second;
+      const bool sparse = (c < min_cell_support);
+      if (sparse && near_border(obs.first, x, y)) { protective = true; break; }
+    }
+    if (!had_coords)    { ++it; ++kept_no_coords; } // keep if coords unknown
+    else if (protective){ ++it; ++kept_short; }
+    else                { it = map_tracks.erase(it); ++dropped; }
+  }
+  OPENMVG_LOG_INFO
+    << "[TRACKS-CUT] selective(coverage+border): min_len=" << min_len
+    << " min_cell_support=" << min_cell_support
+    << " cell_px=" << cell_px
+    << " border_pct=" << border_pct
+    << " dropped=" << dropped
+    << " kept_short=" << kept_short
+    << " kept_no_coords=" << kept_no_coords;
+}
+
 bool SequentialSfMReconstructionEngine2::InitTracksAndLandmarks()
 {
   // Compute tracks from matches
   tracks::TracksBuilder tracksBuilder;
   {
     tracksBuilder.Build(matches_provider_->pairWise_matches_);
-    tracksBuilder.Filter();
+    // Keep every valid length-2+ track at the builder stage (this still removes
+    // id-collision tracks). The short-track cut is applied SELECTIVELY below on
+    // map_tracks_ so we can protect low-overlap / peripheral views; see the
+    // top-of-file knobs OPENMVG_SFM2_TRACKS_MIN_LENGTH and
+    // OPENMVG_SFM2_TRACKS_MIN_STRONG_SUPPORT.
+    tracksBuilder.Filter(2);
     tracksBuilder.ExportToSTL(map_tracks_);
+    SelectiveShortTrackCut(map_tracks_,
+                           features_provider_,
+                           sfm_data_,
+                           track_min_length_,
+                           OPENMVG_SFM2_TRACKS_MIN_CELL_SUPPORT,
+                           OPENMVG_SFM2_TRACKS_COVERAGE_CELL_PX,
+                           OPENMVG_SFM2_TRACKS_COVERAGE_BORDER_PCT);
 
     OPENMVG_LOG_INFO << "\n" << "Track stats";
     {
@@ -810,6 +1141,15 @@ bool SequentialSfMReconstructionEngine2::InitTracksAndLandmarks()
     // pass needed -- a sorted track id is appended exactly once per
     // (view, track) pair, in increasing track-id order.
     view_track_ids_cache_.clear();
+    view_track_ids_cache_.reserve(sfm_data_.GetViews().size());
+    // Do NOT reserve() landmarks_. It is a Hash_Map<IndexT, Landmark>
+    // (std::unordered_map); reserving changes the bucket count, which changes
+    // iteration order -> sfm_data_.structure order (set in Triangulation) ->
+    // Ceres residual-block insertion order -> FP summation order in the Schur
+    // solve. That makes runs non-bit-identical and, on bimodal / ghost-layer-
+    // prone scenes, tips the final BA into a worse basin (right-edge blow-up).
+    // The few saved rehashes are not worth a divergent reconstruction.
+    landmarks_.clear();
 
     // For every track add the observations:
     // - views and feature positions that see this landmark
@@ -851,12 +1191,25 @@ bool SequentialSfMReconstructionEngine2::InitTracksAndLandmarks()
     max_view_id = std::max(max_view_id, view_it.first);
   resection_score_cache_.assign(max_view_id + 1, ResectionScoreCache{});
   prev_reconstructed_track_ids_.clear();
-  prev_view_with_no_pose_.clear();
+  cur_reconstructed_track_ids_.clear();
+  // Reset bitmask scratch (sized identically to resection_score_cache_).
+  prev_view_with_no_pose_mask_.assign(max_view_id + 1, 0);
+  cur_view_with_no_pose_mask_.assign(max_view_id + 1, 0);
+  dirty_view_mask_.assign(max_view_id + 1, 0);
   return map_tracks_.size() > 0;
 }
 
 bool SequentialSfMReconstructionEngine2::Triangulation()
 {
+#if OPENMVG_SFM2_TIME_TRIANGULATION
+  // INERT profiling probe (see OPENMVG_SFM2_TIME_TRIANGULATION toggle).
+  // Function-local statics accumulate across the sequential resection loop;
+  // Triangulation() is never called concurrently, so no synchronisation.
+  static unsigned long long s_tri_call_count = 0;
+  static double             s_tri_total_ms   = 0.0;
+  const auto s_tri_t0 = std::chrono::steady_clock::now();
+#endif
+
   sfm_data_.structure = landmarks_;
 
   //--
@@ -868,7 +1221,27 @@ bool SequentialSfMReconstructionEngine2::Triangulation()
   const double max_reprojection_error = 4.0;
   const IndexT min_required_inliers = 2;
   const IndexT min_sample_index = 2;
+
+  // One-time seed-stage breakdown: when only the 2 seed poses exist, log where
+  // the seed structure is lost so a "2 cameras / 0 tracks" stall can be pinned
+  // to either (a) no track spans the seed pair -> everything dies in
+  // eraseObservationsWithMissingPoses (matching/track-graph problem), or
+  // (b) tracks span the pair but triangulation rejects them (degenerate pose /
+  // cheirality / reprojection). Init-only, so it never spams the resection loop.
+  const bool seed_stage = (sfm_data_.GetPoses().size() <= 2);
+  const std::size_t n_before_erase = seed_stage ? sfm_data_.structure.size() : 0;
+
   eraseObservationsWithMissingPoses(sfm_data_, min_sample_index);
+
+  if (seed_stage)
+  {
+    const std::size_t n_after_erase = sfm_data_.structure.size();
+    OPENMVG_LOG_INFO
+      << "[SEED-TRI] poses=" << sfm_data_.GetPoses().size()
+      << " landmarks=" << n_before_erase
+      << " span_seed_pair(after_erase)=" << n_after_erase;
+  }
+
   SfM_Data_Structure_Computation_Robust triangulation_engine(
       max_reprojection_error,
       min_required_inliers,
@@ -876,6 +1249,27 @@ bool SequentialSfMReconstructionEngine2::Triangulation()
       triangulation_method_);
 
   triangulation_engine.triangulate(sfm_data_);
+
+  if (seed_stage)
+  {
+    OPENMVG_LOG_INFO
+      << "[SEED-TRI] triangulated(after_robust)=" << sfm_data_.structure.size()
+      << " (if span_seed_pair>0 but this=0 -> degenerate seed geometry;"
+      << " if span_seed_pair=0 -> no track connects the seed views)";
+  }
+
+#if OPENMVG_SFM2_TIME_TRIANGULATION
+  const auto s_tri_t1 = std::chrono::steady_clock::now();
+  const double s_tri_ms =
+    std::chrono::duration<double, std::milli>(s_tri_t1 - s_tri_t0).count();
+  s_tri_total_ms += s_tri_ms;
+  ++s_tri_call_count;
+  OPENMVG_LOG_INFO
+    << "[TRI-TIME] call=" << s_tri_call_count
+    << " tracks=" << sfm_data_.structure.size()
+    << " this_ms=" << s_tri_ms
+    << " cumulative_ms=" << s_tri_total_ms;
+#endif
 
   return !sfm_data_.structure.empty();
 }
@@ -941,28 +1335,19 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
 
   // Get the track ids of the reconstructed landmarks.
   //
-  // Buffer is reused across calls to avoid the per-call allocation of a
-  // landmark-count-sized vector (5M+ entries on large scenes -- the
-  // alloc + dealloc was a measurable per-AddingMissingView fixed cost).
-  // `clear()` preserves capacity, so the `reserve()` below is a no-op
-  // once the buffer has grown to the high-water mark.
-  //
-  // `thread_local` is defensive: AddingMissingView is called serially
-  // from Process() (the OMP parallel-for lives *inside* this function),
-  // so a plain `static` would also be correct. `thread_local` future-
-  // proofs against any caller that might one day invoke this from
-  // multiple threads.
+  // Buffer is a class member (`cur_reconstructed_track_ids_`) so its
+  // heap capacity is reused across calls; at the end of this function
+  // it is swapped with `prev_reconstructed_track_ids_` (no copy).
   //
   // Output bit-identical to the previous lambda-IIFE form: same
   // transform, same sort, same final contents.
-  thread_local static std::vector<IndexT> reconstructed_trackId_buf;
-  reconstructed_trackId_buf.clear();
-  reconstructed_trackId_buf.reserve(sfm_data_.GetLandmarks().size());
+  std::vector<IndexT> & reconstructed_trackId = cur_reconstructed_track_ids_;
+  reconstructed_trackId.clear();
+  reconstructed_trackId.reserve(sfm_data_.GetLandmarks().size());
   std::transform(sfm_data_.GetLandmarks().cbegin(), sfm_data_.GetLandmarks().cend(),
-    std::back_inserter(reconstructed_trackId_buf),
+    std::back_inserter(reconstructed_trackId),
     stl::RetrieveKey());
-  std::sort(reconstructed_trackId_buf.begin(), reconstructed_trackId_buf.end());
-  const std::vector<IndexT> & reconstructed_trackId = reconstructed_trackId_buf;
+  std::sort(reconstructed_trackId.begin(), reconstructed_trackId.end());
 
   // === Resection-score delta cache ===
   //
@@ -995,9 +1380,17 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
   //     reconstructed set has materially turned over and most views
   //     will end up dirty anyway. Walking every delta track's view
   //     list would cost more than just letting per-view recompute run.
-  std::unordered_set<IndexT> dirty_views;
-  const bool first_call = prev_view_with_no_pose_.empty()
-                        && prev_reconstructed_track_ids_.empty();
+  //
+  // `dirty_view_mask_` is a reused bit-vector keyed by view_id
+  // (replacing the previous std::unordered_set<IndexT>). Reset to all-
+  // zero each call; O(1) mark, O(1) test, no hashing or bucket allocs.
+  // Bounded by max_view_id+1 (== resection_score_cache_.size()).
+  std::fill(dirty_view_mask_.begin(), dirty_view_mask_.end(), uint8_t(0));
+  // prev_reconstructed_track_ids_ is only empty on the first invocation;
+  // any subsequent call has at least one reconstructed track (we early-
+  // return at the top if landmarks is empty, and otherwise populated
+  // reconstructed_trackId is swapped into prev_ at the end of the call).
+  const bool first_call = prev_reconstructed_track_ids_.empty();
   bool force_all_dirty = first_call;
 
   std::vector<IndexT> added_tracks, removed_tracks;
@@ -1019,21 +1412,32 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
     }
     else
     {
+      const IndexT mask_size = static_cast<IndexT>(dirty_view_mask_.size());
       auto mark_views_for_track = [&](IndexT track_id)
       {
         auto it = map_tracks_.find(track_id);
         if (it == map_tracks_.end()) return;
         for (const auto & vf : it->second)  // {ViewId, FeatureId}
-          dirty_views.insert(vf.first);
+        {
+          const IndexT vid = vf.first;
+          if (vid < mask_size) dirty_view_mask_[vid] = 1;
+        }
       };
       for (IndexT t : added_tracks)   mark_views_for_track(t);
       for (IndexT t : removed_tracks) mark_views_for_track(t);
     }
   }
 
-  // Snapshot current no-pose set for next round's "re-entered" detection.
-  std::unordered_set<IndexT> current_view_with_no_pose_set(
-      view_with_no_pose.cbegin(), view_with_no_pose.cend());
+  // Build current no-pose mask for next round's "re-entered" detection.
+  // Reused member bit-vector (no per-call allocation). The previous
+  // mask is still valid here (we read it below); we swap at function end.
+  std::fill(cur_view_with_no_pose_mask_.begin(),
+            cur_view_with_no_pose_mask_.end(), uint8_t(0));
+  {
+    const IndexT mask_size = static_cast<IndexT>(cur_view_with_no_pose_mask_.size());
+    for (IndexT id : view_with_no_pose)
+      if (id < mask_size) cur_view_with_no_pose_mask_[id] = 1;
+  }
 
   // List the view that have a sufficient 2D-3D coverage for robust pose estimation
   //
@@ -1082,11 +1486,13 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
       // added/removed from reconstructed_trackId since.
       ResectionScoreCache & slot = resection_score_cache_[view_id];
       const bool was_scored_last_round =
-          prev_view_with_no_pose_.count(view_id) > 0;
+          (view_id < prev_view_with_no_pose_mask_.size())
+          && prev_view_with_no_pose_mask_[view_id] != 0;
       const bool is_dirty =
           force_all_dirty
           || !was_scored_last_round
-          || dirty_views.count(view_id) > 0;
+          || (view_id < dirty_view_mask_.size()
+              && dirty_view_mask_[view_id] != 0);
 
       if (is_dirty)
       {
@@ -1110,10 +1516,13 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
           slot.track_id_for_resection;
       const double track_ratio = slot.track_ratio;
 
-      OPENMVG_LOG_INFO
-        << "ViewId: " << view_id
-        << "; #number of 2D-3D matches: " << track_id_for_resection.size()
-        << "; " << track_ratio * 100 << " % of the view track coverage.";
+      // Per-view "ViewId: ...; #2D-3D matches: ..." log removed.
+      // It fired unconditionally for every no-pose view in every resection
+      // round (~14k records on 369-image runs), and OPENMVG_LOG_INFO takes
+      // a global logger mutex -- inside an `#pragma omp parallel for` that
+      // effectively serializes the loop. The gate-passed branch below still
+      // logs each actually-resected view via "Robust Resection of camera
+      // index: ..." so no observable diagnostic information is lost.
 
 #if OPENMVG_SFM_PIPELINE_DIAG
       // Pre-classify failure reason; will be overwritten on success.
@@ -1158,17 +1567,24 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
           intrinsic = sfm_data_.GetIntrinsics().at(view->id_intrinsic);
         }
 
-        // Collect the feature observation
+        // Collect the feature observation.
+        // Hoist hash-map lookups (`feats_per_view.at(view_id)` and
+        // `GetLandmarks()`) out of the per-point loop; both are O(1)
+        // average but the constant-factor savings are noticeable when
+        // a single view produces hundreds of 2D-3D pairs.
         Mat2X pt2D_original(2, track_id_for_resection.size());
+        const auto & view_feats   = features_provider_->feats_per_view.at(view_id);
+        const auto & landmarks    = sfm_data_.GetLandmarks();
+        const bool   has_disto    = intrinsic && intrinsic->have_disto();
         auto track_it = track_id_for_resection.cbegin();
         auto feat_it = feature_id_for_resection.cbegin();
         for (size_t cpt = 0; cpt < track_id_for_resection.size(); ++cpt, ++track_it, ++feat_it)
         {
-          resection_data.pt3D.col(cpt) = sfm_data_.GetLandmarks().at(*track_it).X;
+          resection_data.pt3D.col(cpt) = landmarks.at(*track_it).X;
           resection_data.pt2D.col(cpt) = pt2D_original.col(cpt) =
-            features_provider_->feats_per_view.at(view_id)[*feat_it].coords().cast<double>();
+            view_feats[*feat_it].coords().cast<double>();
           // Handle image distortion if intrinsic is known (to ease the resection)
-          if (intrinsic && intrinsic->have_disto())
+          if (has_disto)
           {
             resection_data.pt2D.col(cpt) = intrinsic->get_ud_pixel(resection_data.pt2D.col(cpt));
           }
@@ -1336,9 +1752,11 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
   const IndexT pose_after = sfm_data_.GetPoses().size();
 
   // Persist delta-cache state for the next AddingMissingView() call.
-  // Done after the parallel loop so writes are race-free.
-  prev_reconstructed_track_ids_ = reconstructed_trackId;
-  prev_view_with_no_pose_ = std::move(current_view_with_no_pose_set);
+  // Swap (no copy) the current track-id vector into prev_, and move the
+  // current no-pose mask into prev_. Done after the parallel loop so
+  // writes are race-free.
+  prev_reconstructed_track_ids_.swap(reconstructed_trackId);
+  prev_view_with_no_pose_mask_.swap(cur_view_with_no_pose_mask_);
 
   return (pose_after != pose_before);
 }
@@ -1362,8 +1780,12 @@ bool SequentialSfMReconstructionEngine2::BundleAdjustment(BAPreset preset)
   // both cases (same KKT system).
   const std::size_t n_poses = sfm_data_.GetPoses().size();
   const bool sparse_available =
+#if OPENMVG_SFM2_FORCE_NO_SPARSE_BA
+      false;  // A/B override: behave as if Ceres was built without sparse libs.
+#else
        ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::SUITE_SPARSE)
     || ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::EIGEN_SPARSE);
+#endif
 
   if (n_poses > 1500 && sparse_available)
   {

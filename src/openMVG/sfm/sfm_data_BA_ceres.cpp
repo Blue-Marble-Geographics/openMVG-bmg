@@ -54,6 +54,39 @@ namespace sfm {
 #define OPENMVG_BA_USE_INNER_ITERATIONS 1
 #endif
 
+// ---------------------------------------------------------------------------
+// Adaptive GPS / motion-prior weighting (auto de-dome).
+//
+// PROBLEM: the pose-center prior weight (ViewPriors::center_weight_) defaults
+// to 1.0 per axis. Each camera then contributes ONE 3D prior residual (in GPS
+// units, e.g. metres) that must compete against the hundreds-to-thousands of
+// reprojection residuals (pixels) pulling on that same pose. The prior is
+// outvoted by ~n_obs:1, so BA settles into the low-reprojection "dome/bowl"
+// warp and never pulls the model onto its GPS priors (large residual GPS
+// fitting error, no convergence). A hard-coded -W weight cannot fix this for
+// arbitrary data because the right value depends on per-camera observation
+// count, scene scale and GPS units.
+//
+// FIX: scale each camera's prior weight by sqrt(n_obs_camera) so the prior
+// COST per camera (weight^2 * ||dC||^2) grows in step with that camera's
+// reprojection cost (~n_obs). The GPS:vision ratio then becomes INDEPENDENT of
+// point density, scene size and image count -- i.e. one dataset-independent
+// STRENGTH constant works for arbitrary data. The Huber knee is scaled by the
+// same factor so the robust threshold stays at the same physical distance.
+//
+//   OPENMVG_SFM_GPS_PRIOR_AUTOSCALE : 1 = on (default), 0 = legacy raw weight.
+//   OPENMVG_SFM_GPS_PRIOR_STRENGTH  : global GPS:vision ratio multiplier.
+//       1.0 = balanced (default). Raise (2-4) to force flatter georeferencing
+//       when GPS is trusted (RTK); lower (0.25-0.5) if the model starts
+//       snapping to noisy GPS. This is the ONLY knob to touch, and it is
+//       dataset-independent thanks to the sqrt(n_obs) scaling.
+#ifndef OPENMVG_SFM_GPS_PRIOR_AUTOSCALE
+#define OPENMVG_SFM_GPS_PRIOR_AUTOSCALE 1
+#endif
+#ifndef OPENMVG_SFM_GPS_PRIOR_STRENGTH
+#define OPENMVG_SFM_GPS_PRIOR_STRENGTH 1.0
+#endif
+
 using namespace openMVG::cameras;
 using namespace openMVG::geometry;
 
@@ -1085,20 +1118,59 @@ bool Bundle_Adjustment_Ceres::Adjust
     const bool own_prior_loss =
       (problem_options.loss_function_ownership == ceres::DO_NOT_TAKE_OWNERSHIP);
 
+    // --- Adaptive GPS-prior weighting (auto de-dome) -----------------------
+    // Count how many reprojection observations pull on each pose so we can
+    // scale that pose's prior weight by sqrt(n_obs). See the macro comment.
+    Hash_Map<IndexT, uint32_t> obs_per_pose;
+#if OPENMVG_SFM_GPS_PRIOR_AUTOSCALE
+    for (const auto & structure_it : sfm_data.structure)
+    {
+      for (const auto & obs_it : structure_it.second.obs)
+      {
+        const auto view_it = sfm_data.views.find(obs_it.first);
+        if (view_it == sfm_data.views.end() || !view_it->second) continue;
+        ++obs_per_pose[view_it->second->id_pose];
+      }
+    }
+#endif
+    const double gps_prior_strength =
+      static_cast<double>(OPENMVG_SFM_GPS_PRIOR_STRENGTH);
+
     size_t prior_blocks = 0;
+    double applied_scale_min = std::numeric_limits<double>::max();
+    double applied_scale_max = 0.0;
     for (const auto & view_it : sfm_data.GetViews())
     {
       const sfm::ViewPriors * prior = dynamic_cast<sfm::ViewPriors*>(view_it.second.get());
       if (prior != nullptr && prior->b_use_pose_center_ && sfm_data.IsPoseAndIntrinsicDefined(prior))
       {
+        // Per-pose adaptive scale: sqrt(n_obs) * strength. Falls back to the
+        // raw weight (scale 1.0) when autoscale is disabled or the pose has no
+        // counted observations. The prior residual is weight*dC, so the prior
+        // COST scales as n_obs -- matching this pose's reprojection cost.
+        double prior_scale = gps_prior_strength;
+#if OPENMVG_SFM_GPS_PRIOR_AUTOSCALE
+        const auto it_obs = obs_per_pose.find(prior->id_pose);
+        const double n_obs =
+          (it_obs != obs_per_pose.end()) ? static_cast<double>(it_obs->second) : 1.0;
+        prior_scale = std::sqrt(std::max(1.0, n_obs)) * gps_prior_strength;
+#endif
+        applied_scale_min = std::min(applied_scale_min, prior_scale);
+        applied_scale_max = std::max(applied_scale_max, prior_scale);
+
+        const Vec3 scaled_weight = prior->center_weight_ * prior_scale;
+
         // Arena-owned cost function (cost_function_ownership is DO_NOT_TAKE_OWNERSHIP).
         ceres::CostFunction * cost_function =
           cost_function_arena.Alloc<
             ceres::AutoDiffCostFunction<PoseCenterConstraintCostFunction, 3, 6>>(
-              new PoseCenterConstraintCostFunction(prior->pose_center_, prior->center_weight_));
+              new PoseCenterConstraintCostFunction(prior->pose_center_, scaled_weight));
 
+        // Scale the Huber knee by the same factor so the robust transition
+        // stays at the same PHYSICAL distance (pose_center_robust_fitting_error
+        // in user units) after the weight scaling.
         ceres::LossFunction * prior_loss =
-          new ceres::HuberLoss(Square(pose_center_robust_fitting_error));
+          new ceres::HuberLoss(Square(prior_scale * pose_center_robust_fitting_error));
         if (own_prior_loss)
           prior_loss_functions.emplace_back(prior_loss);
 
@@ -1113,7 +1185,11 @@ bool Bundle_Adjustment_Ceres::Adjust
     {
       OPENMVG_LOG_INFO
         << "[BA-DIAG:Prior] Added " << prior_blocks << " pose-center prior residual block(s)"
-        << " | Huber threshold (sq): " << Square(pose_center_robust_fitting_error);
+        << " | autoscale=" << (OPENMVG_SFM_GPS_PRIOR_AUTOSCALE ? "on" : "off")
+        << " strength=" << gps_prior_strength
+        << " weight_scale[min=" << (prior_blocks ? applied_scale_min : 0.0)
+        << " max=" << applied_scale_max << "]"
+        << " | base Huber threshold (sq): " << Square(pose_center_robust_fitting_error);
     }
   }
 

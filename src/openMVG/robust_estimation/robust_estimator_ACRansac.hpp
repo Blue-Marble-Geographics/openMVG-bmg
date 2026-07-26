@@ -37,6 +37,7 @@
 //--
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <iterator>
@@ -54,6 +55,35 @@ namespace openMVG {
 namespace robust{
 
 namespace acransac_nfa_internal {
+
+// ----------------------------------------------------------------
+// [ACRANSAC-PERF] Fast log-of-binomial-coefficient tabulation.
+//
+// The reference implementation (used when OPENMVG_ACRANSAC_FAST_LOGCOMBI=0)
+// fills `m_logc_n[0..n]` by computing logcombi(k, n) from scratch for
+// each k. That inner loop is O(min(k, n-k)), so the full table costs
+// O(n^2/4) float-adds. For nData = 1000 that is ~250K ops per
+// ACRANSAC call (per NFA_Interface construction).
+//
+// The fast path uses the recurrences:
+//   logC(n,k)   = logC(n,k-1) + log10(n-k+1) - log10(k)   for k <= n/2
+//   logC(n,k)   = logC(n, n-k)                            for k >  n/2   (symmetry C(n,k)=C(n,n-k))
+//   logC(n,k0)  = logC(n-1,k0) + log10(n)   - log10(n-k0) for n  >  2*k0 (k0 fixed)
+// reducing both tabulations to O(n). The accumulator is held in
+// `double` and rounded to `float` on store, so per-step drift vs the
+// reference is sub-ULP (in fact strictly better than the reference's
+// float-accumulator direct sum). NFA scores derived from these tables
+// will differ from the reference by at most a few ULPs; in pathological
+// near-tie configurations the chosen inlier threshold could shift by
+// one or two points. Bit-exact regression tests against the reference
+// will fail.
+//
+// Set OPENMVG_ACRANSAC_FAST_LOGCOMBI to 0 to restore the legacy
+// direct-sum implementation.
+// ----------------------------------------------------------------
+#ifndef OPENMVG_ACRANSAC_FAST_LOGCOMBI
+#define OPENMVG_ACRANSAC_FAST_LOGCOMBI 1
+#endif
 
 /// logarithm (base 10) of binomial coefficient
 static float logcombi
@@ -80,8 +110,23 @@ static void makelogcombi_n
 )
 {
   l.resize(n+1);
+#if OPENMVG_ACRANSAC_FAST_LOGCOMBI
+  // O(n) recurrence (see file header comment). logC(n,0) = 0; symmetric
+  // around k = n/2.
+  l[0] = 0.f;
+  const uint32_t half = n / 2;
+  double acc = 0.0;
+  for (uint32_t k = 1; k <= half; ++k) {
+    acc += static_cast<double>(vec_log10[n - k + 1])
+         - static_cast<double>(vec_log10[k]);
+    l[k] = static_cast<float>(acc);
+  }
+  for (uint32_t k = half + 1; k <= n; ++k)
+    l[k] = l[n - k];
+#else
   for (uint32_t k = 0; k <= n; ++k)
     l[k] = logcombi(k, n, vec_log10);
+#endif
 }
 
 /// tabulate logcombi(k,.)
@@ -94,8 +139,27 @@ static void makelogcombi_k
 )
 {
   l.resize(nmax+1);
+#if OPENMVG_ACRANSAC_FAST_LOGCOMBI
+  // For n <= 2*k the (n-k < k) symmetry fold inside logcombi() kicks
+  // in, so the recurrence's "add log10(n) - log10(n-k)" identity does
+  // not apply uniformly across that boundary. Compute those small-n
+  // values directly, then switch to O(1)/step recurrence for n > 2*k.
+  const uint32_t direct_end =
+      std::min<uint32_t>(2 * k, nmax);
+  for (uint32_t n = 0; n <= direct_end; ++n)
+    l[n] = logcombi(k, n, vec_log10);
+  if (direct_end < nmax) {
+    double acc = static_cast<double>(l[direct_end]);
+    for (uint32_t n = direct_end + 1; n <= nmax; ++n) {
+      acc += static_cast<double>(vec_log10[n])
+           - static_cast<double>(vec_log10[n - k]);
+      l[n] = static_cast<float>(acc);
+    }
+  }
+#else
   for (uint32_t n = 0; n <= nmax; ++n)
     l[n] = logcombi(k, n, vec_log10);
+#endif
 }
 
 static void makelogcombi
@@ -106,10 +170,15 @@ static void makelogcombi
   std::vector<float> & vec_logc_n
 )
 {
-  // compute a lookuptable of log10 value for the range [0,n+1]
-  std::vector<float> vec_log10(n + 1);
+  // Lookup table of log10(i) for i in [0, n+1).
+  // reserve + push_back skips the value-init of (n+1) floats that the
+  // previous `std::vector<float> vec_log10(n + 1)` ctor performed; every
+  // entry is overwritten on the very next line anyway. Final contents
+  // are identical (vec_log10[0] = log10(0) = -inf, unused by logcombi).
+  std::vector<float> vec_log10;
+  vec_log10.reserve(n + 1);
   for (uint32_t i = 0; i <= n; ++i)
-    vec_log10[i] = log10(static_cast<float>(i));
+    vec_log10.push_back(log10(static_cast<float>(i)));
 
   makelogcombi_n(n, vec_logc_n, vec_log10);
   makelogcombi_k(k, n, vec_logc_k, vec_log10);
@@ -196,6 +265,14 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
     std::pair<double,double> & nfa_threshold
 )
 {
+  // Hoist Kernel::NumSamples() once per call. m_residuals.size() would
+  // also work (sized to NumSamples() in the ctor), but going through the
+  // kernel keeps the contract explicit. NumSamples() is invariant for the
+  // lifetime of this NFA_Interface instance; the compiler can't prove
+  // that across virtual-or-templated kernel calls, so it would otherwise
+  // re-call on every use.
+  const uint32_t n_samples = static_cast<uint32_t>(m_kernel.NumSamples());
+
   // A-Contrario computation of the most meaningful discrimination inliers/outliers.
   // Two computation mode are implemented:
   // - A quantified computation
@@ -209,30 +286,56 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
     // This version avoid:
     //   - to sort explicitly the residual error array,
     //   - to compute the NFA for every sample of the datum.
-    const int nBins = 20;
-    Histogram<double> histo(0.0f, m_max_threshold, nBins);
-    histo.Add(m_residuals.cbegin(), m_residuals.cend());
+    //
+    // Inlined-array histogram: replaces the previous
+    //   Histogram<double> histo(0, m_max_threshold, nBins);
+    //   histo.Add(...);
+    //   const std::vector<double> residual_val = histo.GetXbinsValue();
+    // pattern, which heap-allocated two ~160 B vectors per call. With
+    // ACRANSAC running this up to `num_max_iteration` times, those small
+    // allocs were a measurable allocator-pressure source. The stack
+    // array + inline bin-center computation is bit-identical:
+    //   * binning index  = (r-Start) * nBins / (End-Start), Start=0,
+    //                    = r * nBins / m_max_threshold   (matches Histogram::Add)
+    //   * bin center val = (End-Start)/(nBins-1) * i + Start
+    //                    = m_max_threshold/(nBins-1) * i (matches GetXbinsValue)
+    //   * out-of-range residuals (r<0 or r>=m_max_threshold) are silently
+    //     dropped, exactly as Histogram's underflow/overflow counters were
+    //     incremented-but-never-read in the original.
+    constexpr int nBins = 20;
+    std::array<size_t, nBins> frequencies{};   // zero-initialised
+    const double inv_bin_width =
+        static_cast<double>(nBins) / m_max_threshold;
+    for (const double r : m_residuals)
+    {
+      // Negative r casts to a huge size_t and fails the i<nBins gate
+      // (same as Histogram's underflow path: silently ignored).
+      const size_t i = static_cast<size_t>(r * inv_bin_width);
+      if (i < static_cast<size_t>(nBins))
+        ++frequencies[i];
+    }
+    const double bin_step =
+        m_max_threshold / static_cast<double>(nBins - 1);
 
     // Compute NFA scoring from the cumulative histogram
 
     using nfa_thresholdT = std::pair<double,double>; // NFA and residual threshold
     nfa_thresholdT current_best_nfa(std::numeric_limits<double>::infinity(), 0.0);
     unsigned int cumulative_count = 0;
-    const std::vector<size_t> & frequencies = histo.GetHist();
-    const std::vector<double> residual_val = histo.GetXbinsValue();
     for (int bin = 0; bin < nBins; ++bin)
     {
       cumulative_count += frequencies[bin];
+      const double residual_val_bin = bin_step * static_cast<double>(bin);
       if (cumulative_count > Kernel::MINIMUM_SAMPLES
-          && residual_val[bin] > std::numeric_limits<float>::epsilon())
+          && residual_val_bin > std::numeric_limits<float>::epsilon())
       {
         const double logalpha = m_kernel.logalpha0()
-          + m_kernel.multError() * log10(residual_val[bin]
+          + m_kernel.multError() * log10(residual_val_bin
           + std::numeric_limits<float>::epsilon());
         const nfa_thresholdT current_nfa( m_loge0
           + logalpha * (double)(cumulative_count - Kernel::MINIMUM_SAMPLES)
           + m_logc_n[cumulative_count]
-          + m_logc_k[cumulative_count], residual_val[bin]);
+          + m_logc_k[cumulative_count], residual_val_bin);
         // Keep the best NFA iff it is meaningful ( NFA < 0 ) and better than the existing one
         if (current_nfa.first < current_best_nfa.first && current_nfa.first < 0)
           current_best_nfa = current_nfa;
@@ -248,8 +351,8 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
       // Pre-size to total residual count -- inlier count <= n; reserves once,
       // avoids the geometric realloc chain inside push_back. Semantics unchanged.
       inliers.clear();
-      inliers.reserve(m_kernel.NumSamples());
-      for (uint32_t index = 0; index < m_kernel.NumSamples(); ++index)
+      inliers.reserve(n_samples);
+      for (uint32_t index = 0; index < n_samples; ++index)
       {
         if (m_residuals[index] <= nfa_threshold.second)
           inliers.push_back(index);
@@ -262,7 +365,7 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
     // Residuals sorting (ascending order while keeping original point indexes)
     {
       m_sorted_residuals.clear();
-      m_sorted_residuals.reserve(m_kernel.NumSamples());
+      m_sorted_residuals.reserve(n_samples);
       // ----------------------------------------------------------------
       // [ACRANSAC-SAFE] NaN/Inf sanitize before sort.
       //
@@ -287,7 +390,7 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
 #endif
 #if OPENMVG_ACRANSAC_NAN_SANITIZE
       const double sentinel = std::numeric_limits<double>::max();
-      for (uint32_t i = 0; i < m_kernel.NumSamples(); ++i)
+      for (uint32_t i = 0; i < n_samples; ++i)
       {
         double r = m_residuals[i];
         // NaN-safe: (r != r) iff r is NaN. Inf is also rejected.
@@ -296,7 +399,7 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
         m_sorted_residuals.emplace_back(r, i);
       }
 #else
-      for (uint32_t i = 0; i < m_kernel.NumSamples(); ++i)
+      for (uint32_t i = 0; i < n_samples; ++i)
       {
         m_sorted_residuals.emplace_back(m_residuals[i], i);
       }
@@ -307,7 +410,7 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
     // Find best NFA and its index wrt square error threshold in m_sorted_residuals.
     using nfa_indexT = std::pair<double, uint32_t>;
     nfa_indexT current_best_nfa(std::numeric_limits<double>::infinity(), Kernel::MINIMUM_SAMPLES);
-    const size_t n = m_kernel.NumSamples();
+    const size_t n = n_samples;
     for (size_t k = Kernel::MINIMUM_SAMPLES + 1;
         k <= n && m_sorted_residuals[k-1].first <= m_max_threshold;
         ++k) // Compute the NFA for all k in [minimal_sample+1,n]
@@ -379,11 +482,23 @@ std::pair<double, double> ACRANSAC
 
   //--
   // Sampling:
-  // Possible sampling indices [0,..,nData] (will change in the optimization phase)
-  std::vector<uint32_t> vec_index(nData);
-  std::iota(vec_index.begin(), vec_index.end(), 0);
-  // Sample indices (used for model evaluation)
-  std::vector<uint32_t> vec_sample(sizeSample);
+  // Possible sampling indices [0,..,nData] (will change in the optimization phase).
+  //
+  // Previously written as `std::vector<uint32_t> vec_index(nData); iota(...);`
+  // which value-initialised (zero-filled) nData uint32_ts and then immediately
+  // overwrote every entry with iota. The reserve + push_back pattern below
+  // produces the same final contents with a single write per element, no
+  // wasted memset pass. Final size and bytes are identical; semantics
+  // unchanged.
+  std::vector<uint32_t> vec_index;
+  vec_index.reserve(nData);
+  for (uint32_t i = 0; i < nData; ++i)
+    vec_index.push_back(i);
+  // Sample indices (used for model evaluation). reserve-only; UniformSample
+  // resizes internally before filling, so we skip the value-init of the
+  // initial sizeSample elements as well.
+  std::vector<uint32_t> vec_sample;
+  vec_sample.reserve(sizeSample);
 
   const double maxThreshold = (precision == std::numeric_limits<double>::infinity()) ?
     std::numeric_limits<double>::infinity() :

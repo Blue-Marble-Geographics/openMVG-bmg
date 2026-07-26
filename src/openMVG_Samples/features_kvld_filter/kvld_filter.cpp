@@ -1,3 +1,4 @@
+#if 0 // JPB WIP BUG
 // This file is part of OpenMVG, an Open Multiple View Geometry C++ library.
 
 // Copyright (c) 2012, 2013 openMVG authors.
@@ -27,7 +28,7 @@ using namespace openMVG;
 using namespace openMVG::image;
 using namespace openMVG::matching;
 using namespace svg;
-
+  
 int main(int argc, char **argv) {
   CmdLine cmd;
 
@@ -275,3 +276,4 @@ int main(int argc, char **argv) {
 
   return EXIT_SUCCESS;
 }
+#endif

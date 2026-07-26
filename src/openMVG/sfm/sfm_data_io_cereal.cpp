@@ -24,8 +24,11 @@
 #include "openMVG/system/logger.hpp"
 #include "third_party/stlplus3/filesystemSimplified/file_system.hpp"
 
+#include <cstdio>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include <cereal/types/map.hpp>
 #include <cereal/types/string.hpp>
@@ -96,10 +99,29 @@ bool Load_Cereal(
   const bool b_structure = (flags_part & STRUCTURE) == STRUCTURE;
   const bool b_control_point = (flags_part & CONTROL_POINTS) == CONTROL_POINTS;
 
-  //Create the stream and check it is ok
-  std::ifstream stream(filename, std::ios::binary | std::ios::in);
-  if (!stream)
-    return false;
+  // cereal binary archives read one primitive at a time. Going through
+  // std::filebuf for tens of millions of tiny reads (every double / IndexT
+  // in the structure block triggers an sgetn) is the dominant cost on
+  // large scenes. Slurp the whole file into memory and feed cereal a
+  // std::istringstream so all subsequent reads are pointer arithmetic
+  // inside a stringbuf instead of buffered file I/O.
+  //
+  // Text archives benefit from the same trick (they tokenize through the
+  // same streambuf interface) so we use this path unconditionally.
+  std::string file_buffer;
+  {
+    std::ifstream stream(filename, std::ios::binary | std::ios::in | std::ios::ate);
+    if (!stream)
+      return false;
+    const std::streamoff sz = stream.tellg();
+    if (sz < 0)
+      return false;
+    stream.seekg(0, std::ios::beg);
+    file_buffer.resize(static_cast<std::size_t>(sz));
+    if (sz > 0 && !stream.read(file_buffer.data(), sz))
+      return false;
+  }
+  std::istringstream stream(std::move(file_buffer), std::ios::binary | std::ios::in);
 
   // Data serialization
   try
@@ -140,7 +162,6 @@ bool Load_Cereal(
         catch (cereal::Exception& e)
         {
           OPENMVG_LOG_ERROR << e.what();
-          stream.close();
           return false;
         }
       }
@@ -188,7 +209,41 @@ bool Load_Cereal(
       }
 
     if (b_structure)
-      archive(cereal::make_nvp("structure", data.structure));
+    {
+      // cereal's generic pair_associative_container loader emplace_hint's
+      // one item at a time WITHOUT reserving the unordered_map first, so on
+      // a 568k-landmark scene the map rehashes ~20 times and each rehash
+      // moves every Landmark (which itself owns an ankerl obs map). That
+      // dominates the binary-load wall time. Drive the map protocol
+      // manually so we can reserve() exactly once. Binary on-wire format is
+      // a size_tag followed by N (key, value) pairs -- byte-identical to
+      // what the generic loader consumes, so this is a pure load-path
+      // optimisation (no file format change).
+      if (bBinary)
+      {
+        cereal::size_type sz = 0;
+        archive(cereal::make_size_tag(sz));
+        data.structure.clear();
+        data.structure.reserve(static_cast<std::size_t>(sz));
+        for (cereal::size_type i = 0; i < sz; ++i)
+        {
+          // Read the key first, then try_emplace default-constructs the
+          // Landmark directly inside the unordered_map node. Deserialize
+          // into it->second so the Landmark (Vec3 + ankerl obs map) is
+          // never move-constructed -- saves one move per landmark, which
+          // matters because the ankerl map has non-trivial move cost.
+          IndexT key;
+          archive(key);
+          auto [it, inserted] = data.structure.try_emplace(key);
+          (void)inserted;
+          archive(it->second);
+        }
+      }
+      else
+      {
+        archive(cereal::make_nvp("structure", data.structure));
+      }
+    }
     else
       if (bBinary)
       {
@@ -215,12 +270,50 @@ bool Load_Cereal(
   catch (const cereal::Exception & e)
   {
     OPENMVG_LOG_ERROR << e.what();
-    stream.close();
     return false;
   }
-  stream.close();
   return true;
 }
+
+// When OPENMVG_SFM_XML_COMPACT is enabled, the XML output archive is
+// constructed with indentation disabled so the emitted document contains no
+// inter-element whitespace. This keeps the file byte-for-byte parseable while
+// eliminating the flood of whitespace-only character callbacks that a SAX
+// consumer (e.g. Global Mapper's XmlDecoder) would otherwise have to process.
+// JSON and binary archives are unaffected.
+#ifndef OPENMVG_SFM_XML_COMPACT
+#define OPENMVG_SFM_XML_COMPACT 1
+#endif
+
+namespace {
+// Factory that constructs the requested output archive and runs the
+// serialization body. The primary template uses cereal's default options.
+template <typename Archive>
+struct OutputArchiveFactory
+{
+  template <typename Fn>
+  static void Run(std::ofstream & stream, Fn && fn)
+  {
+    Archive archive(stream);
+    fn(archive);
+  }
+};
+
+#if OPENMVG_SFM_XML_COMPACT
+// XML specialization: disable indentation (no inter-element whitespace).
+template <>
+struct OutputArchiveFactory<cereal::XMLOutputArchive>
+{
+  template <typename Fn>
+  static void Run(std::ofstream & stream, Fn && fn)
+  {
+    cereal::XMLOutputArchive archive(
+      stream, cereal::XMLOutputArchive::Options().indent(false));
+    fn(archive);
+  }
+};
+#endif // OPENMVG_SFM_XML_COMPACT
+} // namespace
 
 template <
 // JSONOutputArchive/ ...
@@ -244,8 +337,8 @@ bool Save_Cereal(
     return false;
 
   // Data serialization
+  OutputArchiveFactory<archiveType>::Run(stream, [&](archiveType & archive)
   {
-    archiveType archive(stream);
     // since OpenMVG 0.9, the sfm_data version 0.2 is introduced
     //  - it adds control_points storage
     // since OpenMVG 1.1, the sfm_data version 0.3 is introduced
@@ -282,7 +375,7 @@ bool Save_Cereal(
       else
         archive(cereal::make_nvp("control_points", Landmarks()));
     }
-  }
+  });
   stream.close();
   return true;
 }

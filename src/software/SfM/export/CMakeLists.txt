@@ -21,6 +21,13 @@ target_link_libraries(openMVG_main_openMVG2PMVS
 
 # - Export a SfM openMVG scene to openMVS format
 #
+# The undistort inner loop (UndistortImageWithMap / BilinearInteriorRGB) is
+# the hot function in this binary. The SIMD path uses pure SSE2 intrinsics
+# only (which is the MSVC x64 baseline) so this TU compiles with the same
+# /arch level as the rest of the project -- no per-target instruction-set
+# elevation. If we want to add an AVX2 dispatch in the future, do it via a
+# separate TU with runtime CPU-feature detection (the dead AVX2 helper in
+# the .cpp is wired for that), not by raising /arch project-wide.
 add_executable(openMVG_main_openMVG2openMVS main_openMVG2openMVS.cpp)
 target_link_libraries(openMVG_main_openMVG2openMVS
   openMVG_system
@@ -118,6 +125,16 @@ set_property(TARGET openMVG_main_openMVG2PMVS PROPERTY FOLDER OpenMVG/software)
 install(TARGETS openMVG_main_openMVG2PMVS DESTINATION bin/)
 set_property(TARGET openMVG_main_openMVG2openMVS PROPERTY FOLDER OpenMVG/software)
 install(TARGETS openMVG_main_openMVG2openMVS DESTINATION bin/)
+# Deploy libjpeg(-turbo) runtime DLL next to the exe so the build-tree binary
+# is directly runnable. No-op when OPENMVG_JPEG_RUNTIME_DLL is empty (i.e.
+# internal static libjpeg or non-Windows).
+if(OPENMVG_JPEG_RUNTIME_DLL)
+  add_custom_command(TARGET openMVG_main_openMVG2openMVS POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${OPENMVG_JPEG_RUNTIME_DLL}"
+      "$<TARGET_FILE_DIR:openMVG_main_openMVG2openMVS>"
+    COMMENT "Deploying libjpeg runtime DLL")
+endif()
 set_property(TARGET openMVG_main_openMVG2CMPMVS PROPERTY FOLDER OpenMVG/software)
 install(TARGETS openMVG_main_openMVG2CMPMVS DESTINATION bin/)
 set_property(TARGET openMVG_main_openMVG2MESHLAB PROPERTY FOLDER OpenMVG/software)

@@ -1,3 +1,4 @@
+#if 0 // JPB WIP BUG 
 // Ceres Solver - A fast non-linear least squares minimizer
 // Copyright 2015 Google Inc. All rights reserved.
 // http://ceres-solver.org/
@@ -450,3 +451,4 @@ int main(int argc, char** argv) {
 
   return 0;
 }
+#endif

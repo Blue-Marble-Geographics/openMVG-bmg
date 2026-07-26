@@ -151,8 +151,18 @@ bool SfMSceneInitializerStellar::Process()
     stl::RetrieveKey());
 
   Pair_Set selected_stellar_pod;
+  // Select the largest stellar (star) configuration among the pairs that
+  // ACTUALLY produced a relative pose (relative_poses_pairs), NOT the full
+  // putative set (relative_pose_pairs). Upstream bug: it passed
+  // relative_pose_pairs here, so when only a subset of the putative pod's
+  // pairs yield a relative pose (common on HIGH-feature / low-parallax aerial
+  // graphs -- e.g. Randy HIGH: 5 of 15), the selected pod contains pairs with
+  // NO relative pose and Stellar_Solver::Solve returns false (whole init
+  // fails, pipeline falls back to GLOBAL). Selecting from the computed poses
+  // yields a pod every edge of which has a pose, so the solve succeeds with
+  // whatever connected star the successful poses form.
   if (!find_largest_stellar_configuration(
-        relative_pose_pairs,
+        relative_poses_pairs,
         matches_provider_,
         selected_stellar_pod))
   {

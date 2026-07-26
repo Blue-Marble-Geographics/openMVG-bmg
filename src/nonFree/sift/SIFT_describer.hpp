@@ -16,6 +16,8 @@
 #include "openMVG/image/image_container.hpp"
 
 #include <algorithm>
+#include <climits>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 
@@ -177,12 +179,40 @@ public:
     //Convert to float
     const image::Image<float> If(image.GetMat().cast<float>());
 
+    // Optional runtime override of the first octave (o_min), for A/B testing
+    // without recompiling. Default is unchanged: uses _params._first_octave
+    // (normally 0 = no upscale, the fast path). Set
+    //   OPENMVG_SIFT_FIRST_OCTAVE=-1  -> re-enable the 2x upscale octave
+    //        (more fine-scale keypoints, ~2-3x slower, 4x first-octave memory)
+    //   OPENMVG_SIFT_FIRST_OCTAVE=0   -> force no upscale (fast)
+    // Read once; thread-safe under the per-image parallelism (C++11 static init).
+    static const int s_first_octave_override = []() -> int {
+      const char* v = std::getenv("OPENMVG_SIFT_FIRST_OCTAVE");
+      return v ? std::atoi(v) : INT_MIN; // INT_MIN => not set
+    }();
+    const int first_octave = (s_first_octave_override != INT_MIN)
+      ? s_first_octave_override
+      : _params._first_octave;
+
+    // Optional GLOBAL override of the peak threshold (min contrast), applied to
+    // every image regardless of preset -- set it once in the environment, no
+    // per-dataset tuning needed. Higher value -> fewer low-contrast keypoints
+    // -> less descriptor work -> faster (mild recall trade). Unset => preset
+    // value. Read once; thread-safe under the per-image parallelism.
+    static const float s_peak_thresh_override = []() -> float {
+      const char* v = std::getenv("OPENMVG_SIFT_PEAK_THRESHOLD");
+      return v ? static_cast<float>(std::atof(v)) : -1.0f; // <0 => not set
+    }();
+    const float peak_threshold = (s_peak_thresh_override >= 0.0f)
+      ? s_peak_thresh_override
+      : _params._peak_threshold;
+
     VlSiftFilt *filt = vl_sift_new(w, h,
-      _params._num_octaves, _params._num_scales, _params._first_octave);
+      _params._num_octaves, _params._num_scales, first_octave);
     if (_params._edge_threshold >= 0)
       vl_sift_set_edge_thresh(filt, _params._edge_threshold);
-    if (_params._peak_threshold >= 0)
-      vl_sift_set_peak_thresh(filt, 255*_params._peak_threshold/_params._num_scales);
+    if (peak_threshold >= 0)
+      vl_sift_set_peak_thresh(filt, 255*peak_threshold/_params._num_scales);
 
     Descriptor<vl_sift_pix, 128> descr;
     Descriptor<unsigned char, 128> descriptor;

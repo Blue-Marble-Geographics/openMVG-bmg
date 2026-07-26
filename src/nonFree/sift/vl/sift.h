@@ -76,6 +76,9 @@ typedef struct _VlSiftFilt
   double gaussFilterSigma ;   /**< current Gaussian filter std */
   vl_size gaussFilterWidth ;  /**< current Gaussian filter width */
 
+  float *smoothRowBuf ;       /**< cached horizontal-filter ring buffer @internal */
+  size_t smoothRowBufSize ;   /**< byte capacity of smoothRowBuf @internal */
+
   VlSiftKeypoint* keys ;/**< detected keypoints. */
   int nkeys ;           /**< number of detected keypoints. */
   int keys_res ;        /**< size of the keys buffer. */

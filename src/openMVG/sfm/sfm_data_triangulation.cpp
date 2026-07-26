@@ -8,8 +8,8 @@
 
 #include "openMVG/sfm/sfm_data_triangulation.hpp"
 
-#include <deque>
 #include <functional>
+#include <vector>
 
 #include "openMVG/geometry/pose3.hpp"
 #include "openMVG/multiview/triangulation_nview.hpp"
@@ -203,7 +203,14 @@ void SfM_Data_Structure_Computation_Blind::triangulate
 )
 const
 {
-  std::deque<IndexT> rejectedId;
+  // Worst case: every track rejected. vector+reserve avoids the
+  // deque's chunked allocations under the OMP critical (the previous
+  // std::deque had no reserve(), so every push_front under heavy
+  // rejection could heap-allocate while holding the lock). Order of
+  // rejectedId is irrelevant -- consumed by structure.erase() below,
+  // which operates on a hash map.
+  std::vector<IndexT> rejectedId;
+  rejectedId.reserve(sfm_data.structure.size());
   std::unique_ptr<system::ProgressInterface> my_progress_bar;
   if (bConsole_verbose_)
     my_progress_bar.reset(
@@ -244,14 +251,14 @@ const
 #ifdef OPENMVG_USE_OPENMP
         #pragma omp critical
 #endif
-        rejectedId.push_front(tracks_it.first);
+        rejectedId.push_back(tracks_it.first);
       }
     }
   }
   // Erase the unsuccessful triangulated tracks
-  for (auto& it : rejectedId)
+  for (const IndexT id : rejectedId)
   {
-    sfm_data.structure.erase(it);
+    sfm_data.structure.erase(id);
   }
 }
 
@@ -289,7 +296,10 @@ void SfM_Data_Structure_Computation_Robust::robust_triangulation
 )
 const
 {
-  std::deque<IndexT> rejectedId;
+  // See note in the Blind variant: vector+reserve replaces a deque
+  // whose chunked allocations happened under the OMP critical.
+  std::vector<IndexT> rejectedId;
+  rejectedId.reserve(sfm_data.structure.size());
   std::unique_ptr<system::ProgressInterface> my_progress_bar;
   if (bConsole_verbose_)
     my_progress_bar.reset(
@@ -320,14 +330,14 @@ const
 #ifdef OPENMVG_USE_OPENMP
         #pragma omp critical
 #endif
-        rejectedId.push_front(tracks_it.first);
+        rejectedId.push_back(tracks_it.first);
       }
     }
   }
   // Erase the unsuccessful triangulated tracks
-  for (auto& it : rejectedId)
+  for (const IndexT id : rejectedId)
   {
-    sfm_data.structure.erase(it);
+    sfm_data.structure.erase(id);
   }
 }
 

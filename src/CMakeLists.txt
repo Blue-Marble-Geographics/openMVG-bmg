@@ -199,9 +199,74 @@ endif()
 # ==============================================================================
 # IMAGE IO detection
 # ==============================================================================
+# Prefer libjpeg-turbo over the vendored stock libjpeg whenever a system or
+# vcpkg-provided install is reachable. libjpeg-turbo is API/ABI compatible
+# with IJG libjpeg but adds SSE2/AVX2 SIMD paths that typically deliver a
+# 2-4x speedup on JPEG encode/decode -- a measurable win for tools like
+# main_openMVG2openMVS where JPEG write dominates wall time. The caller can
+# still override by passing -DJPEG_ROOT=... or -DCMAKE_TOOLCHAIN_FILE=...
+# (e.g. the vcpkg toolchain) explicitly.
+if(NOT DEFINED JPEG_ROOT AND NOT DEFINED ENV{JPEG_ROOT}
+   AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  foreach(_jpeg_hint
+      "$ENV{VCPKG_ROOT}/installed/x64-windows"
+      "C:/vcpkg/installed/x64-windows"
+      "C:/tools/vcpkg/installed/x64-windows"
+      "C:/libjpeg-turbo64"
+      "C:/Program Files/libjpeg-turbo64")
+    if(EXISTS "${_jpeg_hint}/include/jpeglib.h"
+       AND EXISTS "${_jpeg_hint}/lib/jpeg.lib")
+      set(JPEG_ROOT "${_jpeg_hint}" CACHE PATH
+          "libjpeg(-turbo) install root (auto-detected)")
+      message(STATUS "libjpeg-turbo candidate: ${JPEG_ROOT}")
+      break()
+    endif()
+  endforeach()
+endif()
+
+# CMake >= 3.12 honors <Package>_ROOT in find_package, but only when policy
+# CMP0074 is set to NEW. The project's minimum (older) leaves it WARN by
+# default, which causes find_package(JPEG) to silently ignore JPEG_ROOT.
+if(POLICY CMP0074)
+  cmake_policy(SET CMP0074 NEW)
+endif()
+
 find_package(JPEG QUIET)
 find_package(PNG QUIET)
 find_package(TIFF QUIET)
+
+# When JPEG resolves to a shared libjpeg(-turbo) install (typical with vcpkg
+# x64-windows, or a libjpeg-turbo installer), locate the matching runtime
+# DLL so dependent targets can post-build-copy it next to their exe. Stays
+# empty when the internal static libjpeg is used, in which case no DLL is
+# needed at runtime.
+set(OPENMVG_JPEG_RUNTIME_DLL "")
+if(JPEG_FOUND AND WIN32 AND JPEG_LIBRARIES)
+  # JPEG_LIBRARIES may be a list / target / single path; pick first file path.
+  set(_jpeg_implib "")
+  foreach(_j ${JPEG_LIBRARIES})
+    if(EXISTS "${_j}")
+      set(_jpeg_implib "${_j}")
+      break()
+    endif()
+  endforeach()
+  if(_jpeg_implib)
+    get_filename_component(_jpeg_libdir "${_jpeg_implib}" DIRECTORY)
+    # vcpkg layout: <root>/lib/jpeg.lib + <root>/bin/jpeg62.dll
+    get_filename_component(_jpeg_root "${_jpeg_libdir}" DIRECTORY)
+    foreach(_candidate
+        "${_jpeg_root}/bin/jpeg62.dll"
+        "${_jpeg_root}/bin/libjpeg-62.dll"
+        "${_jpeg_root}/bin/libjpeg.dll"
+        "${_jpeg_libdir}/jpeg62.dll")
+      if(EXISTS "${_candidate}")
+        set(OPENMVG_JPEG_RUNTIME_DLL "${_candidate}")
+        message(STATUS "libjpeg runtime DLL: ${OPENMVG_JPEG_RUNTIME_DLL}")
+        break()
+      endif()
+    endforeach()
+  endif()
+endif()
 
 # Folders
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)

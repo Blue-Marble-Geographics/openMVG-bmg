@@ -23,6 +23,8 @@ using namespace openMVG;
 using namespace openMVG::image;
 using namespace openMVG::matching;
 
+extern "C" int hasAVX2;
+
 #include "openMVG/features/sift/SIFT_Anatomy_Image_Describer.hpp"
 #include "nonFree/sift/SIFT_describer.hpp"
 
