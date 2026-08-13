@@ -14,9 +14,14 @@
 #include "openMVG/tracks/union_find.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <utility>
 #include <vector>
+
+#ifdef OPENMVG_USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace openMVG {
 namespace sfm {
@@ -153,34 +158,97 @@ IndexT RemoveOutliers_PixelAndAngleError
   }
 
   // O(1) lookup. Returns nullptr if the view has no valid (pose,intrinsic).
+  //
+  // Both caches are bound through const references so the lambda selects the
+  // *const* overloads of operator[]/find. This matters because get_cache is
+  // called concurrently from the parallel pass below: the standard only
+  // guarantees const member functions of a shared container are free of data
+  // races ([res.on.data.races]). The non-const find() happens to be
+  // read-only in every implementation we build against, but relying on that
+  // is exactly the kind of assumption that stops holding after a toolchain
+  // bump. The caches are fully populated above and never written again.
+  const std::vector<ViewCache> & view_cache_flat_ro = view_cache_flat;
+  const Hash_Map<IndexT, ViewCache> & view_cache_hash_ro = view_cache_hash;
   auto get_cache = [&](IndexT view_id) -> const ViewCache * {
     if (use_flat)
     {
       if (view_id > max_view_id) return nullptr;
-      const ViewCache & vc = view_cache_flat[view_id];
+      const ViewCache & vc = view_cache_flat_ro[view_id];
       return vc.intrinsic ? &vc : nullptr;
     }
-    const auto it = view_cache_hash.find(view_id);
-    return (it != view_cache_hash.end()) ? &it->second : nullptr;
+    const auto it = view_cache_hash_ro.find(view_id);
+    return (it != view_cache_hash_ro.end()) ? &it->second : nullptr;
   };
 
   IndexT removed_tracks_by_angle = 0;
   IndexT removed_obs_by_pixel = 0;
-  // Reused per-track scratch for the angle pass: avoid reallocating each
-  // iteration over millions of landmarks. Each entry stores a precomputed
-  // world-space *unit* ray; pair angle then collapses to a single dot
-  // product (cosine domain comparison, no acos in the inner loop).
-  struct RayEntry { Vec3 ray; };
-  std::vector<RayEntry> ray_entries;
   // Convert the angle threshold to cosine-domain once. cos is monotone
   // decreasing on [0, pi], so "angle_deg >= threshold_deg" becomes
   // "dot <= cos_threshold" for unit rays. dMinAcceptedAngle is in degrees.
   // Clamp the dot range to [-1+eps, 1-eps] like AngleBetweenRay does.
   const double cos_threshold = std::cos(D2R(dMinAcceptedAngle));
-  Landmarks::iterator iterTracks = sfm_data.structure.begin();
-  while (iterTracks != sfm_data.structure.end())
+
+  // ---- Phase 0: snapshot the landmark nodes -----------------------------
+  // The loop below used to be a single erase-while-iterating walk, which
+  // forces it to be serial. It doesn't need to be: every track is fully
+  // independent. The angle pass is read-only, and the pixel pass only
+  // mutates that track's *own* Observations map -- a separate container per
+  // Landmark. Nothing in either pass touches sfm_data.structure itself, so
+  // the only step that has to be serialized is the final track erase.
+  //
+  // Landmarks is a std::unordered_map, so there is no contiguous value array
+  // to index into for a `parallel for`. Node addresses are stable across
+  // erase of *other* nodes, so a (key, Landmark*) snapshot is safe to hold
+  // across the later erase pass. The snapshot walk is O(N) pointer chasing,
+  // negligible next to the per-observation undistortion below.
+  std::vector<std::pair<IndexT, Landmark *>> tracks;
+  tracks.reserve(sfm_data.structure.size());
+  for (auto & it : sfm_data.structure)
+    tracks.emplace_back(it.first, &it.second);
+  const int n_tracks = static_cast<int>(tracks.size());
+
+  // Per-track verdict + per-track pixel-rejection count. Counts are summed
+  // in the serial pass afterwards rather than via an OpenMP reduction:
+  // MSVC is stuck on OpenMP 2.0 where reductions on unsigned/typedef'd
+  // integer types are a portability trap, and this also keeps the totals
+  // deterministic regardless of thread scheduling.
+  enum : uint8_t { kKeep = 0, kEraseByAngle = 1, kEraseByPixel = 2 };
+  std::vector<uint8_t>  verdict(n_tracks, kKeep);
+  std::vector<uint32_t> pixel_removed(n_tracks, 0);
+
+  // Threading gate -- two conditions must hold before we fork:
+  //  1) Enough work to pay for fork/join. A stellar pod reconstruction has
+  //     a few hundred landmarks; forking there costs more than the loop.
+  //     A v2 sequential scene has 100k+, which is where this matters.
+  //  2) We are not already inside a parallel region. This function IS
+  //     reachable from one: sfm_stellar_engine.cpp's
+  //     `#pragma omp parallel for` over stellar pods calls
+  //     Stellar_Solver::Solve, which calls the RemoveOutliers_* wrappers.
+  //     Every core is already busy there; nesting would oversubscribe, or
+  //     (with nesting disabled, the default) pay fork overhead for a
+  //     one-thread team. omp_in_parallel() is OpenMP 2.0, so it is
+  //     available on MSVC.
+#ifdef OPENMVG_USE_OPENMP
+  static const int kParallelMinTracks = 2048;
+  const bool use_threads = (n_tracks >= kParallelMinTracks) && !omp_in_parallel();
+  // schedule(dynamic) with a coarse chunk: per-track cost is uneven (the
+  // angle pass is O(K^2) for tracks that fail and typically O(K) for tracks
+  // that pass early), and 1024-track chunks keep the scheduling overhead
+  // down to ~N/1024 atomic grabs.
+  #pragma omp parallel for schedule(dynamic, 1024) if(use_threads)
+#endif
+  for (int track_idx = 0; track_idx < n_tracks; ++track_idx)
   {
-    Observations & obs = iterTracks->second.obs;
+    Landmark & landmark = *tracks[track_idx].second;
+    Observations & obs = landmark.obs;
+
+    // Per-thread scratch for the angle pass: avoid reallocating on each of
+    // the millions of landmarks. Each entry is a precomputed world-space
+    // *unit* ray; pair angle then collapses to a single dot product (cosine
+    // domain comparison, no acos in the inner loop). thread_local so the
+    // capacity survives both the loop iterations and the call, and so each
+    // OpenMP worker gets its own buffer.
+    thread_local static std::vector<Vec3> ray_entries;
 
     // ---- Angle pass (track-level) -------------------------------------
     // Three key wins vs. the legacy nested loop:
@@ -210,9 +278,11 @@ IndexT RemoveOutliers_PixelAndAngleError
       const Vec2 ud = vc->intrinsic->get_ud_pixel(ob.second.x);
       // ray in world space: R^T * bearing(ud), normalized. AngleBetweenRay
       // internally does the same; we hoist it so each obs pays once.
-      ray_entries.push_back({
-        (vc->pose.rotation().transpose() * vc->intrinsic->oneBearing(ud)).normalized()
-      });
+      // emplace_back, not push_back: the Eigen expression is evaluated
+      // straight into the vector's storage. push_back of a braced RayEntry
+      // wrapper materialized a temporary Vec3 first and then copied it in.
+      ray_entries.emplace_back(
+        (vc->pose.rotation().transpose() * vc->intrinsic->oneBearing(ud)).normalized());
     }
 
     bool angle_ok = false;
@@ -224,10 +294,10 @@ IndexT RemoveOutliers_PixelAndAngleError
       double min_dot = 1.0; // cos(0) -- no pair has been seen yet.
       for (std::size_t i = 0; i < n && !angle_ok; ++i)
       {
-        const Vec3 & ra = ray_entries[i].ray;
+        const Vec3 & ra = ray_entries[i];
         for (std::size_t j = i + 1; j < n; ++j)
         {
-          const double dot = ra.dot(ray_entries[j].ray);
+          const double dot = ra.dot(ray_entries[j]);
           if (dot <= cos_threshold)
           {
             angle_ok = true;
@@ -248,14 +318,18 @@ IndexT RemoveOutliers_PixelAndAngleError
     }
     if (!angle_ok)
     {
-      iterTracks = sfm_data.structure.erase(iterTracks);
-      ++removed_tracks_by_angle;
+      // Track dies on parallax. Matching the legacy ordering, its
+      // observations are never seen by the pixel pass.
+      verdict[track_idx] = kEraseByAngle;
       continue;
     }
 
     // ---- Pixel residual pass (obs-level) ------------------------------
-    // Identical to RemoveOutliers_PixelResidualError's inner body.
-    const Vec3 & X = iterTracks->second.X;
+    // Identical to RemoveOutliers_PixelResidualError's inner body. Safe to
+    // run concurrently: `obs` is this landmark's own Observations map, not
+    // shared with any other iteration.
+    const Vec3 & X = landmark.X;
+    uint32_t n_pixel_removed = 0;
     Observations::iterator itObs = obs.begin();
     while (itObs != obs.end())
     {
@@ -266,17 +340,41 @@ IndexT RemoveOutliers_PixelAndAngleError
           vc->pose(X), itObs->second.x);
         if (residual.squaredNorm() > dThresholdPixelSq)
         {
-          ++removed_obs_by_pixel;
+          ++n_pixel_removed;
           itObs = obs.erase(itObs);
           continue;
         }
       }
       ++itObs;
     }
+    pixel_removed[track_idx] = n_pixel_removed;
     if (obs.empty() || obs.size() < minTrackLength)
-      iterTracks = sfm_data.structure.erase(iterTracks);
-    else
-      ++iterTracks;
+      verdict[track_idx] = kEraseByPixel;
+  }
+
+  // ---- Phase 2: apply the verdicts (serial) -----------------------------
+  // The only step that mutates sfm_data.structure. Walking the snapshot in
+  // order means the surviving container is identical to what the old
+  // erase-while-iterating loop produced, and the totals are summed in a
+  // fixed order so they don't depend on thread scheduling.
+  for (int track_idx = 0; track_idx < n_tracks; ++track_idx)
+  {
+    removed_obs_by_pixel += pixel_removed[track_idx];
+    switch (verdict[track_idx])
+    {
+      case kEraseByAngle:
+        ++removed_tracks_by_angle;
+        sfm_data.structure.erase(tracks[track_idx].first);
+        break;
+      case kEraseByPixel:
+        // Legacy semantics: tracks dropped for falling under minTrackLength
+        // are not counted in either total (their removed observations
+        // already were).
+        sfm_data.structure.erase(tracks[track_idx].first);
+        break;
+      default:
+        break;
+    }
   }
 
   if (out_removed_by_angle) *out_removed_by_angle = removed_tracks_by_angle;
@@ -1066,10 +1164,22 @@ double DepthCleaning
     if (pose_it == sfm_data.poses.end()) continue;
     if (sfm_data.intrinsics.find(v->id_intrinsic) == sfm_data.intrinsics.end())
       continue;
+    // Store the MAP KEY, not v->id_view. These are the same value in every
+    // scene OpenMVG builds itself, but nothing enforces it -- Views are
+    // shared_ptr'd into sfm_data.views under a caller-chosen key, and a
+    // scene assembled by hand or by subsetting can hold a View whose
+    // id_view field disagrees with the slot it sits in.
+    //
+    // That distinction is load-bearing on the flat path: max_view_id (and
+    // therefore the size of depth_accum_flat / median_depth_flat below) is
+    // derived from the map KEYS, while push_depth() indexes those arrays by
+    // ViewCache::view_id with no bounds check. Keying the cache off id_view
+    // made "id_view > max(keys)" an out-of-bounds push_back through a bogus
+    // std::vector header -- heap corruption, not a clean crash.
     if (use_flat)
-      view_cache_flat[view_it.first] = { pose_it->second, v->id_view };
+      view_cache_flat[view_it.first] = { pose_it->second, view_it.first };
     else
-      view_cache_hash[view_it.first] = { pose_it->second, v->id_view };
+      view_cache_hash[view_it.first] = { pose_it->second, view_it.first };
   }
 
   auto get_cache = [&](IndexT view_id) -> const ViewCache * {
@@ -1083,8 +1193,9 @@ double DepthCleaning
     return (it != view_cache_hash.end()) ? &it->second : nullptr;
   };
 
-  // Per-view depth accumulator. Keyed by ViewCache::view_id (which equals
-  // v->id_view, matching the original std::map<IndexT, ...> behavior).
+  // Per-view depth accumulator, indexed by ViewCache::view_id -- which is
+  // the sfm_data.views map key, the same quantity max_view_id was measured
+  // over, so the flat index below is in range by construction.
   // thread_local-static + clear() each inner so the per-view capacity
   // (typically thousands of depths) is retained across calls. Avoid
   // assign(N+1, {}) which would destroy every inner vector.

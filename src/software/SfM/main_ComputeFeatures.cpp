@@ -38,10 +38,13 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #ifdef OPENMVG_USE_OPENMP
 #include <omp.h>
 #endif
+
+#include <windows.h>
 
 using namespace openMVG;
 using namespace openMVG::image;
@@ -99,6 +102,39 @@ CpuHasSSE41(void)
   int info[4];
   __cpuid(info, 1);
   return (info[2] & (1 << 19)) != 0;  /* ECX bit 19 = SSE4.1 */
+}
+
+// Returns one affinity mask per physical core (a single logical processor per
+// core, i.e. hyperthread siblings are dropped). Single processor-group only
+// (<= 64 logical CPUs), which covers typical single-socket workstations.
+static std::vector<DWORD_PTR>
+GetPhysicalCoreMasks()
+{
+  std::vector<DWORD_PTR> masks;
+  DWORD len = 0;
+  GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+  if (len == 0)
+    return masks;
+
+  std::vector<char> buf(len);
+  auto * first = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+  if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first, &len))
+    return masks;
+
+  char * ptr = buf.data();
+  while (ptr < buf.data() + len)
+  {
+    auto * cur = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(ptr);
+    if (cur->Relationship == RelationProcessorCore)
+    {
+      // GroupMask[0].Mask holds all logical procs (HT siblings) of this core;
+      // keep only the lowest set bit to pin to a single logical processor.
+      const DWORD_PTR full = cur->Processor.GroupMask[0].Mask;
+      masks.push_back(full & (~full + 1));
+    }
+    ptr += cur->Size;
+  }
+  return masks;
 }
 
 /// - Compute view image description (feature & descriptor extraction)
@@ -302,14 +338,29 @@ int main(int argc, char **argv)
     // Use a boolean to track if we must stop feature extraction
     std::atomic<bool> preemptive_exit(false);
 
+    // Snapshot view pointers for O(1) indexed access. Iterating a std::map with
+    // std::advance(begin(), i) inside the loop is O(i), i.e. O(n^2) overall.
+    std::vector<const View*> vec_views;
+    vec_views.reserve(sfm_data.views.size());
+    for (const auto & view_it : sfm_data.views)
+      vec_views.push_back(view_it.second.get());
+
 #if (!TEST_CF_SINGLE_IMAGE) || (!TEST_CF_NOTHREADING)
 #ifdef OPENMVG_USE_OPENMP
-    const unsigned int nb_max_thread = omp_get_max_threads();
+    // Physical-core affinity masks (used only for pinning below). Dropping
+    // hyperthreads keeps one worker per core, reducing peak memory / HT contention.
+    const std::vector<DWORD_PTR> core_masks = GetPhysicalCoreMasks();
+    const unsigned int nb_physical =
+        core_masks.empty() ? omp_get_max_threads()
+                           : static_cast<unsigned int>(core_masks.size());
 
+    // The caller passes -n as a physical-core count: it has already performed the
+    // core/memory budgeting, so honor it directly (one pinned worker per core).
+    // Only when -n is unspecified do we default to all detected physical cores.
     if (iNumThreads > 0) {
         omp_set_num_threads(iNumThreads);
     } else {
-        omp_set_num_threads(nb_max_thread);
+        omp_set_num_threads(static_cast<int>(nb_physical));
     }
 
     #pragma omp parallel for schedule(dynamic) private(imageGray)
@@ -321,9 +372,19 @@ int main(int argc, char **argv)
     for (int i = 0; i < std::min(static_cast<int>(sfm_data.views.size()), (int) TEST_CF_MAX_IMAGES); ++i)
 #endif
     {
-      Views::const_iterator iterViews = sfm_data.views.begin();
-      std::advance(iterViews, i);
-      const View * view = iterViews->second.get();
+#ifdef OPENMVG_USE_OPENMP
+      // Pin each OpenMP worker to a distinct physical core exactly once, to keep
+      // its large SIFT pyramid buffers cache/NUMA-local and prevent migration.
+      static thread_local bool pinned = false;
+      if (!pinned && !core_masks.empty())
+      {
+        const int tid = omp_get_thread_num();
+        SetThreadAffinityMask(GetCurrentThread(),
+                              core_masks[tid % core_masks.size()]);
+        pinned = true;
+      }
+#endif
+      const View * view = vec_views[i];
       const std::string
         sView_filename = stlplus::create_filespec(sfm_data.s_root_path, view->s_Img_path),
         sFeat = stlplus::create_filespec(sOutDir, stlplus::basename_part(sView_filename), "feat"),
@@ -384,6 +445,12 @@ int main(int argc, char **argv)
 
         // Compute features and descriptors and export them to files
         auto regions = image_describer->Describe(imageGray, mask);
+        // Release the image buffers before the disk write: they are no longer
+        // needed and holding them during Save() needlessly inflates peak memory
+        // (multiplied across all worker threads).
+        imageGray = Image<unsigned char>();
+        imageMask = Image<unsigned char>();
+        mask = nullptr;
         if (regions && !image_describer->Save(regions.get(), sFeat, sDesc)) {
           OPENMVG_LOG_ERROR
             << "Cannot save regions for image: " << sView_filename << ';'

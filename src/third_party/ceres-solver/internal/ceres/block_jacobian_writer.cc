@@ -121,6 +121,24 @@ void BuildJacobianLayout(const Program& program,
   }
 }
 
+// Order a row's cells by block_id.
+//
+// Rows carry a handful of cells (2-4 for a typical bundle adjustment residual),
+// and there is one row per residual block, so this runs hundreds of thousands of
+// times on a large problem. std::sort pays introsort's fixed setup on every one
+// of those calls; a straight insertion sort over a few elements sitting in L1 is
+// strictly less work at these sizes.
+inline void SortCellsByBlockId(Cell* cells, int num_cells) {
+  for (int i = 1; i < num_cells; ++i) {
+    const Cell cell = cells[i];
+    int j = i - 1;
+    for (; j >= 0 && cells[j].block_id > cell.block_id; --j) {
+      cells[j + 1] = cells[j];
+    }
+    cells[j + 1] = cell;
+  }
+}
+
 }  // namespace
 
 BlockJacobianWriter::BlockJacobianWriter(const Evaluator::Options& options,
@@ -167,9 +185,19 @@ SparseMatrix* BlockJacobianWriter::CreateJacobian() const {
 
   // Construct the cells in each row.
   const vector<ResidualBlock*>& residual_blocks = program_->residual_blocks();
+  const int num_rows = residual_blocks.size();
   int row_block_position = 0;
-  bs->rows.resize(residual_blocks.size());
-  for (int i = 0; i < residual_blocks.size(); ++i) {
+  bs->rows.resize(num_rows);
+
+  // Scratch space for assembling a row before it is copied into its final home.
+  // Building and sorting here keeps the working set in L1 and lets the row's
+  // vector be sized exactly once. Residuals with more parameter blocks than fit
+  // on the stack fall back to a heap buffer that is reused across rows.
+  const int kMaxStackCells = 8;
+  Cell stack_cells[kMaxStackCells];
+  vector<Cell> heap_cells;
+
+  for (int i = 0; i < num_rows; ++i) {
     const ResidualBlock* residual_block = residual_blocks[i];
     CompressedRow* row = &bs->rows[i];
 
@@ -177,32 +205,49 @@ SparseMatrix* BlockJacobianWriter::CreateJacobian() const {
     row->block.position = row_block_position;
     row_block_position += row->block.size;
 
-    // Size the row by the number of active parameters in this residual.
     const int num_parameter_blocks = residual_block->NumParameterBlocks();
+    ParameterBlock* const* row_parameter_blocks =
+        residual_block->parameter_blocks();
+    const int* row_jacobian_layout = jacobian_layout_[i];
+
+    Cell* cells = stack_cells;
+    if (num_parameter_blocks > kMaxStackCells) {
+      heap_cells.resize(num_parameter_blocks);
+      cells = &heap_cells[0];
+    }
+
+    // Gather the active parameters of this row in a single pass. The previous
+    // version walked the parameter blocks twice -- once to count them and once
+    // to fill them in -- which doubled the pointer chasing through
+    // ParameterBlock. That chasing is the part that actually misses cache here,
+    // since a bundle adjustment problem has one distinct point block per
+    // residual and those blocks are scattered across the heap.
+    //
+    // Note that the counting pass tested index() != -1 while the filling pass
+    // tested IsConstant(). Those agree for a program that has been through
+    // Program::RemoveFixedBlocks, but only IsConstant() matches the predicate
+    // BuildJacobianLayout used when it laid out jacobian_layout_, so that is the
+    // one the layout index must be advanced on. Using a single predicate for
+    // both sizing and filling removes the discrepancy.
     int num_active_parameter_blocks = 0;
     for (int j = 0; j < num_parameter_blocks; ++j) {
-      if (residual_block->parameter_blocks()[j]->index() != -1) {
-        num_active_parameter_blocks++;
+      const ParameterBlock* parameter_block = row_parameter_blocks[j];
+      if (parameter_block->IsConstant()) {
+        continue;
       }
-    }
-    row->cells.resize(num_active_parameter_blocks);
-
-    // Add layout information for the active parameters in this row.
-    for (int j = 0, k = 0; j < num_parameter_blocks; ++j) {
-      const ParameterBlock* parameter_block =
-          residual_block->parameter_blocks()[j];
-      if (!parameter_block->IsConstant()) {
-        Cell& cell = row->cells[k];
-        cell.block_id = parameter_block->index();
-        cell.position = jacobian_layout_[i][k];
-
-        // Only increment k for active parameters, since there is only layout
-        // information for active parameters.
-        k++;
-      }
+      Cell& cell = cells[num_active_parameter_blocks];
+      cell.block_id = parameter_block->index();
+      // There is only layout information for active parameters, so this indexes
+      // by the active count rather than by j.
+      cell.position = row_jacobian_layout[num_active_parameter_blocks];
+      num_active_parameter_blocks++;
     }
 
-    sort(row->cells.begin(), row->cells.end(), CellLessThan);
+    SortCellsByBlockId(cells, num_active_parameter_blocks);
+
+    // assign() sizes the vector exactly and copy-constructs into it. resize()
+    // would default-construct every Cell only to have it overwritten.
+    row->cells.assign(cells, cells + num_active_parameter_blocks);
   }
 
   BlockSparseMatrix* jacobian = new BlockSparseMatrix(bs);

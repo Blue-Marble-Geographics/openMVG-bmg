@@ -185,6 +185,14 @@ inline bool loadDescsFromBinFile(
 {
   using VALUE = typename DescriptorsT::value_type;
 
+  // The descriptors are read as one contiguous block, which requires the element
+  // type to be exactly its payload (no padding, no vtable). Eigen's fixed-size
+  // Matrix<T,N,1> satisfies this. Assert it, so that any future change to
+  // Descriptor breaks the build here instead of silently corrupting the format.
+  static_assert(
+    sizeof(VALUE) == VALUE::static_size * sizeof(typename VALUE::bin_type),
+    "Descriptor must be padding-free for bulk binary I/O");
+
   vec_desc.clear();
   std::ifstream fileIn(sfileNameDescs.c_str(), std::ios::in | std::ios::binary);
   if (!fileIn.is_open())
@@ -193,9 +201,11 @@ inline bool loadDescsFromBinFile(
   std::size_t cardDesc = 0;
   fileIn.read(reinterpret_cast<char*>(&cardDesc), sizeof(std::size_t));
   vec_desc.resize(cardDesc);
-  for (auto & it :vec_desc) {
-    fileIn.read(reinterpret_cast<char*>(it.data()),
-      VALUE::static_size*sizeof(typename VALUE::bin_type));
+  //Read descriptor content with a single bulk read (the vector storage is
+  //contiguous, so this consumes the exact same bytes as the previous per-element loop)
+  if (cardDesc > 0) {
+    fileIn.read(reinterpret_cast<char*>(vec_desc.data()),
+      static_cast<std::streamsize>(cardDesc * sizeof(VALUE)));
   }
   const bool bOk = !fileIn.bad();
   fileIn.close();
@@ -210,16 +220,23 @@ inline bool saveDescsToBinFile(
 {
   using VALUE = typename DescriptorsT::value_type;
 
+  // See loadDescsFromBinFile: the bulk write below assumes a padding-free element.
+  static_assert(
+    sizeof(VALUE) == VALUE::static_size * sizeof(typename VALUE::bin_type),
+    "Descriptor must be padding-free for bulk binary I/O");
+
   std::ofstream file(sfileNameDescs.c_str(), std::ios::out | std::ios::binary);
   if (!file.is_open())
     return false;
   //Write the number of descriptor
   const std::size_t cardDesc = vec_desc.size();
   file.write((const char*) &cardDesc,  sizeof(std::size_t));
-  //Write descriptor content
-  for (const auto iter : vec_desc) {
-    file.write((const char*) iter.data(),
-      VALUE::static_size*sizeof(typename VALUE::bin_type));
+  //Write descriptor content with a single bulk write. The previous loop copied
+  //each descriptor by value and issued one write() per element; the emitted
+  //bytes are identical, so the on-disk format is unchanged.
+  if (cardDesc > 0) {
+    file.write(reinterpret_cast<const char*>(vec_desc.data()),
+      static_cast<std::streamsize>(cardDesc * sizeof(VALUE)));
   }
   const bool bOk = file.good();
   file.close();

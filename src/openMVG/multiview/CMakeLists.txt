@@ -43,6 +43,13 @@ target_link_libraries(openMVG_multiview
   PUBLIC
     openMVG_numeric
     openMVG_system
+    # ACRANSAC (robust_estimator_ACRansac.hpp) now calls a runtime-dispatched
+    # NFA kernel that lives in openMVG_robust_estimation. Every ACRANSAC user
+    # in the tree -- openMVG_sfm, openMVG_matching_image_collection and the
+    # multiview_robust_* samples -- already links openMVG_multiview, so
+    # carrying it PUBLIC here supplies all of them transitively.
+    # (No cycle: openMVG_robust_estimation only links openMVG_numeric.)
+    openMVG_robust_estimation
 )
 
 if (MSVC)

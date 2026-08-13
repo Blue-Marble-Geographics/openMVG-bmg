@@ -27,8 +27,45 @@
 #include <array>
 #include <ceres/types.h>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iostream>
+
+#ifdef OPENMVG_USE_OPENMP
+#include <omp.h>
+#endif
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
+namespace {
+
+// popcount / count-trailing-zeros on a 64-bit word. std::popcount and
+// std::countr_zero are C++20; openMVG builds as C++17, so use the
+// compiler intrinsics (same ones cascade_hasher.hpp already relies on).
+inline unsigned PopCount64(uint64_t v)
+{
+#ifdef _MSC_VER
+  return static_cast<unsigned>(__popcnt64(v));
+#else
+  return static_cast<unsigned>(__builtin_popcountll(v));
+#endif
+}
+
+// Precondition: v != 0.
+inline unsigned CountTrailingZeros64(uint64_t v)
+{
+#ifdef _MSC_VER
+  unsigned long index;
+  _BitScanForward64(&index, v);
+  return static_cast<unsigned>(index);
+#else
+  return static_cast<unsigned>(__builtin_ctzll(v));
+#endif
+}
+
+} // namespace
 
 // Toggle: relaxed angle thresholds for foliage / narrow-baseline scenes.
 //   1 = current optimisation (1.5deg in-loop post-BA, 3.0deg post-init).
@@ -87,6 +124,34 @@
 //   1 = force DENSE_SCHUR everywhere
 #ifndef OPENMVG_SFM2_FORCE_NO_SPARSE_BA
 #define OPENMVG_SFM2_FORCE_NO_SPARSE_BA 0
+#endif
+
+// Pose count above which BundleAdjustment() switches from SPARSE_SCHUR to
+// ITERATIVE_SCHUR + SCHUR_JACOBI. 0 DISABLES the branch entirely (SPARSE_SCHUR
+// is then used for every scene above 100 poses).
+//
+// PERF ONLY, but NOT bit-identical: CG is an inexact solve, so the trust-region
+// trajectory differs from a direct factorisation even though both target the
+// same KKT system. Expect a different-but-equivalent reconstruction, not the
+// same bytes.
+//
+// HISTORY: was a hard-coded `n_poses > 1500`, bumped there from 300 so the
+// branch would not fire on the ~436-pose drone dataset, where ITERATIVE_SCHUR
+// measured 22-36s against 11s for SPARSE_SCHUR (2-3.3x SLOWER). No crossover
+// was ever observed at 1500 -- the threshold was placed above the test scene,
+// not derived. The stated cache justification ("dense Schur block no longer
+// fits in cache ~1500-2000 poses") does not hold: the block is (6*n_poses)^2
+// doubles, which exceeds a 64MB L3 at ~470 poses, i.e. below the 436-pose
+// measurement where direct factorisation still won by 3.3x.
+//
+// First run to actually cross 1500 poses (2000-image scene, 52.5M residuals)
+// spent 50.9s of a 158.6s BA in the linear solve, and because ITERATIVE_SCHUR
+// forces use_explicit_schur_complement it also materialised an 832MB dense
+// Schur complement -- the very cost the branch claims to avoid.
+//
+// Defaulted to 0 pending a same-scene A/B. Set to a pose count to re-enable.
+#ifndef OPENMVG_SFM2_ITERATIVE_SCHUR_MIN_POSES
+#define OPENMVG_SFM2_ITERATIVE_SCHUR_MIN_POSES 0
 #endif
 
 // Diagnostic toggle: time every Triangulation() call (INERT -- logging only,
@@ -1190,8 +1255,18 @@ bool SequentialSfMReconstructionEngine2::InitTracksAndLandmarks()
   for (const auto & view_it : sfm_data_.GetViews())
     max_view_id = std::max(max_view_id, view_it.first);
   resection_score_cache_.assign(max_view_id + 1, ResectionScoreCache{});
-  prev_reconstructed_track_ids_.clear();
-  cur_reconstructed_track_ids_.clear();
+  // Reconstructed-track membership bitmaps. `map_tracks_` is a std::map, so
+  // rbegin() gives the largest track id in O(1); every landmark id in
+  // sfm_data_.structure comes from a track, hence is <= that bound. Sized
+  // once here and never reallocated during the resection loop, so the
+  // per-call cost is a memset of (max_track_id/8) bytes.
+  const IndexT max_track_id =
+      map_tracks_.empty() ? 0 : static_cast<IndexT>(map_tracks_.rbegin()->first);
+  const size_t track_bitmap_words = static_cast<size_t>(max_track_id) / 64 + 1;
+  cur_reconstructed_track_bits_.assign(track_bitmap_words, uint64_t(0));
+  prev_reconstructed_track_bits_.assign(track_bitmap_words, uint64_t(0));
+  has_prev_reconstructed_tracks_ = false;
+  track_bits_scratch_.clear();
   // Reset bitmask scratch (sized identically to resection_score_cache_).
   prev_view_with_no_pose_mask_.assign(max_view_id + 1, 0);
   cur_view_with_no_pose_mask_.assign(max_view_id + 1, 0);
@@ -1333,30 +1408,125 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
 
   const IndexT pose_before = sfm_data_.GetPoses().size();
 
-  // Get the track ids of the reconstructed landmarks.
+  // Mark the track ids of the reconstructed landmarks in a membership
+  // bitmap (bit t <=> track t has a landmark).
   //
-  // Buffer is a class member (`cur_reconstructed_track_ids_`) so its
-  // heap capacity is reused across calls; at the end of this function
-  // it is swapped with `prev_reconstructed_track_ids_` (no copy).
+  // This replaces the previous "extract every key into a vector, then
+  // std::sort it" form. The sorted vector only ever existed so that the
+  // two consumers below (the prev/cur diff and the per-view score) could
+  // run merge-style algorithms; both are strictly cheaper on the bitmap,
+  // so the O(n log n) sort is pure overhead and is gone. What remains is
+  // one memset of the bitmap plus one bit-set per landmark -- and the
+  // per-landmark step no longer touches a growing vector, so the loop is
+  // bound only by the unordered_map node walk.
   //
-  // Output bit-identical to the previous lambda-IIFE form: same
-  // transform, same sort, same final contents.
-  std::vector<IndexT> & reconstructed_trackId = cur_reconstructed_track_ids_;
-  reconstructed_trackId.clear();
-  reconstructed_trackId.reserve(sfm_data_.GetLandmarks().size());
-  std::transform(sfm_data_.GetLandmarks().cbegin(), sfm_data_.GetLandmarks().cend(),
-    std::back_inserter(reconstructed_trackId),
-    stl::RetrieveKey());
-  std::sort(reconstructed_trackId.begin(), reconstructed_trackId.end());
+  // Set-equivalent to the old vector by construction: unordered_map keys
+  // are unique, so "sorted list of keys" and "bitmap of keys" carry the
+  // same information, and every downstream consumer is rewritten below to
+  // produce byte-identical results from it.
+  //
+  // The buffer is a class member so it is never reallocated; at the end of
+  // this function it is swapped with `prev_reconstructed_track_bits_`.
+  const Landmarks & reconstructed_landmarks = sfm_data_.GetLandmarks();
+  const size_t reconstructed_count = reconstructed_landmarks.size();
+  std::vector<uint64_t> & cur_track_bits = cur_reconstructed_track_bits_;
+  const size_t n_track_words = cur_track_bits.size();
+  // Bit capacity of the bitmap. Every landmark id is <= max track id (see
+  // InitTracksAndLandmarks) so the bound test below never rejects a real
+  // id; it is kept as a cheap, perfectly-predicted guard against a future
+  // caller injecting structure that did not come from `map_tracks_`.
+  const IndexT track_bit_capacity = static_cast<IndexT>(n_track_words * 64);
+
+  bool bitmap_filled_in_parallel = false;
+
+#ifdef OPENMVG_USE_OPENMP
+  // Parallel fill threshold. Below this the OpenMP fork/join plus the
+  // per-thread bitmap reduction costs more than the serial walk saves;
+  // above it the walk is pure cache-miss latency on the unordered_map
+  // nodes (each node holds a Landmark, so consecutive nodes are far
+  // apart), which threads hide well by keeping several misses in flight.
+  constexpr size_t kParallelBitmapFillMinLandmarks = 50000;
+  if (reconstructed_count >= kParallelBitmapFillMinLandmarks
+      && omp_get_max_threads() > 1)
+  {
+    // Bucket-partitioned fill. Each thread walks a static slice of the
+    // hash table's buckets and ORs into its *private* bitmap, so the fill
+    // needs no atomics and no locks; the merge is then partitioned by
+    // word, a pure ALU pass over (#threads * bitmap) bytes that is
+    // negligible next to the node walk. Both phases are order-
+    // independent, so the result is identical to the serial fill --
+    // including under a different thread count.
+    const int n_bucket = static_cast<int>(reconstructed_landmarks.bucket_count());
+    const int n_word = static_cast<int>(n_track_words);
+    const int n_scratch = omp_get_max_threads();
+
+    // Size the per-thread buffers here rather than inside the region:
+    // an allocation inside would write the (adjacent) vector headers
+    // from several threads at once -- correct, but needless false
+    // sharing on the first call. After the first call this loop is a
+    // no-op and the zeroing happens in parallel below.
+    if (static_cast<int>(track_bits_scratch_.size()) < n_scratch)
+      track_bits_scratch_.resize(n_scratch);
+    for (int k = 0; k < n_scratch; ++k)
+    {
+      if (track_bits_scratch_[k].size() != n_track_words)
+        track_bits_scratch_[k].assign(n_track_words, uint64_t(0));
+    }
+
+    #pragma omp parallel
+    {
+      const int thread_id = omp_get_thread_num();
+      const int n_thread_actual = omp_get_num_threads();
+      std::vector<uint64_t> & local_bits = track_bits_scratch_[thread_id];
+      std::fill(local_bits.begin(), local_bits.end(), uint64_t(0));
+
+      #pragma omp for schedule(static)
+      for (int b = 0; b < n_bucket; ++b)
+      {
+        for (auto it = reconstructed_landmarks.begin(b),
+                  it_end = reconstructed_landmarks.end(b); it != it_end; ++it)
+        {
+          const IndexT track_id = it->first;
+          if (track_id < track_bit_capacity)
+            local_bits[track_id >> 6] |= uint64_t(1) << (track_id & 63);
+        }
+      }
+      // Implicit barrier above: every local_bits is complete here.
+      // omp_get_thread_num() is in [0, n_thread_actual), so exactly the
+      // buffers read below are the ones that were just written.
+
+      #pragma omp for schedule(static)
+      for (int w = 0; w < n_word; ++w)
+      {
+        uint64_t merged = 0;
+        for (int k = 0; k < n_thread_actual; ++k)
+          merged |= track_bits_scratch_[k][w];
+        cur_track_bits[w] = merged;
+      }
+    }
+    bitmap_filled_in_parallel = true;
+  }
+#endif
+
+  if (!bitmap_filled_in_parallel)
+  {
+    std::fill(cur_track_bits.begin(), cur_track_bits.end(), uint64_t(0));
+    for (const auto & landmark_it : reconstructed_landmarks)
+    {
+      const IndexT track_id = landmark_it.first;
+      if (track_id < track_bit_capacity)
+        cur_track_bits[track_id >> 6] |= uint64_t(1) << (track_id & 63);
+    }
+  }
 
   // === Resection-score delta cache ===
   //
-  // The score for view V is `|view_tracks_ids(V) n reconstructed_trackId|`
+  // The score for view V is `|view_tracks_ids(V) n reconstructed tracks|`
   // and the corresponding ratio. view_tracks_ids(V) is invariant after
   // InitTracksAndLandmarks (map_tracks_ never changes during the
-  // resection loop). reconstructed_trackId changes between successive
-  // AddingMissingView() calls via Triangulation() and outlier-erase
-  // passes. We diff the current and previous reconstructed-track lists
+  // resection loop). The reconstructed-track set changes between
+  // successive AddingMissingView() calls via Triangulation() and
+  // outlier-erase passes. We diff the current and previous bitmaps
   // to obtain the (added, removed) delta of track ids; only views whose
   // visible tracks intersect the delta need to be re-scored. All others
   // hold a still-valid cached intersection -- output bit-identical to
@@ -1386,45 +1556,63 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
   // zero each call; O(1) mark, O(1) test, no hashing or bucket allocs.
   // Bounded by max_view_id+1 (== resection_score_cache_.size()).
   std::fill(dirty_view_mask_.begin(), dirty_view_mask_.end(), uint8_t(0));
-  // prev_reconstructed_track_ids_ is only empty on the first invocation;
-  // any subsequent call has at least one reconstructed track (we early-
-  // return at the top if landmarks is empty, and otherwise populated
-  // reconstructed_trackId is swapped into prev_ at the end of the call).
-  const bool first_call = prev_reconstructed_track_ids_.empty();
+  // `has_prev_reconstructed_tracks_` is false only on the first invocation
+  // after InitTracksAndLandmarks; every later call published a bitmap into
+  // prev_ at the end of this function.
+  const bool first_call = !has_prev_reconstructed_tracks_;
   bool force_all_dirty = first_call;
 
-  std::vector<IndexT> added_tracks, removed_tracks;
   if (!force_all_dirty)
   {
-    std::set_difference(
-        reconstructed_trackId.cbegin(), reconstructed_trackId.cend(),
-        prev_reconstructed_track_ids_.cbegin(), prev_reconstructed_track_ids_.cend(),
-        std::back_inserter(added_tracks));
-    std::set_difference(
-        prev_reconstructed_track_ids_.cbegin(), prev_reconstructed_track_ids_.cend(),
-        reconstructed_trackId.cbegin(), reconstructed_trackId.cend(),
-        std::back_inserter(removed_tracks));
-
-    const size_t delta_size = added_tracks.size() + removed_tracks.size();
-    if (delta_size * 2 >= reconstructed_trackId.size())
+    // Delta = symmetric difference of the two membership sets = XOR of the
+    // two bitmaps, word by word. This subsumes both std::set_difference
+    // calls: added and removed tracks feed the *same* mark_views_for_track,
+    // so there is no reason to separate them, and no reason to materialise
+    // them into vectors at all -- each delta bit is consumed the moment it
+    // is found.
+    //
+    // The scan also computes |added|+|removed| incrementally and bails to
+    // force_all_dirty the moment the running count crosses the turnover
+    // threshold. That decision is identical to computing the full count
+    // first (a running count only grows, so crossing early implies
+    // crossing overall, and reaching the end means the running count *is*
+    // the full count) -- but on the massive-delta path it stops scanning
+    // instead of enumerating a delta it is about to throw away. Spurious
+    // marks left in dirty_view_mask_ by the aborted scan are harmless:
+    // force_all_dirty short-circuits the mask test in the loop below.
+    const uint64_t * cur_words = cur_track_bits.data();
+    const uint64_t * prev_words = prev_reconstructed_track_bits_.data();
+    const IndexT mask_size = static_cast<IndexT>(dirty_view_mask_.size());
+    auto mark_views_for_track = [&](IndexT track_id)
     {
-      force_all_dirty = true;  // cheaper to just recompute everyone
-    }
-    else
-    {
-      const IndexT mask_size = static_cast<IndexT>(dirty_view_mask_.size());
-      auto mark_views_for_track = [&](IndexT track_id)
+      auto it = map_tracks_.find(track_id);
+      if (it == map_tracks_.end()) return;
+      for (const auto & vf : it->second)  // {ViewId, FeatureId}
       {
-        auto it = map_tracks_.find(track_id);
-        if (it == map_tracks_.end()) return;
-        for (const auto & vf : it->second)  // {ViewId, FeatureId}
-        {
-          const IndexT vid = vf.first;
-          if (vid < mask_size) dirty_view_mask_[vid] = 1;
-        }
-      };
-      for (IndexT t : added_tracks)   mark_views_for_track(t);
-      for (IndexT t : removed_tracks) mark_views_for_track(t);
+        const IndexT vid = vf.first;
+        if (vid < mask_size) dirty_view_mask_[vid] = 1;
+      }
+    };
+
+    size_t delta_size = 0;
+    for (size_t w = 0; w < n_track_words; ++w)
+    {
+      uint64_t delta_word = cur_words[w] ^ prev_words[w];
+      if (delta_word == 0)
+        continue;
+      delta_size += PopCount64(delta_word);
+      if (delta_size * 2 >= reconstructed_count)
+      {
+        force_all_dirty = true;  // cheaper to just recompute everyone
+        break;
+      }
+      const IndexT track_base = static_cast<IndexT>(w * 64);
+      do
+      {
+        const unsigned bit = CountTrailingZeros64(delta_word);
+        delta_word &= delta_word - 1;      // clear lowest set bit
+        mark_views_for_track(track_base + bit);
+      } while (delta_word);
     }
   }
 
@@ -1483,7 +1671,7 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
 
       // Delta-cache check. The slot is only safely re-usable if V was
       // scored last round AND no track in V's view_tracks_ids was
-      // added/removed from reconstructed_trackId since.
+      // added to / removed from the reconstructed-track set since.
       ResectionScoreCache & slot = resection_score_cache_[view_id];
       const bool was_scored_last_round =
           (view_id < prev_view_with_no_pose_mask_.size())
@@ -1496,17 +1684,34 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
 
       if (is_dirty)
       {
-        // Recompute the intersection. Both inputs are sorted-ascending;
-        // output is bit-identical to the previous std::set-based
-        // implementation and to last round's cached value when the
-        // delta-relevant track set is unchanged.
+        // Recompute the intersection by testing each of the view's track
+        // ids against the reconstructed-track bitmap.
+        //
+        // Bit-identical to the previous std::set_intersection over the two
+        // sorted id lists: view_tracks_ids is ascending and duplicate-free
+        // (one append per (view, track) pair, in map_tracks_ order), so
+        // filtering it in place emits exactly the common elements, exactly
+        // once each, in exactly the same ascending order.
+        //
+        // The cost model is what changes. set_intersection is a merge: it
+        // advances through the reconstructed list until it passes the
+        // view's largest track id, so each dirty view streamed most of the
+        // full reconstructed id array (megabytes, once per view). The
+        // bitmap turns that into one random bit test per visible track --
+        // O(#tracks in this view) against a working set of
+        // (#tracks / 8) bytes, which stays resident in L2 across the whole
+        // parallel loop instead of evicting it every iteration.
         slot.track_id_for_resection.clear();
         slot.track_id_for_resection.reserve(
-            std::min(view_tracks_ids.size(), reconstructed_trackId.size()));
-        std::set_intersection(
-            view_tracks_ids.cbegin(), view_tracks_ids.cend(),
-            reconstructed_trackId.cbegin(), reconstructed_trackId.cend(),
-            std::back_inserter(slot.track_id_for_resection));
+            std::min(view_tracks_ids.size(), reconstructed_count));
+        for (const IndexT track_id : view_tracks_ids)
+        {
+          if (track_id < track_bit_capacity
+              && (cur_track_bits[track_id >> 6] >> (track_id & 63)) & uint64_t(1))
+          {
+            slot.track_id_for_resection.push_back(track_id);
+          }
+        }
         slot.track_ratio = slot.track_id_for_resection.size()
                          / static_cast<float>(view_tracks_ids.size() + 1);
       }
@@ -1752,10 +1957,12 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
   const IndexT pose_after = sfm_data_.GetPoses().size();
 
   // Persist delta-cache state for the next AddingMissingView() call.
-  // Swap (no copy) the current track-id vector into prev_, and move the
-  // current no-pose mask into prev_. Done after the parallel loop so
-  // writes are race-free.
-  prev_reconstructed_track_ids_.swap(reconstructed_trackId);
+  // Swap (no copy) the current track bitmap into prev_, and the current
+  // no-pose mask into prev_. Done after the parallel loop so writes are
+  // race-free. `cur_track_bits` aliases cur_reconstructed_track_bits_ and
+  // must not be read past this point.
+  prev_reconstructed_track_bits_.swap(cur_reconstructed_track_bits_);
+  has_prev_reconstructed_tracks_ = true;
   prev_view_with_no_pose_mask_.swap(cur_view_with_no_pose_mask_);
 
   return (pose_after != pose_before);
@@ -1766,18 +1973,15 @@ bool SequentialSfMReconstructionEngine2::BundleAdjustment(BAPreset preset)
   Bundle_Adjustment_Ceres::BA_Ceres_options options;
   // Linear-solver selector:
   //   * < 100 poses                 -> DENSE_SCHUR (fastest at small scale).
-  //   * 100..1500 poses (sparse lib)-> SPARSE_SCHUR + JACOBI preconditioner
+  //   * > 100 poses (sparse lib)    -> SPARSE_SCHUR + JACOBI preconditioner
   //                                    (direct factorisation of Schur comp.).
-  //   * > 1500 poses (sparse lib)   -> ITERATIVE_SCHUR + SCHUR_JACOBI.
+  //   * ITERATIVE_SCHUR + SCHUR_JACOBI only above
+  //     OPENMVG_SFM2_ITERATIVE_SCHUR_MIN_POSES, which defaults to 0 (= never).
   //
-  // [BA-PERF] Threshold bumped from 300 to 1500 after measuring on the
-  // slow drone dataset (~436 poses, 5.7M residuals): ITERATIVE_SCHUR +
-  // SCHUR_JACOBI took 22-36s on the final BA versus 11s for SPARSE_SCHUR
-  // with SuiteSparse. CG inner-iteration count balloons at this scale
-  // because the Schur complement is sparse-but-not-particularly-banded.
-  // Direct factorisation wins until the dense Schur block can no longer
-  // fit in cache (empirically ~1500-2000 poses). Quality identical in
-  // both cases (same KKT system).
+  // The only measurements we have on both solvers favour direct factorisation
+  // (436 poses: 11s SPARSE_SCHUR vs 22-36s ITERATIVE_SCHUR; >1500 poses: 50.9s
+  // in the linear solve plus an 832MB explicit Schur complement). See the
+  // top-of-file knob for the full history before re-enabling the branch.
   const std::size_t n_poses = sfm_data_.GetPoses().size();
   const bool sparse_available =
 #if OPENMVG_SFM2_FORCE_NO_SPARSE_BA
@@ -1787,7 +1991,12 @@ bool SequentialSfMReconstructionEngine2::BundleAdjustment(BAPreset preset)
     || ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::EIGEN_SPARSE);
 #endif
 
-  if (n_poses > 1500 && sparse_available)
+  // 0 disables the iterative branch; see top-of-file knob.
+  constexpr std::size_t kIterativeSchurMinPoses =
+      OPENMVG_SFM2_ITERATIVE_SCHUR_MIN_POSES;
+
+  if (kIterativeSchurMinPoses > 0 &&
+      n_poses > kIterativeSchurMinPoses && sparse_available)
   {
     options.preconditioner_type_ = ceres::SCHUR_JACOBI;
     options.linear_solver_type_  = ceres::ITERATIVE_SCHUR;

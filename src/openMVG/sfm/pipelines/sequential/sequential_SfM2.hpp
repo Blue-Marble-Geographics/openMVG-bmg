@@ -9,6 +9,7 @@
 #ifndef OPENMVG_SFM_LOCALIZATION_SEQUENTIAL2_SFM_HPP
 #define OPENMVG_SFM_LOCALIZATION_SEQUENTIAL2_SFM_HPP
 
+#include <cstdint>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -203,19 +204,43 @@ private:
   };
   std::vector<ResectionScoreCache> resection_score_cache_;
 
-  /// Snapshot of the sorted reconstructed-track-id list at the end of the
-  /// previous AddingMissingView() call. Compared against the current list
-  /// via std::set_difference to obtain the (added, removed) deltas, which
-  /// determine which views' cached scores are stale.
-  std::vector<IndexT> prev_reconstructed_track_ids_;
+  /// Membership bit-set of the reconstructed (triangulated) track ids for
+  /// the current AddingMissingView() call. Bit `t` is set iff track id `t`
+  /// has a landmark in sfm_data_.structure. Word `t >> 6`, bit `t & 63`.
+  ///
+  /// This replaces the sorted std::vector<IndexT> snapshot the delta cache
+  /// used to keep. The set is the same; only the encoding changed, and the
+  /// encoding is what the three consumers actually want:
+  ///   * building it is O(#landmarks) bit-sets with no comparison sort
+  ///     (the vector form paid an O(n log n) std::sort every call purely
+  ///     so the two consumers below could run merge-style algorithms);
+  ///   * the previous/current diff is a word-wise XOR instead of two
+  ///     std::set_difference merges over the full id lists;
+  ///   * the per-view resection score becomes O(#tracks visible in the
+  ///     view) bit tests instead of a std::set_intersection that streams
+  ///     the *entire* reconstructed id list once per dirty view.
+  /// Sized once in InitTracksAndLandmarks to max(track id in map_tracks_)+1
+  /// bits; never reallocated during the resection loop.
+  std::vector<uint64_t> cur_reconstructed_track_bits_;
 
-  /// Scratch buffer for the current call's sorted reconstructed-track-id
-  /// list. Built fresh each AddingMissingView() invocation, then swapped
-  /// with `prev_reconstructed_track_ids_` at the end (so next call's
-  /// `prev_` is this call's `cur_`, with no copy). `clear()` preserves
-  /// capacity across calls so the per-call alloc is amortised away after
-  /// the first reconstruction round.
-  std::vector<IndexT> cur_reconstructed_track_ids_;
+  /// Snapshot of `cur_reconstructed_track_bits_` at the end of the previous
+  /// AddingMissingView() call. The two are swapped at the end of each call
+  /// (no copy), so this always holds the previous round's membership set.
+  std::vector<uint64_t> prev_reconstructed_track_bits_;
+
+  /// False until the first AddingMissingView() call has published a
+  /// `prev_reconstructed_track_bits_`. Replaces the old "prev id vector is
+  /// empty" first-call test, which is not expressible on a bitmap (an
+  /// all-zero bitmap is a legitimate -- if unreachable -- state).
+  bool has_prev_reconstructed_tracks_ = false;
+
+  /// Per-thread scratch bitmaps for the parallel reconstructed-track-bitmap
+  /// build (one entry per OpenMP thread, each sized like
+  /// `cur_reconstructed_track_bits_`). Threads OR into their private buffer
+  /// so no atomics or locks are needed on the fill; a word-partitioned
+  /// reduction merges them. Allocated lazily on the first parallel build
+  /// and reused for the rest of the reconstruction.
+  std::vector<std::vector<uint64_t>> track_bits_scratch_;
 
   /// Snapshot of the set of view ids in `view_with_no_pose` at the end of
   /// the previous AddingMissingView() call. A view that re-enters

@@ -39,6 +39,7 @@ class CpuInstructionSet
   bool m_SSE42 = false;
   bool m_AVX = false;
   bool m_AVX2 = false;
+  bool m_FMA = false;
   bool m_POPCNT = false;
 
   public:
@@ -66,6 +67,10 @@ class CpuInstructionSet
       m_SSE41 = Ecx[19];
       m_SSE42 = Ecx[20];
       m_POPCNT = Ecx[23];
+      // FMA3 is advertised separately from AVX/AVX2 (leaf 1, ECX bit 12).
+      // Every shipping AVX2 part also has FMA3, but code emitting vfmadd
+      // must test for it rather than infer it from AVX2.
+      m_FMA = Ecx[12];
 
       if (nIds > 6)
       {
@@ -109,6 +114,11 @@ class CpuInstructionSet
   bool supportAVX2() const
   {
     return m_AVX2;
+  }
+
+  bool supportFMA() const
+  {
+    return m_FMA;
   }
 
   bool supportPOPCNT() const

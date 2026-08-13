@@ -34,7 +34,9 @@ install(TARGETS openMVG_geometry DESTINATION lib EXPORT openMVG-targets)
 
 UNIT_TEST(openMVG convex_hull "openMVG_geometry")
 UNIT_TEST(openMVG rigid_transformation3D_srt "openMVG_geometry")
-UNIT_TEST(openMVG plane_estimation_kernel "openMVG_geometry")
+# Instantiates ACRANSAC, which needs the runtime-dispatched NFA kernel.
+# openMVG_geometry does not link openMVG_multiview, so name it explicitly.
+UNIT_TEST(openMVG plane_estimation_kernel "openMVG_geometry;openMVG_robust_estimation")
 UNIT_TEST(openMVG half_space_intersection "openMVG_geometry")
 UNIT_TEST(openMVG frustum_intersection "openMVG_multiview_test_data;openMVG_multiview;openMVG_geometry")
 UNIT_TEST(openMVG frustum_box_intersection "openMVG_multiview_test_data;openMVG_multiview;openMVG_geometry")

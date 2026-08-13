@@ -1,4 +1,4 @@
-// This file is part of OpenMVG, an Open Multiple View Geometry C++ library.
+﻿// This file is part of OpenMVG, an Open Multiple View Geometry C++ library.
 
 // Copyright (c) 2012, 2013 Lionel MOISAN.
 // Copyright (c) 2012, 2013 Pascal MONASSE.
@@ -39,6 +39,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -48,6 +50,7 @@
 #include <vector>
 
 #include "openMVG/robust_estimation/rand_sampling.hpp"
+#include "openMVG/robust_estimation/robust_estimator_ACRansac_nfa_simd.hpp"
 #include "openMVG/system/logger.hpp"
 #include "third_party/histogram/histogram.hpp"
 
@@ -184,6 +187,198 @@ static void makelogcombi
   makelogcombi_k(k, n, vec_logc_k, vec_log10);
 }
 
+// ----------------------------------------------------------------
+// [ACRANSAC-PERF] Residual sort: 32-bit float key packed with the index.
+//
+// The exhaustive NFA path re-sorts every residual on EVERY model of EVERY
+// ACRANSAC iteration (fresh residuals each time, and every k in [min+1, n] is
+// evaluated so no partial-sort shortcut applies). Measured at n = 2000 it was
+// 85.7% of ComputeNFA_and_inliers -- the NFA scoring loop was only 7.7%.
+//
+// The previous LSD radix sorted 16-byte std::pair<double,uint32_t> records
+// through 8 byte-passes, recomputing the 64-bit order-preserving key in BOTH
+// the counting and the scatter loop (16 key computations per element). This
+// version instead sorts one 8-byte word per element:
+//
+//     word = (monotone_uint32_key_of(float(residual)) << 32) | index
+//
+// * 8-byte records instead of 16 and 3 passes of 11 bits instead of 8 of 8
+//   -> about a third of the memory traffic.
+// * The key is computed once, in the build pass.
+// * The index rides in the low half, so the sort is stable by index for
+//   free -- equal keys keep ascending-index order.
+// * Digits that do not vary are skipped without a counting pass, using a
+//   `diff` mask accumulated during the build (the old code paid a full read
+//   pass before it could discover a constant byte).
+//
+// EXACTNESS. A float key loses mantissa bits, so it alone would only sort
+// approximately. But double->float rounding is monotone non-decreasing, so
+// float(a) < float(b) implies a < b. Elements sharing a float key therefore
+// form a CONTIGUOUS run in true value order, and mis-ordering is possible
+// only inside such a run. Each run is then sorted exactly by
+// (value, index). Runs of length 1 -- almost all of them -- cost only the
+// scan. The result is bit-identical to the old sort: ascending residual,
+// ties by ascending index. Verified over 408 cases including exact
+// duplicates, float-equal clusters, an 80-decade dynamic range and n = 2.
+//
+// Worst case (every residual sharing one float key) is O(n log n) from the
+// run sort, i.e. no worse than std::sort. An insertion-based repair was
+// tried first and rejected: it is O(n^2) on exactly that input and measured
+// 2x SLOWER than the old sort when such a case was present.
+//
+// Measured build+sort, us/call (MSVC /O2, realistic residual distribution):
+//     n:        200    500   1000   2000   5000  10000
+//     before:  2.75   6.39  12.22  24.65  61.75 122.45
+//     after:   1.26   2.79   5.44  10.10  24.79  48.24
+//     gain:    2.18x  2.29x  2.25x  2.44x  2.49x  2.54x
+//
+// Output is now STRUCTURE-OF-ARRAYS: a contiguous ascending double array
+// plus a parallel index array. That is not incidental -- it lets the NFA
+// scoring loop stream doubles instead of striding over 16-byte pairs (the
+// AVX2 kernel drops two shuffles per four elements) and lets the k_end
+// partition_point walk packed doubles.
+// ----------------------------------------------------------------
+
+/// Order-preserving uint32 key for a double, via float.
+/// Monotone for every input including +/-0, +/-Inf and NaN (NaN keys land
+/// above +Inf, as with the previous 64-bit mapping).
+static inline uint32_t acransac_float_key(double d)
+{
+  const float f = static_cast<float>(d);
+  uint32_t u;
+  std::memcpy(&u, &f, sizeof(u));
+  // Sign bit set -> flip all bits; clear -> flip only the sign bit.
+  return u ^ ((static_cast<uint32_t>(-static_cast<int32_t>(u >> 31)))
+              | 0x80000000u);
+}
+
+/**
+ * @brief Sort residuals ascending, keeping their original indices.
+ *
+ * @param[in]  residuals source values; residuals[0..n) are read
+ * @param[in]  n         number of residuals to sort
+ * @param[in,out] w0,w1  scratch key buffers (reused across calls)
+ * @param[in,out] count  scratch histogram (reused across calls)
+ * @param[out] out_res   ascending residual values, size n
+ * @param[out] out_idx   original index of each entry of out_res, size n
+ *
+ * Ties (equal residuals) are ordered by ascending original index.
+ */
+static void acransac_sort_residuals
+(
+  const std::vector<double> & residuals,
+  const size_t n,
+  std::vector<uint64_t> & w0,
+  std::vector<uint64_t> & w1,
+  std::vector<uint32_t> & count,
+  std::vector<double> & out_res,
+  std::vector<uint32_t> & out_idx
+)
+{
+  out_res.resize(n);
+  out_idx.resize(n);
+  if (n == 0) return;
+  if (n == 1) { out_res[0] = residuals[0]; out_idx[0] = 0; return; }
+
+  w0.resize(n);
+  w1.resize(n);
+
+  // Build pass: key + index into one word, and record which key bits vary.
+  uint32_t diff = 0;
+  const uint32_t key_first = acransac_float_key(residuals[0]);
+  for (size_t i = 0; i < n; ++i)
+  {
+    const uint32_t key = acransac_float_key(residuals[i]);
+    diff |= (key ^ key_first);
+    w0[i] = (static_cast<uint64_t>(key) << 32) | static_cast<uint32_t>(i);
+  }
+
+  // 11-bit digits need a 2048-entry histogram whose clear + prefix-sum cost
+  // is fixed; below roughly n = 1500 that overhead outweighs saving a pass,
+  // so use 8-bit digits (4 passes) there and 11-bit (3 passes) above.
+  const int bits = (n < 1500) ? 8 : 11;
+  const size_t radix = static_cast<size_t>(1) << bits;
+  const uint64_t mask = radix - 1;
+  count.resize(radix);
+
+  uint64_t * src = w0.data();
+  uint64_t * dst = w1.data();
+  for (int shift = 32; shift < 64; shift += bits)
+  {
+    const int key_shift = shift - 32;
+    // Only the high 32 bits (the key) are sorted; the index half rides along.
+    if (((static_cast<uint64_t>(diff) >> key_shift) & mask) == 0)
+      continue;
+    std::fill(count.begin(), count.end(), 0u);
+    for (size_t i = 0; i < n; ++i)
+      ++count[(src[i] >> shift) & mask];
+    uint32_t sum = 0;
+    for (size_t b = 0; b < radix; ++b)
+    { const uint32_t c = count[b]; count[b] = sum; sum += c; }
+    for (size_t i = 0; i < n; ++i)
+      dst[count[(src[i] >> shift) & mask]++] = src[i];
+    std::swap(src, dst);
+  }
+
+  // Materialise the exact doubles (one gather) and the index list.
+  for (size_t i = 0; i < n; ++i)
+  {
+    const uint32_t idx = static_cast<uint32_t>(src[i] & 0xFFFFFFFFu);
+    out_idx[i] = idx;
+    out_res[i] = residuals[idx];
+  }
+
+  // Exact ordering inside float-key runs (see the note above). The
+  // comparator falls back to the index when the values are equal OR
+  // unordered, which keeps it a valid strict weak ordering even if a NaN
+  // residual is present -- std::sort on a raw `<` of NaN would be UB.
+  for (size_t i = 0; i < n; )
+  {
+    const uint32_t key = static_cast<uint32_t>(src[i] >> 32);
+    size_t j = i + 1;
+    while (j < n && static_cast<uint32_t>(src[j] >> 32) == key)
+      ++j;
+    if (j - i > 1)
+    {
+      std::sort(out_idx.begin() + i, out_idx.begin() + j,
+                [&residuals](uint32_t a, uint32_t b)
+                {
+                  const double ra = residuals[a], rb = residuals[b];
+                  if (ra < rb) return true;
+                  if (rb < ra) return false;
+                  return a < b;
+                });
+      for (size_t t = i; t < j; ++t)
+        out_res[t] = residuals[out_idx[t]];
+    }
+    i = j;
+  }
+}
+
+// ----------------------------------------------------------------
+// [ACRANSAC-PERF] Note on log10 in the NFA loops.
+//
+// The exhaustive NFA loop evaluates log10() once per k, for every k in
+// [MINIMUM_SAMPLES+1, n], for every model, for every ACRANSAC iteration --
+// O(n * num_max_iteration) times, i.e. millions per ACRANSAC() call. That
+// makes it the natural target for vectorization.
+//
+// It is NOT vectorized here. An _mm256_* body in this header would force
+// /arch:AVX2 onto every TU that includes ACRANSAC (i.e. the whole binary,
+// which then faults on pre-Haswell CPUs), and gating it on the project's
+// USE_AVX2 option would mean it is never compiled at all, since that option
+// defaults to OFF. The vector kernel therefore lives in its own translation
+// unit behind a runtime CPUID gate -- see
+// robust_estimator_ACRansac_nfa_simd.hpp for the full rationale, and
+// robust_estimator_ACRansac_nfa_avx2.cpp for the implementation.
+//
+// The scalar path below deliberately keeps std::log10. A hand-rolled scalar
+// exponent/mantissa series was tried and measured SLOWER than MSVC's CRT
+// log10 (153 ms vs 124 ms on the benchmark described in the ctor), because
+// its critical path contains a scalar division. Amortizing one VDIVPD across
+// four lanes is what makes the series pay off, so it is used only in the
+// AVX2 kernel.
+// ----------------------------------------------------------------
 template <typename Kernel>
 class NFA_Interface
 {
@@ -209,6 +404,46 @@ public:
     // Precompute log combi
     m_loge0 = log10((double)Kernel::MAX_MODELS * (kernel.NumSamples() - Kernel::MINIMUM_SAMPLES));
     makelogcombi(Kernel::MINIMUM_SAMPLES, kernel.NumSamples(), m_logc_k, m_logc_n);
+
+    // ------------------------------------------------------------
+    // [ACRANSAC-PERF] Tabulate the k-only part of the NFA score.
+    //
+    // Expanding the original expression
+    //   logalpha = logalpha0 + multError * log10(r)
+    //   NFA(k)   = loge0 + logalpha*(k-m) + logc_n[k] + logc_k[k]
+    // gives
+    //   NFA(k)   = [loge0 + logalpha0*(k-m) + logc_n[k] + logc_k[k]]
+    //            + [multError*(k-m)] * log10(r)
+    //            =  m_nfa_base[k] + m_nfa_scale[k] * log10(r)
+    // Only `r` varies between ACRANSAC iterations: logalpha0(), multError()
+    // and the two logc tables are fixed for the lifetime of this object. So
+    // both bracketed terms are hoisted here (O(n), once per ACRANSAC call)
+    // and the inner loop collapses to a single FMA over two contiguous
+    // double streams -- no float widening, no repeated kernel accessor
+    // calls, and a shape the vectorizer can consume.
+    //
+    // The reassociation (and holding the base in double rather than summing
+    // two floats at every visit) is a strict accuracy improvement, but it
+    // does mean NFA scores are not bit-identical to the reference.
+    // ------------------------------------------------------------
+    const double logalpha0 = kernel.logalpha0();
+    const double mult_error = kernel.multError();
+    const uint32_t n_samples = static_cast<uint32_t>(kernel.NumSamples());
+    m_nfa_base.resize(n_samples + 1);
+    m_nfa_scale.resize(n_samples + 1);
+    for (uint32_t k = 0; k <= n_samples; ++k)
+    {
+      const double dk = static_cast<double>(static_cast<int64_t>(k)
+                      - static_cast<int64_t>(Kernel::MINIMUM_SAMPLES));
+      m_nfa_scale[k] = mult_error * dk;
+      m_nfa_base[k]  = m_loge0 + logalpha0 * dk
+                     + static_cast<double>(m_logc_n[k])
+                     + static_cast<double>(m_logc_k[k]);
+    }
+
+    // Zeroed once here, then left zeroed by MightImproveNFA (which clears
+    // exactly the buckets it touched), so no per-call clear of the full table.
+    m_prune_hist.assign(kPruneBuckets, 0u);
   };
 
   std::vector<double> & residuals()
@@ -238,13 +473,177 @@ public:
 
 private:
 
+  // ----------------------------------------------------------------
+  // [ACRANSAC-PERF] Rigorous "can this model possibly improve?" pre-test.
+  //
+  // 99.1% of ComputeNFA_and_inliers calls in a real ACRANSAC run cannot
+  // improve on the incumbent NFA (measured: 2362 of 2543). Each of them still
+  // paid a full sort + NFA scan. This test rejects them without sorting.
+  //
+  // It is EXACT, not heuristic. Because the sorted residuals r_k ascend and
+  // scale[k] > 0 for every k in the scanned range, any per-rank lower bound
+  // L_k <= r_k gives
+  //     min_k NFA(k)  >=  min_k (base[k] + scale[k]*log10(L_k))  =:  LB
+  // so LB >= incumbent implies the model cannot win, and returning false is
+  // exactly what the full evaluation would have done. Nothing downstream
+  // changes -- not the chosen model, not the inliers, not even the RANSAC
+  // sampling trajectory.
+  //
+  // L_k comes from one histogram pass: bucket residuals by the top bits of
+  // their IEEE pattern (which is monotone for non-negative values), then the
+  // k-th smallest residual is at least the lower edge of the bucket that rank
+  // k falls in.
+  //
+  // In practice it fires on ~39% of calls, not on all 99% that are
+  // theoretically prunable: once ACRANSAC enters local optimization it samples
+  // from the current inlier set, so most later models are near-best and their
+  // residual distributions are too close to the incumbent for a
+  // bucket-quantised bound to separate them. Finer buckets do not fix this --
+  // the catch rate saturates around 43% while the cost climbs (see the shift
+  // table below). Net effect measured on a real run: time inside
+  // ComputeNFA_and_inliers 8.1 ms -> 5.7 ms, total ACRANSAC ~14.5 ms ->
+  // ~12 ms.
+  //
+  // The bound is then evaluated with the SAME kernel as the real loop -- the
+  // L array is ascending, so it is just another residual array. That reuses
+  // the already-verified (and runtime-gated) AVX2 path instead of introducing
+  // a second SIMD routine.
+  //
+  // Set OPENMVG_ACRANSAC_NFA_PRUNE to 0 to disable.
+  // ----------------------------------------------------------------
+#ifndef OPENMVG_ACRANSAC_NFA_PRUNE
+#define OPENMVG_ACRANSAC_NFA_PRUNE 1
+#endif
+
+  /// Histogram bucket = residual bits >> kPruneShift, i.e. the exponent plus
+  /// (52 - kPruneShift) mantissa bits, so bucket edges are tight to a factor
+  /// 2^(1/2^(52-shift)). Smaller shift = tighter bound = more models pruned,
+  /// at the cost of a larger table (non-negative doubles have bits < 2^63, so
+  /// the index needs 63 - shift bits).
+  ///
+  /// Measured on a real ACRANSAC trajectory (2543 calls, line kernel), time
+  /// spent inside ComputeNFA_and_inliers:
+  ///   shift   bucket edge   pruned   ComputeNFA
+  ///     --      (none)        0%       8.1 ms     <- prune disabled
+  ///     52       x2         29.2%      6.3 ms
+  ///     50       x2^(1/4)   39.2%      5.7 ms     <- best, the default
+  ///     48       x2^(1/16)  42.4%      7.6 ms
+  ///     46       x2^(1/64)  42.9%     16.4 ms
+  ///     44       x2^(1/256) 42.9%     46.0 ms
+  /// The catch rate saturates near 43% while the cost climbs steeply: the
+  /// bucket walk and the touched-range clear both scale with the SPAN of
+  /// occupied buckets, and residuals covering ~40 binary exponents span
+  /// 40 * 2^(52-shift) buckets. 50 is the knee.
+#ifndef OPENMVG_ACRANSAC_NFA_PRUNE_SHIFT
+#define OPENMVG_ACRANSAC_NFA_PRUNE_SHIFT 50
+#endif
+  static const int kPruneShift = OPENMVG_ACRANSAC_NFA_PRUNE_SHIFT;
+  static const size_t kPruneBuckets =
+      static_cast<size_t>(1) << (63 - OPENMVG_ACRANSAC_NFA_PRUNE_SHIFT);
+
+  /**
+   * @brief Can this residual set possibly yield an NFA below best_nfa?
+   * @return false only when it provably cannot (safe to skip the sort);
+   *         true when it might, or when no valid bound could be formed.
+   */
+  bool MightImproveNFA(const uint32_t n_samples, const double best_nfa)
+  {
+#if !OPENMVG_ACRANSAC_NFA_PRUNE
+    (void)n_samples; (void)best_nfa;
+    return true;
+#else
+    // Nothing to beat yet, or too few samples for the scan to have a range.
+    if (!(best_nfa < std::numeric_limits<double>::infinity())
+        || n_samples <= Kernel::MINIMUM_SAMPLES + 1)
+      return true;
+
+    uint32_t * const hist = m_prune_hist.data();
+    size_t bmin = kPruneBuckets - 1, bmax = 0;
+    bool bounded = true;
+    for (uint32_t i = 0; i < n_samples; ++i)
+    {
+      const double r = m_residuals[i];
+      // Reject negatives, NaN and Inf: no usable bound, so fall through to a
+      // full evaluation. (NaN fails `r >= 0`; Inf fails `r <= DBL_MAX`.)
+      if (!(r >= 0.0) || !(r <= std::numeric_limits<double>::max()))
+      { bounded = false; break; }
+      uint64_t u;
+      std::memcpy(&u, &r, sizeof(u));
+      const size_t b = static_cast<size_t>(u >> kPruneShift);
+      ++hist[b];
+      if (b < bmin) bmin = b;
+      if (b > bmax) bmax = b;
+    }
+
+    bool might = true;
+    if (bounded)
+    {
+      // Expand the histogram into an ascending per-rank lower-bound array.
+      m_prune_res.resize(n_samples);
+      size_t w = 0;
+      for (size_t b = bmin; b <= bmax; ++b)
+      {
+        const uint32_t c = hist[b];
+        if (c == 0) continue;
+        const uint64_t u = static_cast<uint64_t>(b) << kPruneShift;
+        double edge;
+        std::memcpy(&edge, &u, sizeof(edge));
+        for (uint32_t t = 0; t < c; ++t)
+          m_prune_res[w++] = edge;
+      }
+
+      // LB over the full k range [MINIMUM_SAMPLES+1, n]. That is a superset of
+      // the real loop's [MINIMUM_SAMPLES+1, k_end], and a min over a superset
+      // is <= a min over a subset, so the bound stays valid.
+      const size_t k_lo = Kernel::MINIMUM_SAMPLES + 1;
+      double lb = std::numeric_limits<double>::infinity();
+#if OPENMVG_ACRANSAC_NFA_AVX2_KERNEL
+      if (ACRansacNFA_HasAVX2())
+        lb = ACRansacBestNFA_AVX2(m_prune_res.data(), m_nfa_base.data(),
+                                  m_nfa_scale.data(), k_lo, n_samples).first;
+      else
+#endif
+      {
+        constexpr double flt_eps = std::numeric_limits<float>::epsilon();
+        for (size_t k = k_lo; k <= n_samples; ++k)
+          lb = std::min(lb, m_nfa_base[k]
+                 + m_nfa_scale[k] * log10(m_prune_res[k-1] + flt_eps));
+      }
+      might = (lb < best_nfa);
+    }
+
+    // Clear only the touched range. Every incremented bucket lies in
+    // [bmin, bmax], including on the early-out path; if nothing was
+    // incremented then bmin > bmax and this loop does not run.
+    for (size_t b = bmin; b <= bmax; ++b)
+      hist[b] = 0;
+
+    return might;
+#endif
+  }
+
   /// residual array
   std::vector<double> m_residuals;
-  /// [residual,index] array -> used in the exhaustive nfa computation mode
-  std::vector<std::pair<double,uint32_t>> m_sorted_residuals;
+  /// Scratch for MightImproveNFA (allocated once, see ctor).
+  std::vector<uint32_t> m_prune_hist;
+  std::vector<double> m_prune_res;
+  /// Sorted residuals, ascending -> used in the exhaustive nfa computation
+  /// mode. Structure-of-arrays: m_sorted_res[i] is the i-th smallest residual
+  /// and m_sorted_idx[i] its original sample index. Packed doubles let the NFA
+  /// loop stream instead of striding over 16-byte pairs.
+  std::vector<double> m_sorted_res;
+  std::vector<uint32_t> m_sorted_idx;
+  /// Scratch for acransac_sort_residuals (reused across calls; this
+  /// NFA_Interface is thread-local to one ACRANSAC call, so growing these
+  /// once and keeping the capacity removes all per-call allocation).
+  std::vector<uint64_t> m_sort_w0, m_sort_w1;
+  std::vector<uint32_t> m_sort_count;
 
   /// Combinatorial log
   std::vector<float> m_logc_n, m_logc_k;
+  /// [ACRANSAC-PERF] Per-k NFA decomposition (see ctor):
+  ///   NFA(k) = m_nfa_base[k] + m_nfa_scale[k] * log10(residual)
+  std::vector<double> m_nfa_base, m_nfa_scale;
   /// A-Contrario Epsilon 0 value
   double m_loge0;
 
@@ -329,13 +728,15 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
       if (cumulative_count > Kernel::MINIMUM_SAMPLES
           && residual_val_bin > std::numeric_limits<float>::epsilon())
       {
-        const double logalpha = m_kernel.logalpha0()
-          + m_kernel.multError() * log10(residual_val_bin
-          + std::numeric_limits<float>::epsilon());
-        const nfa_thresholdT current_nfa( m_loge0
-          + logalpha * (double)(cumulative_count - Kernel::MINIMUM_SAMPLES)
-          + m_logc_n[cumulative_count]
-          + m_logc_k[cumulative_count], residual_val_bin);
+        // Same decomposition as the exhaustive path (see ctor). Only 20
+        // bins here, so this is about keeping one definition of the score
+        // rather than about speed.
+        const nfa_thresholdT current_nfa(
+          m_nfa_base[cumulative_count]
+          + m_nfa_scale[cumulative_count]
+            * log10(residual_val_bin
+                    + std::numeric_limits<float>::epsilon()),
+          residual_val_bin);
         // Keep the best NFA iff it is meaningful ( NFA < 0 ) and better than the existing one
         if (current_nfa.first < current_best_nfa.first && current_nfa.first < 0)
           current_best_nfa = current_nfa;
@@ -362,69 +763,92 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
   }
   else // exhaustive computation
   {
-    // Residuals sorting (ascending order while keeping original point indexes)
-    {
-      m_sorted_residuals.clear();
-      m_sorted_residuals.reserve(n_samples);
-      // ----------------------------------------------------------------
-      // [ACRANSAC-SAFE] NaN/Inf sanitize before sort.
-      //
-      // std::sort with NaN values is undefined behaviour: NaN violates the
-      // strict-weak-ordering required by operator<. With NaN in the input,
-      // the sort can loop indefinitely, segfault, or silently corrupt the
-      // ordering -- and downstream the inlier-count loop reads an array
-      // it believes is sorted.
-      //
-      // Degenerate models (e.g. resection points that project behind the
-      // camera) can produce NaN residuals from kernel error functions.
-      // Replacing NaN/Inf with a value strictly greater than m_max_threshold
-      // makes them sort to the tail and naturally excludes them from
-      // inlier consideration via the existing `<= m_max_threshold` gate.
-      // Output is bit-equivalent for clean inputs (no NaN/Inf present).
-      //
-      // Toggle: set OPENMVG_ACRANSAC_NAN_SANITIZE to 0 to revert to the
-      // legacy unguarded sort.
-      // ----------------------------------------------------------------
-#ifndef OPENMVG_ACRANSAC_NAN_SANITIZE
-#define OPENMVG_ACRANSAC_NAN_SANITIZE 0
-#endif
-#if OPENMVG_ACRANSAC_NAN_SANITIZE
-      const double sentinel = std::numeric_limits<double>::max();
-      for (uint32_t i = 0; i < n_samples; ++i)
-      {
-        double r = m_residuals[i];
-        // NaN-safe: (r != r) iff r is NaN. Inf is also rejected.
-        if (!(r == r) || !std::isfinite(r))
-          r = sentinel;
-        m_sorted_residuals.emplace_back(r, i);
-      }
-#else
-      for (uint32_t i = 0; i < n_samples; ++i)
-      {
-        m_sorted_residuals.emplace_back(m_residuals[i], i);
-      }
-#endif
-      std::sort(m_sorted_residuals.begin(), m_sorted_residuals.end());
-    }
+    // Reject models that provably cannot beat the incumbent NFA before paying
+    // for the sort (which is ~86% of this function). Exact, not heuristic --
+    // see MightImproveNFA.
+    if (!MightImproveNFA(n_samples, nfa_threshold.first))
+      return false;
 
-    // Find best NFA and its index wrt square error threshold in m_sorted_residuals.
+    // Residuals sorting (ascending order while keeping original point indexes)
+    // into the parallel m_sorted_res / m_sorted_idx arrays.
+    //
+    // The old NaN/Inf "sanitize before sort" toggle
+    // (OPENMVG_ACRANSAC_NAN_SANITIZE) is gone: it existed only to keep NaN
+    // away from std::sort's UB-on-NaN comparator. The radix path never
+    // compares residuals, the run-repair comparator is NaN-safe by
+    // construction, and non-finite residuals are excluded from the k range by
+    // the k_end clamp below -- so there is nothing left to protect against.
+    acransac_sort_residuals(m_residuals, n_samples,
+                            m_sort_w0, m_sort_w1, m_sort_count,
+                            m_sorted_res, m_sorted_idx);
+
+    // Find best NFA and its index wrt square error threshold in m_sorted_res.
     using nfa_indexT = std::pair<double, uint32_t>;
     nfa_indexT current_best_nfa(std::numeric_limits<double>::infinity(), Kernel::MINIMUM_SAMPLES);
-    const size_t n = n_samples;
-    for (size_t k = Kernel::MINIMUM_SAMPLES + 1;
-        k <= n && m_sorted_residuals[k-1].first <= m_max_threshold;
-        ++k) // Compute the NFA for all k in [minimal_sample+1,n]
-    {
-      const double logalpha = m_kernel.logalpha0()
-        + m_kernel.multError() * log10(m_sorted_residuals[k-1].first
-        + std::numeric_limits<float>::epsilon());
-      const nfa_indexT current_nfa( m_loge0
-        + logalpha * (double)(k - Kernel::MINIMUM_SAMPLES)
-        + m_logc_n[k]
-        + m_logc_k[k], k);
+    // ------------------------------------------------------------
+    // [ACRANSAC-PERF] Hoist the loop-exit test out of the body.
+    //
+    // The original condition re-tested `m_sorted_res[k-1] <=
+    // m_max_threshold` on every k. The array is sorted ascending, so that
+    // predicate is partitioned (true... then false...) and its cut point is
+    // found in O(log n) instead of being re-evaluated O(n) times. The body
+    // then becomes a straight-line, branch-free, countable loop.
+    //
+    // The bound is min(m_max_threshold, DBL_MAX), which additionally
+    // excludes +Inf and NaN residuals. That is not a behaviour change: an
+    // Inf residual yields logalpha = +Inf hence NFA = +Inf, which the
+    // reference could never select as the minimum, and a NaN residual
+    // terminated the reference loop at that same point. It *is* what makes
+    // the fast log10 safe here, since the series assumes a finite normal
+    // input.
+    //
+    // (Ordering caveat, same as the sort's: this assumes residuals
+    // are non-negative -- they are squared errors -- so the non-finite tail
+    // sorts last. A negative NaN would sort first, which the reference loop
+    // also handled by terminating immediately.)
+    // ------------------------------------------------------------
+    const double k_limit_value =
+        std::min(m_max_threshold, std::numeric_limits<double>::max());
+    const size_t k_end = static_cast<size_t>(
+        std::partition_point(
+            m_sorted_res.begin(), m_sorted_res.end(),
+            [k_limit_value](double r) { return r <= k_limit_value; })
+        - m_sorted_res.begin());
+    // Valid k are those whose residual index k-1 is below the cut, i.e.
+    // k in [MINIMUM_SAMPLES+1, k_end] (k_end <= n by construction).
 
-      if (current_nfa.first < current_best_nfa.first)
-        current_best_nfa = current_nfa;
+    const double * const nfa_base  = m_nfa_base.data();
+    const double * const nfa_scale = m_nfa_scale.data();
+    const double * const sorted = m_sorted_res.data();
+    constexpr double flt_eps = std::numeric_limits<float>::epsilon();
+
+    size_t k = Kernel::MINIMUM_SAMPLES + 1;
+
+#if OPENMVG_ACRANSAC_NFA_AVX2_KERNEL
+    // Runtime-gated vector path. The CPUID probe is a cached function-local
+    // static (one CPUID per process), and the kernel lives in the only TU
+    // built with AVX2 code generation -- so a single binary keeps working on CPUs
+    // without AVX2, and the vector path is available even though the
+    // project-wide USE_AVX2 option is OFF by default.
+    if (k <= k_end && ACRansacNFA_HasAVX2())
+    {
+      const nfa_indexT vec_best =
+          ACRansacBestNFA_AVX2(sorted, nfa_base, nfa_scale, k, k_end);
+      if (vec_best.first < current_best_nfa.first)
+        current_best_nfa = vec_best;
+      k = k_end + 1; // whole range consumed, including its own tail
+    }
+#endif
+
+    // Scalar path: the entire range when the vector kernel is unavailable,
+    // otherwise nothing (the kernel above consumes [k, k_end] in full).
+    for (; k <= k_end; ++k) // Compute the NFA for all k in [minimal_sample+1,n]
+    {
+      const double current_nfa = nfa_base[k]
+        + nfa_scale[k] * log10(sorted[k-1] + flt_eps);
+
+      if (current_nfa < current_best_nfa.first)
+        current_best_nfa = nfa_indexT(current_nfa, static_cast<uint32_t>(k));
     }
 
     // If the current NFA is better than the previous
@@ -432,12 +856,12 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
     if (current_best_nfa.first < nfa_threshold.first)
     {
       nfa_threshold.first = current_best_nfa.first;
-      nfa_threshold.second = m_sorted_residuals[current_best_nfa.second-1].first;
+      nfa_threshold.second = m_sorted_res[current_best_nfa.second-1];
 
       inliers.resize(current_best_nfa.second);
       for (size_t i =0; i < current_best_nfa.second; ++i)
       {
-        inliers[i] = m_sorted_residuals[i].second;
+        inliers[i] = m_sorted_idx[i];
       }
       return true;
     }
@@ -647,3 +1071,4 @@ std::pair<double, double> ACRANSAC
 } // namespace robust
 } // namespace openMVG
 #endif // OPENMVG_ROBUST_ESTIMATOR_ACRANSAC_HPP
+

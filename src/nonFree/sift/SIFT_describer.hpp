@@ -16,10 +16,15 @@
 #include "openMVG/image/image_container.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <numeric>
+#include <sstream>
+#include <string>
 
 extern "C" {
 #include "nonFree/sift/vl/sift.h"
@@ -29,6 +34,74 @@ extern "C" {
 
 namespace openMVG {
 namespace features {
+
+/// Opt-in, per-image profiling of the SIFT describer.
+///
+/// Answers where extraction time actually goes, and in particular whether
+/// lowering the peak threshold costs its time in extrema DETECTION or in the
+/// per-keypoint ORIENTATION + DESCRIPTOR loop. Those imply different fixes:
+/// only the latter can be reduced by capping keypoints before description.
+///
+/// Enable with OPENMVG_SIFT_PROFILE=1; the destination CSV defaults to
+/// "sift_profile.csv" and can be set with OPENMVG_SIFT_PROFILE_CSV.
+/// Entirely inactive otherwise -- the flag is read once into a static.
+namespace sift_profile {
+
+using Clock = std::chrono::steady_clock;
+
+inline bool Enabled()
+{
+  static const bool on = []() -> bool {
+    const char * v = std::getenv("OPENMVG_SIFT_PROFILE");
+    return v != nullptr && std::atoi(v) != 0;
+  }();
+  return on;
+}
+
+struct Record
+{
+  double convert_ms = 0.0;   // uchar -> float image conversion
+  double pyramid_ms = 0.0;   // Gaussian/DoG pyramid construction (all octaves)
+  double detect_ms  = 0.0;   // vl_sift_detect: scale-space extrema detection
+  double orient_ms  = 0.0;   // vl_sift_calc_keypoint_orientations
+  double desc_ms    = 0.0;   // vl_sift_calc_keypoint_descriptor + conversion
+  double total_ms   = 0.0;
+  long long keypoints    = 0; // extrema surviving the peak/edge thresholds
+  long long orientations = 0; // emitted regions (>= keypoints; up to 4 each)
+  int       octaves      = 0;
+  std::string per_octave;     // "o0:1234 o1:567 ..." keypoints per octave
+};
+
+/// Appends one row per image. Serialised: ComputeFeatures describes images
+/// across OpenMP threads concurrently.
+inline void Emit(const Record & r, int width, int height)
+{
+  static std::mutex mtx;
+  static bool initialised = false;
+
+  const char * path_env = std::getenv("OPENMVG_SIFT_PROFILE_CSV");
+  const std::string path = path_env ? path_env : "sift_profile.csv";
+
+  std::lock_guard<std::mutex> lock(mtx);
+  // Truncate once per process so repeated runs do not accumulate stale rows.
+  std::ofstream out(path.c_str(),
+    initialised ? (std::ios::out | std::ios::app) : (std::ios::out | std::ios::trunc));
+  if (!out)
+    return;
+  if (!initialised)
+  {
+    out << "width,height,keypoints,orientations,octaves,"
+           "convert_ms,pyramid_ms,detect_ms,orient_ms,desc_ms,total_ms,per_octave\n";
+    initialised = true;
+  }
+  out << width << ',' << height << ','
+      << r.keypoints << ',' << r.orientations << ',' << r.octaves << ','
+      << r.convert_ms << ',' << r.pyramid_ms << ',' << r.detect_ms << ','
+      << r.orient_ms << ',' << r.desc_ms << ',' << r.total_ms << ','
+      << r.per_octave << '\n';
+}
+
+} // namespace sift_profile
 
 // Bibliography:
 // [1] R. Arandjelović, A. Zisserman.
@@ -176,8 +249,25 @@ public:
   )
   {
     const int w = image.Width(), h = image.Height();
+
+    // Profiling scaffolding. When disabled these are a single predictable
+    // branch per span and no clock reads at all.
+    const bool prof = sift_profile::Enabled();
+    sift_profile::Record prof_rec;
+    std::ostringstream prof_octaves;
+    using ProfClock = sift_profile::Clock;
+    const auto prof_now = [prof]() {
+      return prof ? ProfClock::now() : ProfClock::time_point{};
+    };
+    const auto prof_ms = [](ProfClock::time_point a, ProfClock::time_point b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const auto prof_t_start = prof_now();
+
     //Convert to float
+    const auto prof_t_convert0 = prof_now();
     const image::Image<float> If(image.GetMat().cast<float>());
+    if (prof) prof_rec.convert_ms = prof_ms(prof_t_convert0, ProfClock::now());
 
     // Optional runtime override of the first octave (o_min), for A/B testing
     // without recompiling. Default is unchanged: uses _params._first_octave
@@ -218,7 +308,9 @@ public:
     Descriptor<unsigned char, 128> descriptor;
 
     // Process SIFT computation
+    const auto prof_t_pyr0 = prof_now();
     vl_sift_process_first_octave(filt, If.data());
+    if (prof) prof_rec.pyramid_ms += prof_ms(prof_t_pyr0, ProfClock::now());
 
     // Build alias to cached data
     auto regions = std::unique_ptr<Regions_type>(new Regions_type);
@@ -229,10 +321,19 @@ public:
     regions->Descriptors().reserve(estimatedKeypoints);
 
     while (true) {
+      const auto prof_t_det0 = prof_now();
       vl_sift_detect(filt);
+      if (prof) prof_rec.detect_ms += prof_ms(prof_t_det0, ProfClock::now());
 
       VlSiftKeypoint const *keys  = vl_sift_get_keypoints(filt);
       const int nkeys = vl_sift_get_nkeypoints(filt);
+
+      if (prof) {
+        prof_rec.keypoints += nkeys;
+        prof_octaves << (prof_rec.octaves ? " " : "")
+                     << 'o' << prof_rec.octaves << ':' << nkeys;
+        ++prof_rec.octaves;
+      }
 
 #if 0 // Now gradient buffer free
       // Update gradient before launching parallel extraction
@@ -253,7 +354,9 @@ public:
         int nangles = 1; // by default (1 upright feature)
         if (_bOrientation)
         { // compute from 1 to 4 orientations
+          const auto prof_t_ori0 = prof_now();
           nangles = vl_sift_calc_keypoint_orientations(filt, angles, keys + i);
+          if (prof) prof_rec.orient_ms += prof_ms(prof_t_ori0, ProfClock::now());
         }
         else
         {
@@ -267,18 +370,32 @@ public:
         const float ksig = keys[i].sigma;
 
         for (int q=0 ; q < nangles ; ++q) {
+          const auto prof_t_desc0 = prof_now();
           vl_sift_calc_keypoint_descriptor(filt, &descr[0], keys + i, angles[q]);
 
           siftDescToUChar(&descr[0], descriptor, _params._root_sift);
+          if (prof) {
+            prof_rec.desc_ms += prof_ms(prof_t_desc0, ProfClock::now());
+            ++prof_rec.orientations;
+          }
 
           regions->Descriptors().push_back(descriptor);
           regions->Features().emplace_back(kx, ky, ksig, static_cast<float>(angles[q]));
         }
       }
-      if (vl_sift_process_next_octave(filt))
+      const auto prof_t_pyr1 = prof_now();
+      const int last_octave = vl_sift_process_next_octave(filt);
+      if (prof) prof_rec.pyramid_ms += prof_ms(prof_t_pyr1, ProfClock::now());
+      if (last_octave)
         break; // Last octave
     }
     vl_sift_delete(filt);
+
+    if (prof) {
+      prof_rec.total_ms   = prof_ms(prof_t_start, ProfClock::now());
+      prof_rec.per_octave = prof_octaves.str();
+      sift_profile::Emit(prof_rec, w, h);
+    }
 
     return regions;
   }
