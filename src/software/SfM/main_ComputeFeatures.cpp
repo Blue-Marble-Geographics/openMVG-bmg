@@ -34,7 +34,9 @@
 
 #include <cereal/details/helpers.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -104,38 +106,150 @@ CpuHasSSE41(void)
   return (info[2] & (1 << 19)) != 0;  /* ECX bit 19 = SSE4.1 */
 }
 
-// Returns one affinity mask per physical core (a single logical processor per
-// core, i.e. hyperthread siblings are dropped). Single processor-group only
-// (<= 64 logical CPUs), which covers typical single-socket workstations.
-static std::vector<DWORD_PTR>
-GetPhysicalCoreMasks()
+//------------------------------------------------------------------------------
+// Machine topology + memory budgeting.
+//
+// Feature extraction is embarrassingly parallel per image, but each worker
+// holds a large PRIVATE footprint (the float image plus the SIFT scale-space
+// pyramid, tens of bytes per input pixel). So the useful worker count is
+//    min( what the CPU can run , what RAM can hold )
+// and neither term alone is a good answer: one physical core per worker leaves
+// a big machine idle, while one logical processor per worker will thrash a
+// 16 GB box on 24 MP imagery. Everything below exists to compute that min.
+//------------------------------------------------------------------------------
+
+static int
+BitCount(DWORD_PTR mask)
 {
-  std::vector<DWORD_PTR> masks;
+  int n = 0;
+  for (; mask; mask &= (mask - 1))
+    ++n;
+  return n;
+}
+
+// Affinity masks for the machine's physical cores. Single processor-group only
+// (<= 64 logical CPUs), which covers typical single-socket workstations; on
+// bigger hosts the vectors come back empty and pinning is simply skipped.
+struct CoreTopology
+{
+  std::vector<DWORD_PTR> primary;   // one logical processor per physical core
+  std::vector<DWORD_PTR> shared;    // all hyperthread siblings of that core
+  int nb_logical = 0;               // logical processors in this group
+};
+
+static CoreTopology
+GetCoreTopology()
+{
+  CoreTopology topo;
+
   DWORD len = 0;
   GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-  if (len == 0)
-    return masks;
-
-  std::vector<char> buf(len);
-  auto * first = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
-  if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first, &len))
-    return masks;
-
-  char * ptr = buf.data();
-  while (ptr < buf.data() + len)
+  if (len != 0)
   {
-    auto * cur = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(ptr);
-    if (cur->Relationship == RelationProcessorCore)
+    std::vector<char> buf(len);
+    auto * first = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, first, &len))
     {
-      // GroupMask[0].Mask holds all logical procs (HT siblings) of this core;
-      // keep only the lowest set bit to pin to a single logical processor.
-      const DWORD_PTR full = cur->Processor.GroupMask[0].Mask;
-      masks.push_back(full & (~full + 1));
+      char * ptr = buf.data();
+      while (ptr < buf.data() + len)
+      {
+        auto * cur = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(ptr);
+        if (cur->Relationship == RelationProcessorCore)
+        {
+          // GroupMask[0].Mask holds all logical procs (HT siblings) of this
+          // core; its lowest set bit pins to a single logical processor.
+          const DWORD_PTR full = cur->Processor.GroupMask[0].Mask;
+          topo.shared.push_back(full);
+          topo.primary.push_back(full & (~full + 1));
+          topo.nb_logical += BitCount(full);
+        }
+        ptr += cur->Size;
+      }
     }
-    ptr += cur->Size;
   }
-  return masks;
+
+  if (topo.nb_logical == 0)
+  {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    topo.nb_logical = static_cast<int>(si.dwNumberOfProcessors);
+  }
+  return topo;
 }
+
+// Bytes of physical RAM we are willing to hand to the extraction workers.
+// Measured against what is *currently* available, so a machine that is also
+// running other work (or another pipeline stage) scales itself down, minus
+// headroom for the OS, the file cache and this process' own allocations.
+// Returns 0 if the budget cannot be established (caller then ignores memory).
+static uint64_t
+FeatureMemoryBudget()
+{
+  if (const char * env = std::getenv("OPENMVG_CF_MEM_BUDGET_MB"))
+  {
+    const long long mb = std::atoll(env);
+    if (mb > 0)
+      return static_cast<uint64_t>(mb) << 20;
+  }
+
+  MEMORYSTATUSEX ms;
+  ms.dwLength = sizeof(ms);
+  if (!GlobalMemoryStatusEx(&ms))
+    return 0;
+
+  // Reserve 1.5 GB or 10% of RAM, whichever is larger: enough to keep a 16 GB
+  // box responsive without needlessly parking 12 GB on a 128 GB one.
+  const uint64_t reserve =
+      std::max<uint64_t>(1536ull << 20, ms.ullTotalPhys / 10);
+  // Already under pressure: report a token budget rather than 0, which the
+  // caller reads as "unknown" and would answer with full concurrency. A token
+  // budget instead collapses us to the single mandatory worker.
+  return (ms.ullAvailPhys > reserve) ? (ms.ullAvailPhys - reserve) : 1;
+}
+
+// Per-worker peak footprint, expressed per pixel of the input image.
+//
+// vlfeat SIFT (num_scales = 3 => s_min = -1, s_max = 4) allocates, at the
+// resolution of the FIRST octave and then reuses those buffers for the coarser
+// ones, so this is the peak:
+//    octave  : nel * (s_max - s_min + 1) = 6 float planes
+//    dog+temp: nel * (s_max - s_min) + nel = 6 float planes
+// = 12 float planes = 48 B/px, plus the uchar image (1 B/px), its float copy
+// (4 B/px) and the regions vectors + allocator slack (~11 B/px of margin).
+// OPENMVG_SIFT_FIRST_OCTAVE=-1 upsamples 2x first, i.e. 4x those planes.
+static uint64_t
+BytesPerPixelPerWorker(const Image_describer * describer)
+{
+  if (const char * env = std::getenv("OPENMVG_CF_BYTES_PER_PIXEL"))
+  {
+    const long long v = std::atoll(env);
+    if (v > 0)
+      return static_cast<uint64_t>(v);
+  }
+
+  // dynamic_cast (not the -m string) so a describer restored from
+  // image_describer.json is classified correctly too.
+  if (dynamic_cast<const SIFT_Image_describer *>(describer))
+  {
+    const char * fo = std::getenv("OPENMVG_SIFT_FIRST_OCTAVE");
+    const bool upscale = (fo != nullptr && std::atoi(fo) < 0);
+    return upscale ? 208 : 64;
+  }
+  if (dynamic_cast<const SIFT_Anatomy_Image_describer *>(describer))
+    return 96;  // holds the whole Gaussian + DoG pyramid resident at once
+  if (dynamic_cast<const AKAZE_Image_describer *>(describer))
+    return 96;  // 4 slices x 4 float planes per octave, all octaves resident
+
+  return 96;    // unknown describer: assume the expensive case
+}
+
+// How a worker is bound to a core, once the worker count is known.
+enum class EPinMode
+{
+  NONE,               // topology unknown, or more workers than logical procs
+  CORE_EXCLUSIVE,     // <= 1 worker per physical core: pin to one sibling
+  CORE_SHARED         // oversubscribed: pin to a core, either sibling allowed
+};
 
 /// - Compute view image description (feature & descriptor extraction)
 /// - Export computed data
@@ -192,7 +306,10 @@ int main(int argc, char **argv)
         << "   HIGH,\n"
         << "   ULTRA: !!Can take long time!!\n"
 #ifdef OPENMVG_USE_OPENMP
-        << "[-n|--numThreads] number of parallel computations\n"
+        << "[-n|--numThreads] upper bound on parallel image extractions\n"
+        << "   (pass the logical thread count; 0 = use every logical\n"
+        << "    processor). The effective worker count is this value clamped\n"
+        << "    by the memory the largest images in the scene need.\n"
 #endif
       ;
 
@@ -345,24 +462,111 @@ int main(int argc, char **argv)
     for (const auto & view_it : sfm_data.views)
       vec_views.push_back(view_it.second.get());
 
-#if (!TEST_CF_SINGLE_IMAGE) || (!TEST_CF_NOTHREADING)
-#ifdef OPENMVG_USE_OPENMP
-    // Physical-core affinity masks (used only for pinning below). Dropping
-    // hyperthreads keeps one worker per core, reducing peak memory / HT contention.
-    const std::vector<DWORD_PTR> core_masks = GetPhysicalCoreMasks();
-    const unsigned int nb_physical =
-        core_masks.empty() ? omp_get_max_threads()
-                           : static_cast<unsigned int>(core_masks.size());
+    // Largest images first. With schedule(dynamic) this keeps the long tasks
+    // off the end of the run (where they would finish alone, all other workers
+    // idle), and it makes the memory bound below exact rather than pessimistic:
+    // the images resident at peak concurrency are precisely the k largest.
+    std::sort(vec_views.begin(), vec_views.end(),
+      [](const View * a, const View * b) {
+        return static_cast<uint64_t>(a->ui_width) * a->ui_height >
+               static_cast<uint64_t>(b->ui_width) * b->ui_height;
+      });
 
-    // The caller passes -n as a physical-core count: it has already performed the
-    // core/memory budgeting, so honor it directly (one pinned worker per core).
-    // Only when -n is unspecified do we default to all detected physical cores.
-    if (iNumThreads > 0) {
-        omp_set_num_threads(iNumThreads);
-    } else {
-        omp_set_num_threads(static_cast<int>(nb_physical));
+    // Pixel count per view, descending.
+    std::vector<uint64_t> view_pixels;
+    view_pixels.reserve(vec_views.size());
+    for (const View * v : vec_views)
+      view_pixels.push_back(static_cast<uint64_t>(v->ui_width) * v->ui_height);
+
+    if (!view_pixels.empty() && view_pixels.front() == 0)
+    {
+      // Scene carries no image dimensions (unusual). Probe a few headers --
+      // cheap, no pixel decode -- and assume the worst of them for all views.
+      uint64_t probed = 0;
+      const size_t nb_probe = std::min<size_t>(vec_views.size(), 16);
+      for (size_t k = 0; k < nb_probe; ++k)
+      {
+        ImageHeader hdr;
+        const std::string path =
+          stlplus::create_filespec(sfm_data.s_root_path, vec_views[k]->s_Img_path);
+        if (ReadImageHeader(path.c_str(), &hdr))
+          probed = std::max(probed,
+                            static_cast<uint64_t>(hdr.width) * hdr.height);
+      }
+      if (probed == 0)
+        probed = 40ull * 1000 * 1000;  // conservative fallback: 40 MP
+      std::fill(view_pixels.begin(), view_pixels.end(), probed);
     }
 
+#ifdef OPENMVG_USE_OPENMP
+    const CoreTopology topo = GetCoreTopology();
+    const int nb_physical =
+        topo.primary.empty() ? topo.nb_logical
+                             : static_cast<int>(topo.primary.size());
+
+    // -n is a CEILING on concurrency, not the answer: the caller says how many
+    // threads it is willing to give us (0 = every logical processor) and we
+    // spend as many of them as RAM allows. OPENMVG_CF_THREADS overrides it, so
+    // the ceiling can be retuned without touching the calling process.
+    int thread_ceiling = iNumThreads;
+    if (const char * env = std::getenv("OPENMVG_CF_THREADS"))
+    {
+      const int v = std::atoi(env);
+      if (v != 0)
+        thread_ceiling = v;
+    }
+    if (thread_ceiling <= 0)
+      thread_ceiling = topo.nb_logical;   // hyperthreads included
+    thread_ceiling = std::max(1, std::min(thread_ceiling, 4 * topo.nb_logical));
+
+    // Admit workers largest-image-first while their summed footprint fits the
+    // budget. Summing the actual top-k images beats (k * largest image) on the
+    // mixed-resolution scenes we see in practice. At least one worker always
+    // runs: a single huge image over budget must still be attempted.
+    const uint64_t bytes_per_pixel = BytesPerPixelPerWorker(image_describer.get());
+    const uint64_t mem_budget = FeatureMemoryBudget();
+
+    int nb_workers = thread_ceiling;
+    if (mem_budget > 0 && !view_pixels.empty())
+    {
+      uint64_t acc = 0;
+      int k = 0;
+      while (k < thread_ceiling && k < static_cast<int>(view_pixels.size()))
+      {
+        const uint64_t need = view_pixels[k] * bytes_per_pixel;
+        if (k > 0 && acc + need > mem_budget)
+          break;
+        acc += need;
+        ++k;
+      }
+      nb_workers = std::max(1, k);
+    }
+
+    // Pin each worker to a core to keep its large pyramid buffers cache/NUMA
+    // local. One worker per core gets a single sibling; when memory allowed us
+    // to oversubscribe, workers share a core's siblings instead.
+    const EPinMode pin_mode =
+        topo.primary.empty()               ? EPinMode::NONE
+      : (nb_workers <= nb_physical)        ? EPinMode::CORE_EXCLUSIVE
+      : (nb_workers <= topo.nb_logical)    ? EPinMode::CORE_SHARED
+                                           : EPinMode::NONE;
+
+    OPENMVG_LOG_INFO
+      << "Extraction concurrency: " << nb_workers << " worker(s)"
+      << " (ceiling " << thread_ceiling << ", "
+      << nb_physical << " physical / " << topo.nb_logical << " logical cores)"
+      << "\n  memory budget: " << (mem_budget >> 20) << " MB"
+      << ", ~" << ((view_pixels.empty()
+                     ? 0 : view_pixels.front() * bytes_per_pixel) >> 20)
+      << " MB per worker on the largest image"
+      << " (" << bytes_per_pixel << " B/px)";
+
+    omp_set_dynamic(0);   // do not let the runtime hand us fewer threads
+    omp_set_num_threads(nb_workers);
+#endif
+
+#if (!TEST_CF_SINGLE_IMAGE) || (!TEST_CF_NOTHREADING)
+#ifdef OPENMVG_USE_OPENMP
     #pragma omp parallel for schedule(dynamic) private(imageGray)
 #endif
 #endif
@@ -373,14 +577,15 @@ int main(int argc, char **argv)
 #endif
     {
 #ifdef OPENMVG_USE_OPENMP
-      // Pin each OpenMP worker to a distinct physical core exactly once, to keep
-      // its large SIFT pyramid buffers cache/NUMA-local and prevent migration.
+      // Apply the affinity decided above, once per worker thread, to prevent
+      // migration away from the cache holding its SIFT pyramid buffers.
       static thread_local bool pinned = false;
-      if (!pinned && !core_masks.empty())
+      if (!pinned && pin_mode != EPinMode::NONE)
       {
+        const std::vector<DWORD_PTR> & masks =
+          (pin_mode == EPinMode::CORE_EXCLUSIVE) ? topo.primary : topo.shared;
         const int tid = omp_get_thread_num();
-        SetThreadAffinityMask(GetCurrentThread(),
-                              core_masks[tid % core_masks.size()]);
+        SetThreadAffinityMask(GetCurrentThread(), masks[tid % masks.size()]);
         pinned = true;
       }
 #endif

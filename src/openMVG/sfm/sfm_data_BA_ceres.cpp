@@ -1252,7 +1252,20 @@ bool Bundle_Adjustment_Ceres::Adjust
   // path only). Generally yields a slightly better elimination order at
   // the cost of one extra Jacobian-matrix copy in memory. Same linear
   // system, same numerical result -- pure time/memory tradeoff.
-  if (ceres_config_options.linear_solver_type == ceres::SPARSE_SCHUR)
+  //
+  // MEMORY: the extra copy scales with the observation count, so on large
+  // scenes it is measured in GB, not MB. A 1940-pose / 25M-observation run
+  // peaked at 54.4 GB of 68.4 GB with only ~1 GB of headroom left -- and that
+  // was on the ITERATIVE_SCHUR path, which never takes this copy. Enabling it
+  // there would likely have exhausted RAM. Set this to 0 on memory-bound
+  // scenes; the only cost is a slightly worse elimination order.
+  //   1 = post-ordering on (Ceres/stock behaviour, faster factorisation)
+  //   0 = post-ordering off (saves one Jacobian-sized allocation)
+#ifndef OPENMVG_BA_USE_POSTORDERING
+#define OPENMVG_BA_USE_POSTORDERING 1
+#endif
+  if (OPENMVG_BA_USE_POSTORDERING &&
+      ceres_config_options.linear_solver_type == ceres::SPARSE_SCHUR)
   {
     ceres_config_options.use_postordering = true;
   }
