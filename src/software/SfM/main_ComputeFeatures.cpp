@@ -177,14 +177,18 @@ GetCoreTopology()
   return topo;
 }
 
-// Bytes of physical RAM we are willing to hand to the extraction workers.
-// Measured against what is *currently* available, so a machine that is also
-// running other work (or another pipeline stage) scales itself down, minus
+// Bytes of physical RAM we are willing to hand to the extraction workers, minus
 // headroom for the OS, the file cache and this process' own allocations.
 // Returns 0 if the budget cannot be established (caller then ignores memory).
 static uint64_t
-FeatureMemoryBudget()
+FeatureMemoryBudget(uint64_t * total_out, uint64_t * avail_out)
 {
+  MEMORYSTATUSEX ms;
+  ms.dwLength = sizeof(ms);
+  const bool ok = (GlobalMemoryStatusEx(&ms) != 0);
+  if (total_out) *total_out = ok ? ms.ullTotalPhys : 0;
+  if (avail_out) *avail_out = ok ? ms.ullAvailPhys : 0;
+
   if (const char * env = std::getenv("OPENMVG_CF_MEM_BUDGET_MB"))
   {
     const long long mb = std::atoll(env);
@@ -192,19 +196,31 @@ FeatureMemoryBudget()
       return static_cast<uint64_t>(mb) << 20;
   }
 
-  MEMORYSTATUSEX ms;
-  ms.dwLength = sizeof(ms);
-  if (!GlobalMemoryStatusEx(&ms))
+  if (!ok)
     return 0;
 
-  // Reserve 1.5 GB or 10% of RAM, whichever is larger: enough to keep a 16 GB
-  // box responsive without needlessly parking 12 GB on a 128 GB one.
+  // What we can actually spend. Windows counts only the free + standby lists as
+  // "available": memory parked in ANOTHER process' working set is excluded even
+  // when it is idle and the OS would trim it the moment we asked for it. Taking
+  // ullAvailPhys literally therefore collapses a 16-core box to two workers
+  // whenever the host application happens to be holding a large idle heap --
+  // measured in the field: 3.2 GB reported available of 16 GB installed. So
+  // treat half of installed RAM as spendable when the reported figure is below
+  // that; above it, the reported figure is the honest constraint and wins.
+  const uint64_t usable =
+      std::max<uint64_t>(ms.ullAvailPhys, ms.ullTotalPhys / 2);
+
+  // Headroom on top of that: 10% of RAM, floored at 1.5 GB so a small box stays
+  // responsive and capped at 4 GB because the need is roughly absolute -- it
+  // does not grow with RAM, and scaling it would park 12 GB on a 128 GB host.
   const uint64_t reserve =
-      std::max<uint64_t>(1536ull << 20, ms.ullTotalPhys / 10);
-  // Already under pressure: report a token budget rather than 0, which the
-  // caller reads as "unknown" and would answer with full concurrency. A token
-  // budget instead collapses us to the single mandatory worker.
-  return (ms.ullAvailPhys > reserve) ? (ms.ullAvailPhys - reserve) : 1;
+      std::min<uint64_t>(4096ull << 20,
+        std::max<uint64_t>(1536ull << 20, ms.ullTotalPhys / 10));
+
+  // Under real pressure: report a token budget rather than 0, which the caller
+  // reads as "unknown" and would answer with full concurrency. A token budget
+  // instead collapses us to the single mandatory worker.
+  return (usable > reserve) ? (usable - reserve) : 1;
 }
 
 // Per-worker peak footprint, expressed per pixel of the input image.
@@ -524,7 +540,8 @@ int main(int argc, char **argv)
     // mixed-resolution scenes we see in practice. At least one worker always
     // runs: a single huge image over budget must still be attempted.
     const uint64_t bytes_per_pixel = BytesPerPixelPerWorker(image_describer.get());
-    const uint64_t mem_budget = FeatureMemoryBudget();
+    uint64_t phys_total = 0, phys_avail = 0;
+    const uint64_t mem_budget = FeatureMemoryBudget(&phys_total, &phys_avail);
 
     int nb_workers = thread_ceiling;
     if (mem_budget > 0 && !view_pixels.empty())
@@ -555,6 +572,8 @@ int main(int argc, char **argv)
       << "Extraction concurrency: " << nb_workers << " worker(s)"
       << " (ceiling " << thread_ceiling << ", "
       << nb_physical << " physical / " << topo.nb_logical << " logical cores)"
+      << "\n  RAM: " << (phys_total >> 20) << " MB installed, "
+      << (phys_avail >> 20) << " MB reported available"
       << "\n  memory budget: " << (mem_budget >> 20) << " MB"
       << ", ~" << ((view_pixels.empty()
                      ? 0 : view_pixels.front() * bytes_per_pixel) >> 20)
