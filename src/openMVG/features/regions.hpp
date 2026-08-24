@@ -9,6 +9,7 @@
 #ifndef OPENMVG_FEATURES_REGIONS_HPP
 #define OPENMVG_FEATURES_REGIONS_HPP
 
+#include <cstdint>
 #include <string>
 #include <openMVG/features/feature.hpp>
 #include <openMVG/features/feature_container.hpp>
@@ -70,6 +71,22 @@ public:
     size_t i,
     const Regions *,
     size_t j) const = 0;
+
+  /// Batched form of SquaredDescriptorDistance: squared distances between
+  /// region i of this container and regions j_indices[0..count) of other.
+  /// The single-pair form has to resolve the concrete type of `other` on every
+  /// call (a dynamic_cast); overriding this resolves it once per batch instead,
+  /// which matters in the guided matching inner loops.
+  virtual void SquaredDescriptorDistances(
+    size_t i,
+    const Regions * other,
+    const uint32_t * j_indices,
+    size_t count,
+    double * out) const
+  {
+    for (size_t k = 0; k < count; ++k)
+      out[k] = SquaredDescriptorDistance(i, other, j_indices[k]);
+  }
 
   /// Add the Inth region to another Region container
   virtual void CopyRegion(size_t i, Regions *) const = 0;

@@ -9,6 +9,9 @@
 #ifndef OPENMVG_FEATURES_SCALAR_REGIONS_HPP
 #define OPENMVG_FEATURES_SCALAR_REGIONS_HPP
 
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <typeinfo>
 
 #include "../../P2PUtils.h"
@@ -129,6 +132,31 @@ public:
     const Scalar_Regions<FeatT, T, L> * regionsT = dynamic_cast<const Scalar_Regions<FeatT, T, L> *>(regions);
     matching::L2<T> metric;
     return metric(vec_descs_[i].data(), regionsT->vec_descs_[j].data(), DescriptorT::static_size);
+  }
+
+  // Batched L2: resolve the concrete type of the other container once, then run
+  // the metric over the whole candidate list.
+  void SquaredDescriptorDistances(
+    size_t i,
+    const Regions * regions,
+    const uint32_t * j_indices,
+    size_t count,
+    double * out) const override
+  {
+    assert(i < vec_descs_.size());
+    assert(regions);
+
+    const Scalar_Regions<FeatT, T, L> * regionsT = dynamic_cast<const Scalar_Regions<FeatT, T, L> *>(regions);
+    if (!regionsT)
+    {
+      std::fill(out, out + count, std::numeric_limits<double>::max());
+      return;
+    }
+    const matching::L2<T> metric;
+    const T * const lhs = vec_descs_[i].data();
+    const DescsT & rhs = regionsT->vec_descs_;
+    for (size_t k = 0; k < count; ++k)
+      out[k] = metric(lhs, rhs[j_indices[k]].data(), DescriptorT::static_size);
   }
 
   /// Add the Inth region to another Region container

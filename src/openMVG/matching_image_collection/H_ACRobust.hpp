@@ -174,8 +174,11 @@ struct GeometricFilter_HMatrix_AC
         PointsToMat(cam_I, pointsFeaturesI, xI);
         PointsToMat(cam_J, pointsFeaturesJ, xJ);
 
-        geometry_aware::GuidedMatching
-          <Mat3, openMVG::homography::kernel::AsymmetricError>(
+        // Grid restricted variant: same result as the exhaustive
+        // GuidedMatching<Mat3, AsymmetricError>, but a homography predicts a
+        // single right position per left point, so only the cells around that
+        // prediction are searched.
+        geometry_aware::GuidedMatching_Homography_Grid(
           m_H, xI, xJ, Square(m_dPrecision_robust), matches);
 
         // Remove duplicates

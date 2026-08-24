@@ -9,6 +9,9 @@
 #ifndef OPENMVG_FEATURES_BINARY_REGIONS_HPP
 #define OPENMVG_FEATURES_BINARY_REGIONS_HPP
 
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <typeinfo>
 
 #include "../../P2PUtils.h"
@@ -133,6 +136,35 @@ public:
     const typename matching::Hamming<unsigned char>::ResultType descDist =
       metric(vec_descs_[i].data(), regionsT->vec_descs_[j].data(), DescriptorT::static_size);
     return descDist * descDist;
+  }
+
+  // Batched squared Hamming: resolve the concrete type of the other container
+  // once, then run the metric over the whole candidate list.
+  void SquaredDescriptorDistances(
+    size_t i,
+    const Regions * regions,
+    const uint32_t * j_indices,
+    size_t count,
+    double * out) const override
+  {
+    assert(i < vec_descs_.size());
+    assert(regions);
+
+    const Binary_Regions<FeatT, L> * regionsT = dynamic_cast<const Binary_Regions<FeatT, L> *>(regions);
+    if (!regionsT)
+    {
+      std::fill(out, out + count, std::numeric_limits<double>::max());
+      return;
+    }
+    const matching::Hamming<unsigned char> metric;
+    const unsigned char * const lhs = vec_descs_[i].data();
+    const DescsT & rhs = regionsT->vec_descs_;
+    for (size_t k = 0; k < count; ++k)
+    {
+      const double d = static_cast<double>(
+        metric(lhs, rhs[j_indices[k]].data(), DescriptorT::static_size));
+      out[k] = d * d;
+    }
   }
 
   /// Add the Inth region to another Region container

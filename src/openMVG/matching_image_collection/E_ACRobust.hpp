@@ -200,10 +200,10 @@ struct GeometricFilter_EMatrix_AC
         regionsI = regions_provider->get(iIndex),
         regionsJ = regions_provider->get(jIndex);
 
-      geometry_aware::GuidedMatching<
-        Mat3,
-        openMVG::fundamental::kernel::EpipolarDistanceError>(
-          //openMVG::fundamental::kernel::SymmetricEpipolarDistanceError>(
+      // Epipolar-band restricted variant: same result as the exhaustive
+      // GuidedMatching<Mat3, EpipolarDistanceError>, without testing every
+      // left/right region combination.
+      geometry_aware::GuidedMatching_Fundamental_Grid(
           F,
           cam_I, *regionsI,
           cam_J, *regionsJ,

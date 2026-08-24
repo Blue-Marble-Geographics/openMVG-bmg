@@ -10,6 +10,8 @@
 #define OPENMVG_ROBUST_ESTIMATION_GUIDED_MATCHING_HPP
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -220,6 +222,323 @@ void GuidedMatching(
       // save the best corresponding index
       vec_corresponding_index.push_back(matching::IndMatch(i,dR.idx));
     }
+  }
+
+  // Remove duplicates (when multiple points at same position exist)
+  matching::IndMatch::getDeduplicated(vec_corresponding_index);
+}
+
+/// Uniform bucket grid over a 2D point set, stored CSR style
+/// (two flat arrays instead of a vector of vectors, so building it is a
+/// couple of linear passes and no per-cell allocation).
+/// Bounds come from the data rather than from the image size, so undistorted
+/// positions falling outside the image frame are still indexed.
+struct PointGrid2D
+{
+  double min_x = 0.0, min_y = 0.0;
+  double cell_size = 1.0, inv_cell_size = 1.0;
+  int nx = 0, ny = 0;
+  std::vector<uint32_t> cell_begin; // size nx*ny+1
+  std::vector<uint32_t> indices;    // size = number of points
+
+  /// Build the grid. `min_cell_size` is a lower bound on the cell size (the
+  /// caller passes the matching tolerance, since cells smaller than the
+  /// tolerance only add traversal overhead).
+  void Build(const std::vector<Vec2> & points, double min_cell_size)
+  {
+    nx = ny = 0;
+    cell_begin.clear();
+    indices.clear();
+    if (points.empty())
+      return;
+
+    double max_x = points[0](0), max_y = points[0](1);
+    min_x = max_x;
+    min_y = max_y;
+    for (const Vec2 & p : points)
+    {
+      min_x = std::min(min_x, p(0)); max_x = std::max(max_x, p(0));
+      min_y = std::min(min_y, p(1)); max_y = std::max(max_y, p(1));
+    }
+    const double w = std::max(max_x - min_x, 1.0);
+    const double h = std::max(max_y - min_y, 1.0);
+
+    // Aim at ~1 point per cell: that keeps the number of cells visited along a
+    // query and the number of points tested per cell in the same ballpark,
+    // and bounds the grid memory at O(#points).
+    const double density_cell = std::sqrt(w * h / static_cast<double>(points.size()));
+    cell_size = std::max(std::max(min_cell_size, density_cell), 1e-3);
+    inv_cell_size = 1.0 / cell_size;
+
+    nx = static_cast<int>(w * inv_cell_size) + 1;
+    ny = static_cast<int>(h * inv_cell_size) + 1;
+
+    // Counting sort of the point indices into the cells.
+    const size_t cell_count = static_cast<size_t>(nx) * static_cast<size_t>(ny);
+    cell_begin.assign(cell_count + 1, 0);
+    std::vector<uint32_t> cell_of_point(points.size());
+    for (size_t i = 0; i < points.size(); ++i)
+    {
+      const uint32_t c = CellOf(points[i]);
+      cell_of_point[i] = c;
+      ++cell_begin[c + 1];
+    }
+    for (size_t c = 0; c < cell_count; ++c)
+      cell_begin[c + 1] += cell_begin[c];
+
+    indices.resize(points.size());
+    std::vector<uint32_t> cursor(cell_begin.begin(), cell_begin.end() - 1);
+    for (size_t i = 0; i < points.size(); ++i)
+      indices[cursor[cell_of_point[i]]++] = static_cast<uint32_t>(i);
+  }
+
+  inline int ClampX(double x) const
+  {
+    const int gx = static_cast<int>(std::floor((x - min_x) * inv_cell_size));
+    return std::min(std::max(gx, 0), nx - 1);
+  }
+
+  inline int ClampY(double y) const
+  {
+    const int gy = static_cast<int>(std::floor((y - min_y) * inv_cell_size));
+    return std::min(std::max(gy, 0), ny - 1);
+  }
+
+  inline uint32_t CellOf(const Vec2 & p) const
+  {
+    return static_cast<uint32_t>(ClampY(p(1)) * nx + ClampX(p(0)));
+  }
+
+  /// Upper bounds of the gridded area (the lower bounds are min_x / min_y).
+  inline double MaxX() const { return min_x + nx * cell_size; }
+  inline double MaxY() const { return min_y + ny * cell_size; }
+
+  /// Append the point indices of the cells in the inclusive row/column range.
+  inline void Gather(int gx0, int gx1, int gy0, int gy1,
+                     std::vector<uint32_t> & out) const
+  {
+    for (int gy = gy0; gy <= gy1; ++gy)
+    {
+      const size_t row = static_cast<size_t>(gy) * static_cast<size_t>(nx);
+      const uint32_t begin = cell_begin[row + gx0];
+      const uint32_t end   = cell_begin[row + gx1 + 1];
+      out.insert(out.end(), indices.begin() + begin, indices.begin() + end);
+    }
+  }
+};
+
+/// Fill `positions` with the (optionally undistorted) region positions.
+inline void RegionPositions(
+  const cameras::IntrinsicBase * cam,
+  const features::Regions & regions,
+  std::vector<Vec2> & positions)
+{
+  const size_t count = regions.RegionCount();
+  positions.resize(count);
+  for (size_t i = 0; i < count; ++i)
+  {
+    positions[i] = cam ? cam->get_ud_pixel(regions.GetRegionPosition(i))
+                       : regions.GetRegionPosition(i);
+  }
+}
+
+/// Guided Matching for a fundamental matrix (features + descriptors with
+/// distance ratio).
+///
+/// Same result as
+///   GuidedMatching<Mat3, fundamental::kernel::EpipolarDistanceError>(...)
+/// but it does not evaluate every left/right combination:
+///  - the epipolar line of a left point is computed once (the generic version
+///    recomputes F*x inside the inner loop, once per right point),
+///  - only the right points bucketed near that line are tested, using a grid
+///    walk along the line's dominant axis,
+///  - the descriptor distances of the surviving candidates are computed in one
+///    batched call, so the concrete Regions type is resolved once per left
+///    point instead of once per candidate.
+///
+/// The candidate set is a strict superset of the points within `errorTh`, so no
+/// match that the exhaustive version would report is lost.
+inline void GuidedMatching_Fundamental_Grid(
+  const Mat3 & F,       // The fundamental matrix
+  const cameras::IntrinsicBase * camL, // Optional camera (undistort on the fly, can be nullptr)
+  const features::Regions & lRegions,  // regions (point features & corresponding descriptors)
+  const cameras::IntrinsicBase * camR, // Optional camera (undistort on the fly, can be nullptr)
+  const features::Regions & rRegions,  // regions (point features & corresponding descriptors)
+  double errorTh,       // Maximal authorized squared error threshold
+  double distRatio,     // Maximal authorized squared distance ratio
+  matching::IndMatches & vec_corresponding_index) // Output corresponding index
+{
+  if (lRegions.RegionCount() == 0 || rRegions.RegionCount() == 0)
+    return;
+
+  // Un-distort the positions once.
+  std::vector<Vec2> lRegionsPos, rRegionsPos;
+  RegionPositions(camL, lRegions, lRegionsPos);
+  RegionPositions(camR, rRegions, rRegionsPos);
+
+  // Half width of the epipolar band, in pixels.
+  const double band = std::sqrt(std::max(errorTh, 0.0));
+
+  PointGrid2D grid;
+  grid.Build(rRegionsPos, 2.0 * band);
+  if (grid.nx == 0 || grid.ny == 0)
+    return;
+
+  std::vector<uint32_t> cells_candidates, candidates;
+  std::vector<double> descriptor_distances;
+
+  for (size_t i = 0; i < lRegionsPos.size(); ++i)
+  {
+    // Epipolar line of the left point in the right image: hoisted out of the
+    // candidate loop, unlike the generic implementation.
+    const Vec3 line = F * lRegionsPos[i].homogeneous();
+    const double a = line(0), b = line(1), c = line(2);
+    const double norm2 = a * a + b * b;
+    if (!(norm2 > 0.0))
+      continue; // degenerate line: the exhaustive version rejects it too
+
+    // Test |a.x + b.y + c|^2 < errorTh * (a^2 + b^2) instead of dividing.
+    const double line_threshold = errorTh * norm2;
+    const double norm = std::sqrt(norm2);
+
+    // Walk the grid along the line's dominant axis and collect the cells the
+    // band overlaps.
+    cells_candidates.clear();
+    if (std::abs(b) >= std::abs(a))
+    {
+      // |b| > 0 here: solve for y over each column's x range.
+      const double dy = band * norm / std::abs(b); // band half height, in y
+      for (int gx = 0; gx < grid.nx; ++gx)
+      {
+        const double x0 = grid.min_x + gx * grid.cell_size;
+        const double x1 = x0 + grid.cell_size;
+        const double y0 = -(a * x0 + c) / b;
+        const double y1 = -(a * x1 + c) / b;
+        const double lo = std::min(y0, y1) - dy;
+        const double hi = std::max(y0, y1) + dy;
+        if (hi < grid.min_y || lo > grid.MaxY())
+          continue; // the band misses this column entirely
+        grid.Gather(gx, gx, grid.ClampY(lo), grid.ClampY(hi), cells_candidates);
+      }
+    }
+    else
+    {
+      // |a| > 0 here: solve for x over each row's y range.
+      const double dx = band * norm / std::abs(a); // band half width, in x
+      for (int gy = 0; gy < grid.ny; ++gy)
+      {
+        const double y0 = grid.min_y + gy * grid.cell_size;
+        const double y1 = y0 + grid.cell_size;
+        const double x0 = -(b * y0 + c) / a;
+        const double x1 = -(b * y1 + c) / a;
+        const double lo = std::min(x0, x1) - dx;
+        const double hi = std::max(x0, x1) + dx;
+        if (hi < grid.min_x || lo > grid.MaxX())
+          continue; // the band misses this row entirely
+        grid.Gather(grid.ClampX(lo), grid.ClampX(hi), gy, gy, cells_candidates);
+      }
+    }
+
+    // Keep the candidates that really are within the band.
+    candidates.clear();
+    for (const uint32_t j : cells_candidates)
+    {
+      const Vec2 & p = rRegionsPos[j];
+      const double signed_distance = a * p(0) + b * p(1) + c;
+      if (signed_distance * signed_distance < line_threshold)
+        candidates.push_back(j);
+    }
+    if (candidates.size() < 2)
+      continue; // the distance ratio needs a best and a second best
+
+    // The grid walk visits the right regions out of order. Restore ascending
+    // index order so that equal descriptor distances break the same way they
+    // do in the exhaustive version (distanceRatio::update keeps the first).
+    std::sort(candidates.begin(), candidates.end());
+
+    // One batched descriptor distance call per left point.
+    descriptor_distances.resize(candidates.size());
+    lRegions.SquaredDescriptorDistances(
+      i, &rRegions, candidates.data(), candidates.size(),
+      descriptor_distances.data());
+
+    distanceRatio<double> dR;
+    for (size_t k = 0; k < candidates.size(); ++k)
+      dR.update(candidates[k], descriptor_distances[k]);
+
+    // Add correspondence only iff the distance ratio is valid
+    if (dR.isValid(distRatio))
+      vec_corresponding_index.emplace_back(
+        static_cast<IndexT>(i), static_cast<IndexT>(dR.idx));
+  }
+
+  // Remove duplicates (when multiple points at same position exist)
+  matching::IndMatch::getDeduplicated(vec_corresponding_index);
+}
+
+/// Guided Matching for a homography (positions only).
+///
+/// Same result as
+///   GuidedMatching<Mat3, homography::kernel::AsymmetricError>(...)
+/// but a homography maps a left point to a single predicted right position, so
+/// the candidates are just the grid cells within the error radius of that
+/// prediction instead of every right point.
+inline void GuidedMatching_Homography_Grid(
+  const Mat3 & H,     // The homography
+  const Mat & xLeft,  // The left data points
+  const Mat & xRight, // The right data points
+  double errorTh,     // Maximal authorized squared error threshold
+  matching::IndMatches & vec_corresponding_index) // Output corresponding index
+{
+  assert(xLeft.rows() == xRight.rows());
+  if (xLeft.cols() == 0 || xRight.cols() == 0)
+    return;
+
+  std::vector<Vec2> rPos(xRight.cols());
+  for (Eigen::Index j = 0; j < xRight.cols(); ++j)
+    rPos[j] = xRight.col(j).head<2>();
+
+  const double radius = std::sqrt(std::max(errorTh, 0.0));
+
+  PointGrid2D grid;
+  grid.Build(rPos, 2.0 * radius);
+  if (grid.nx == 0 || grid.ny == 0)
+    return;
+
+  for (Eigen::Index i = 0; i < xLeft.cols(); ++i)
+  {
+    const Vec3 projected = H * xLeft.col(i).head<2>().homogeneous();
+    if (projected(2) == 0.0)
+      continue; // point at infinity: the exhaustive version rejects it too
+    const Vec2 p = projected.hnormalized();
+
+    const int gx0 = grid.ClampX(p(0) - radius), gx1 = grid.ClampX(p(0) + radius);
+    const int gy0 = grid.ClampY(p(1) - radius), gy1 = grid.ClampY(p(1) + radius);
+
+    double min_error = std::numeric_limits<double>::max();
+    uint32_t best = 0;
+    for (int gy = gy0; gy <= gy1; ++gy)
+    {
+      const size_t row = static_cast<size_t>(gy) * static_cast<size_t>(grid.nx);
+      const uint32_t begin = grid.cell_begin[row + gx0];
+      const uint32_t end   = grid.cell_begin[row + gx1 + 1];
+      for (uint32_t k = begin; k < end; ++k)
+      {
+        const uint32_t j = grid.indices[k];
+        const double error = (rPos[j] - p).squaredNorm();
+        // The `j < best` tie-break reproduces the exhaustive version, which
+        // scans in ascending index order and keeps the first best.
+        if (error < errorTh &&
+            (error < min_error || (error == min_error && j < best)))
+        {
+          min_error = error;
+          best = j;
+        }
+      }
+    }
+    if (min_error < errorTh)
+      vec_corresponding_index.emplace_back(
+        static_cast<IndexT>(i), static_cast<IndexT>(best));
   }
 
   // Remove duplicates (when multiple points at same position exist)

@@ -76,15 +76,21 @@ void ImageCollectionGeometricFilter::Robust_model_estimation
     my_progress_bar = &system::ProgressInterface::dummy();
   my_progress_bar->Restart( putative_matches.size(), "- Geometric filtering -" );
 
+  // Index the map entries up front: advancing a map iterator per loop index
+  // costs O(i) each time, i.e. O(#pairs^2) walks over the map in total.
+  std::vector<PairWiseMatches::const_iterator> pair_iterators;
+  pair_iterators.reserve(putative_matches.size());
+  for (auto it = putative_matches.begin(); it != putative_matches.end(); ++it)
+    pair_iterators.push_back(it);
+
 #ifdef OPENMVG_USE_OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
-  for (int i = 0; i < (int)putative_matches.size(); ++i)
+  for (int i = 0; i < (int)pair_iterators.size(); ++i)
   {
     if (my_progress_bar->hasBeenCanceled())
       continue;
-    auto iter = putative_matches.begin();
-    advance(iter,i);
+    const auto iter = pair_iterators[i];
 
     Pair current_pair = iter->first;
     const std::vector<IndMatch> & vec_PutativeMatches = iter->second;
