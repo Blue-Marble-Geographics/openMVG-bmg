@@ -24,6 +24,7 @@
 #include "openMVG/sfm/sfm_data_BA_ceres_analytic_radial3.hpp"
 #include "openMVG/sfm/sfm_data_transform.hpp"
 #include "openMVG/sfm/sfm_data.hpp"
+#include "openMVG/sfm/sfm_logging.hpp"
 #include "openMVG/system/logger.hpp"
 #include "openMVG/types.hpp"
 
@@ -45,6 +46,13 @@ namespace openMVG {
 namespace sfm {
 
 #define OPENMVG_CERES_HAS_MANIFOLD ((CERES_VERSION_MAJOR * 100 + CERES_VERSION_MINOR) >= 201)
+
+// Compile-time half of the [BA-DIAG] gate (see sfm_logging.hpp). The runtime
+// half remains `ceres_options_.bVerbose_`; both must be on. Written as a
+// constexpr bool rather than an `#if` so the guarded code keeps being compiled
+// -- with the switch at 0 the `&&` folds and the blocks (including the full
+// observation traversals they perform) are dead-code eliminated.
+static constexpr bool kBADiagLogging = (OPENMVG_SFM_VERBOSE_BA != 0);
 
 // Toggle: Ceres inner iterations (re-solve structure between LM outer steps).
 //   1 = S3 reference behaviour (use_inner_iterations_ = true).
@@ -617,11 +625,13 @@ bool Bundle_Adjustment_Ceres::Adjust
   const Optimize_Options & options
 )
 {
-  // [BA-PERF] Always-on per-Adjust() timing. Cheap (a few clock reads),
-  // unconditional so release builds still tell us where time goes.
+#if OPENMVG_SFM_VERBOSE_BA
+  // [BA-PERF] Per-Adjust() timing. Cheap (a few clock reads) but it fires on
+  // every BA call, so it is compiled out with the rest of the BA diagnostics.
   using clk = std::chrono::steady_clock;
   const auto t_adjust_begin = clk::now();
   clk::time_point t_setup_done;  // populated just before ceres::Solve
+#endif
   //----------
   // Add camera parameters
   // - intrinsics
@@ -639,7 +649,7 @@ bool Bundle_Adjustment_Ceres::Adjust
   size_t total_obs_in = 0;
   for (const auto & lm : sfm_data.GetLandmarks())
     total_obs_in += lm.second.obs.size();
-  if (ceres_options_.bVerbose_)
+  if (kBADiagLogging && ceres_options_.bVerbose_)
   {
     OPENMVG_LOG_INFO
       << "[BA-DIAG:Enter] #views=" << sfm_data.GetViews().size()
@@ -678,7 +688,7 @@ bool Bundle_Adjustment_Ceres::Adjust
 
       // [BA-DIAG] How many usable priors did we find? A low count relative to
       // #poses suggests the seed pod lost prior linkage.
-      if (ceres_options_.bVerbose_)
+      if (kBADiagLogging && ceres_options_.bVerbose_)
       {
         OPENMVG_LOG_INFO
           << "[BA-DIAG:Prior] Collected " << X_SfM.size()
@@ -696,7 +706,7 @@ bool Bundle_Adjustment_Ceres::Adjust
         const double lmeds_median = openMVG::robust::LeastMedianOfSquares(kernel, &sim);
 
         // [BA-DIAG] LMedS result: if max(), registration failed and prior is unusable.
-        if (ceres_options_.bVerbose_)
+        if (kBADiagLogging && ceres_options_.bVerbose_)
         {
           OPENMVG_LOG_INFO
             << "[BA-DIAG:Prior] LMedS median residual: " << lmeds_median
@@ -718,7 +728,7 @@ bool Bundle_Adjustment_Ceres::Adjust
 
           // [BA-DIAG] Post-registration residual stats help detect degenerate
           // priors (e.g., all zeros, or a single-flight-line configuration).
-          if (ceres_options_.bVerbose_)
+          if (kBADiagLogging && ceres_options_.bVerbose_)
           {
             const double res_min = residual(0);
             const double res_max = residual(residual.size() - 1);
@@ -1043,7 +1053,7 @@ bool Bundle_Adjustment_Ceres::Adjust
       problem.SetParameterBlockConstant(structure_landmark_it.second.X.data());
   }
 
-  if (ceres_options_.bVerbose_)
+  if (kBADiagLogging && ceres_options_.bVerbose_)
   {
     OPENMVG_LOG_INFO
       << "[BA-DIAG:Build] Residual blocks added: " << residuals_added
@@ -1181,7 +1191,7 @@ bool Bundle_Adjustment_Ceres::Adjust
         ++prior_blocks;
       }
     }
-    if (ceres_options_.bVerbose_)
+    if (kBADiagLogging && ceres_options_.bVerbose_)
     {
       OPENMVG_LOG_INFO
         << "[BA-DIAG:Prior] Added " << prior_blocks << " pose-center prior residual block(s)"
@@ -1293,7 +1303,7 @@ bool Bundle_Adjustment_Ceres::Adjust
   }
 #endif
 
-  if (ceres_options_.bVerbose_)
+  if (kBADiagLogging && ceres_options_.bVerbose_)
   {
     OPENMVG_LOG_INFO
       << "[BA-DIAG:Solve] linear_solver=" << ceres_config_options.linear_solver_type
@@ -1323,7 +1333,9 @@ bool Bundle_Adjustment_Ceres::Adjust
 
   // Solve BA
   ceres::Solver::Summary summary;
+#if OPENMVG_SFM_VERBOSE_BA
   t_setup_done = clk::now();
+#endif
   ceres::Solve(ceres_config_options, &problem, &summary);
   if (ceres_options_.bCeres_summary_)
     OPENMVG_LOG_INFO << summary.FullReport();
@@ -1341,7 +1353,7 @@ bool Bundle_Adjustment_Ceres::Adjust
     default: break;
   }
 
-  // [BA-PERF] One-line, always-on per-Adjust() timing breakdown:
+  // [BA-PERF] One-line per-Adjust() timing breakdown:
   //   our_setup = time spent building the ceres::Problem (param + residual
   //               adds, manifolds, prior blocks). Our own contribution.
   //   ceres_pre = ceres internal preprocessor (program ordering, residual
@@ -1351,6 +1363,7 @@ bool Bundle_Adjustment_Ceres::Adjust
   //   adjust    = total Adjust() wall time so far (== our_setup + ceres_pre
   //               + solve + write-back/teardown that follows).
   //   res       = residuals; iters = trust-region iterations.
+#if OPENMVG_SFM_VERBOSE_BA
   {
     const double t_adjust =
       std::chrono::duration<double>(clk::now() - t_adjust_begin).count();
@@ -1367,6 +1380,7 @@ bool Bundle_Adjustment_Ceres::Adjust
       << " | solver=" << ceres::LinearSolverTypeToString(summary.linear_solver_type_used)
       << " precond=" << ceres::PreconditionerTypeToString(summary.preconditioner_type_used);
   }
+#endif // OPENMVG_SFM_VERBOSE_BA
 
   // [BA-TUNE] Thread-count tuning diagnostic. Designed so you can sweep
   // OMP_NUM_THREADS (or ceres_options_.nb_threads_) and compare runs.
@@ -1394,6 +1408,7 @@ bool Bundle_Adjustment_Ceres::Adjust
   //   }
   // Pick the thread count with the biggest `resit_per_sec` (or smallest
   // `solve_per_iter`) before the curve flattens / regresses.
+#if OPENMVG_SFM_VERBOSE_BA
   {
     const int actual_threads = ceres_config_options.num_threads;
     const double solve_s = summary.minimizer_time_in_seconds;
@@ -1426,7 +1441,8 @@ bool Bundle_Adjustment_Ceres::Adjust
       << " | res=" << residuals
       << " term=" << termination_str;
   }
-  if (ceres_options_.bVerbose_)
+#endif // OPENMVG_SFM_VERBOSE_BA
+  if (kBADiagLogging && ceres_options_.bVerbose_)
   {
     OPENMVG_LOG_INFO
       << "[BA-DIAG:Solve] termination=" << termination_str
@@ -1468,7 +1484,7 @@ bool Bundle_Adjustment_Ceres::Adjust
   }
   else // Solution is usable
   {
-    if (ceres_options_.bVerbose_)
+    if (kBADiagLogging && ceres_options_.bVerbose_)
     {
       // Display statistics about the minimization
       OPENMVG_LOG_INFO
@@ -1488,7 +1504,7 @@ bool Bundle_Adjustment_Ceres::Adjust
     // [BA-DIAG] Detect non-finite pose parameters BEFORE we write them back
     // to sfm_data. Gated on bVerbose_; the robust-BA loop now catches the
     // resulting bad poses via median-residual ejection regardless.
-    if (ceres_options_.bVerbose_)
+    if (kBADiagLogging && ceres_options_.bVerbose_)
     {
       size_t nonfinite_param_blocks = 0;
       for (const auto & kv : map_poses)
@@ -1560,7 +1576,7 @@ bool Bundle_Adjustment_Ceres::Adjust
 
     // [BA-DIAG] Post-solve diagnostics (full obs traversal + per-pose RMSE
     // histogram). Gated on bVerbose_; not consulted by any control flow.
-    if (ceres_options_.bVerbose_)
+    if (kBADiagLogging && ceres_options_.bVerbose_)
     {
       CountNonFinitePoses(sfm_data, "PostSolve");
 
@@ -1637,8 +1653,10 @@ bool Bundle_Adjustment_Ceres::Adjust
       // set back to the original scene centroid
       openMVG::sfm::ApplySimilarity(sim_to_center.inverse(), sfm_data, true);
 
+#if OPENMVG_SFM_VERBOSE_BA
       //--
       // - Compute some fitting statistics
+      //   Diagnostic only: the result is logged and never read back.
       //--
 
       // Collect corresponding camera centers
@@ -1665,6 +1683,7 @@ bool Bundle_Adjustment_Ceres::Adjust
         minMaxMeanMedian<Vec::Scalar>(residual.data(), residual.data() + residual.size(), os);
         OPENMVG_LOG_INFO << os.str();
       }
+#endif // OPENMVG_SFM_VERBOSE_BA
     }
     return true;
   }

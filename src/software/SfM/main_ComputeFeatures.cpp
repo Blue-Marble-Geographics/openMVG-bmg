@@ -16,6 +16,9 @@
 #define TEST_CF_NOTHREADING          (0)
 #define TEST_CF_MAX_IMAGES           (0)
 
+/* Log the worker-count / RAM-budget breakdown. Tuning aid, off by default. */
+#define TEST_CF_LOG_CONCURRENCY      (0)
+
 #include "openMVG/features/akaze/image_describer_akaze_io.hpp"
 
 #include "openMVG/features/sift/SIFT_Anatomy_Image_Describer_io.hpp"
@@ -568,6 +571,7 @@ int main(int argc, char **argv)
       : (nb_workers <= topo.nb_logical)    ? EPinMode::CORE_SHARED
                                            : EPinMode::NONE;
 
+#if TEST_CF_LOG_CONCURRENCY
     OPENMVG_LOG_INFO
       << "Extraction concurrency: " << nb_workers << " worker(s)"
       << " (ceiling " << thread_ceiling << ", "
@@ -579,6 +583,7 @@ int main(int argc, char **argv)
                      ? 0 : view_pixels.front() * bytes_per_pixel) >> 20)
       << " MB per worker on the largest image"
       << " (" << bytes_per_pixel << " B/px)";
+#endif
 
     omp_set_dynamic(0);   // do not let the runtime hand us fewer threads
     omp_set_num_threads(nb_workers);

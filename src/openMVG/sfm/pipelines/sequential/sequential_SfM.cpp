@@ -19,6 +19,7 @@
 #include "openMVG/sfm/sfm_data_BA_ceres.hpp"
 #include "openMVG/sfm/sfm_data_filters.hpp"
 #include "openMVG/sfm/sfm_data_io.hpp"
+#include "openMVG/sfm/sfm_logging.hpp"
 #include "openMVG/stl/stl.hpp"
 #include "openMVG/system/logger.hpp"
 #include "openMVG/system/loggerprogress.hpp"
@@ -275,15 +276,18 @@ bool SequentialSfMReconstructionEngine::InitLandmarkTracks()
   {
     // List of features matches for each couple of images
     const openMVG::matching::PairWiseMatches & map_Matches = matches_provider_->pairWise_matches_;
-    OPENMVG_LOG_INFO << "Track building";
+    OPENMVG_SFM_LOG_STATS_INFO << "Track building";
 
     tracksBuilder.Build(map_Matches);
-    OPENMVG_LOG_INFO << "Track filtering";
+    OPENMVG_SFM_LOG_STATS_INFO << "Track filtering";
     tracksBuilder.Filter();
-    OPENMVG_LOG_INFO << "Track export to internal struct";
+    OPENMVG_SFM_LOG_STATS_INFO << "Track export to internal struct";
     //-- Build tracks with STL compliant type :
     tracksBuilder.ExportToSTL(map_tracks_);
 
+#if OPENMVG_SFM_VERBOSE_STATS
+    // Track-length histogram + image-id dump: diagnostic only, and it walks
+    // every track twice to build the message.
     {
       std::ostringstream osTrack;
       //-- Display stats :
@@ -308,6 +312,7 @@ bool SequentialSfMReconstructionEngine::InitLandmarkTracks()
       }
       OPENMVG_LOG_INFO << osTrack.str();
     }
+#endif // OPENMVG_SFM_VERBOSE_STATS
   }
   // Initialize the shared track visibility helper
   shared_track_visibility_helper_.reset(new openMVG::tracks::SharedTrackVisibilityHelper(map_tracks_));
@@ -936,7 +941,7 @@ bool SequentialSfMReconstructionEngine::Resection(const uint32_t viewIndex)
   }
 
   // C. Do the resectioning: compute the camera pose
-  OPENMVG_LOG_INFO << "-- Trying robust Resection of view: " << viewIndex;
+  OPENMVG_SFM_LOG_RESECTION_INFO << "-- Trying robust Resection of view: " << viewIndex;
 
   geometry::Pose3 pose;
   const bool bResection = sfm::SfM_Localizer::Localize

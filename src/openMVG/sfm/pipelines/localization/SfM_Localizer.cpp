@@ -18,6 +18,7 @@
 #include "openMVG/sfm/sfm_data_BA.hpp"
 #include "openMVG/sfm/sfm_data_BA_ceres.hpp"
 #include "openMVG/sfm/sfm_landmark.hpp"
+#include "openMVG/sfm/sfm_logging.hpp"
 #include "openMVG/robust_estimation/robust_estimator_ACRansac.hpp"
 #include "openMVG/robust_estimation/robust_estimator_ACRansacKernelAdaptator.hpp"
 #include "openMVG/system/logger.hpp"
@@ -106,6 +107,15 @@ private:
 namespace openMVG {
 namespace sfm {
 
+  // AC-RANSAC's `bVerbose` argument. Every resection call used to hard-code
+  // `true`, which makes ACRANSAC emit an
+  //   "nfa=... inliers=n/m precisionNormalized=... precision=... (iter=...)"
+  // line for each improved model it finds -- several per RANSAC run, one
+  // RANSAC run per candidate view per resection round. Purely diagnostic: the
+  // returned (errorMax, minNFA) pair is what the caller consumes. Tied to the
+  // same switch as the rest of the per-resection logging.
+  static constexpr bool kACRansacVerbose = (OPENMVG_SFM_VERBOSE_RESECTION != 0);
+
   bool SfM_Localizer::Localize
   (
     const resection::SolverType & solver_type,
@@ -154,7 +164,7 @@ namespace sfm {
                                     resection_data.max_iteration,
                                     &P,
                                     dPrecision,
-                                    true);
+                                    kACRansacVerbose);
         // Update the upper bound precision of the model found by AC-RANSAC
         resection_data.error_max = ACRansacOut.first;
       }
@@ -184,7 +194,7 @@ namespace sfm {
                                     resection_data.max_iteration,
                                     &P,
                                     dPrecision,
-                                    true);
+                                    kACRansacVerbose);
         // Update the upper bound precision of the model found by AC-RANSAC
         resection_data.error_max = ACRansacOut.first;
       }
@@ -214,7 +224,7 @@ namespace sfm {
                                     resection_data.max_iteration,
                                     &P,
                                     dPrecision,
-                                    true);
+                                    kACRansacVerbose);
         // Update the upper bound precision of the model found by AC-RANSAC
         resection_data.error_max = ACRansacOut.first;
       }
@@ -245,7 +255,7 @@ namespace sfm {
                                     resection_data.max_iteration,
                                     &P,
                                     dPrecision,
-                                    true);
+                                    kACRansacVerbose);
         // Update the upper bound precision of the model found by AC-RANSAC
         resection_data.error_max = ACRansacOut.first;
       }
@@ -276,7 +286,7 @@ namespace sfm {
                                     resection_data.max_iteration,
                                     &P,
                                     dPrecision,
-                                    true);
+                                    kACRansacVerbose);
         // Update the upper bound precision of the model found by AC-RANSAC
         resection_data.error_max = ACRansacOut.first;
       }
@@ -300,7 +310,10 @@ namespace sfm {
       pose = geometry::Pose3(R, -R.transpose() * t);
     }
 
-    OPENMVG_LOG_INFO << "\n"
+    // Fires on every Localize() call -- i.e. once per candidate view per
+    // resection round, from inside the SfM2 parallel resection loop.
+    // Diagnostic only; see OPENMVG_SFM_VERBOSE_RESECTION in sfm_logging.hpp.
+    OPENMVG_SFM_LOG_RESECTION_INFO << "\n"
       << "-------------------------------" << "\n"
       << "-- Robust Resection statistics: " << "\n"
       << "-- Resection status: " << bResection << "\n"

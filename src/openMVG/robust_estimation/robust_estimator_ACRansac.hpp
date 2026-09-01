@@ -870,6 +870,23 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
 }
 }  // namespace acransac_nfa_internal
 
+// Compile-time gate for ACRANSAC's per-improved-model trace:
+//   "  nfa=... inliers=n/m precisionNormalized=... precision=... (iter=N ,sample=...)"
+// It is emitted once for every model that improves the NFA, so a single
+// ACRANSAC() call prints several lines -- and ACRANSAC runs once per view per
+// resection round (and once per pair during geometric filtering), from inside
+// parallel loops where the logger's global mutex serializes callers.
+//
+// Diagnostic only: the trace reports values that are already returned to the
+// caller as (errorMax, minNFA) plus the inlier vector, so nothing downstream
+// depends on it. Kept behind a compile-time switch rather than the runtime
+// `bVerbose` argument so an individual call site cannot re-introduce the spam.
+//   0 = off (default)
+//   1 = honour the per-call `bVerbose` argument
+#ifndef OPENMVG_ACRANSAC_VERBOSE_LOG
+#define OPENMVG_ACRANSAC_VERBOSE_LOG 0
+#endif
+
 /**
  * @brief ACRANSAC routine (ErrorThreshold, NFA)
  * If an upper bound of the threshold is provided:
@@ -882,7 +899,9 @@ NFA_Interface<Kernel>::ComputeNFA_and_inliers
  * @param[in] nIter maximum number of consecutive iterations
  * @param[out] model returned model if found
  * @param[in] precision upper bound of the precision (squared error)
- * @param[in] bVerbose display console log
+ * @param[in] bVerbose display console log -- also requires the compile-time
+ *            switch OPENMVG_ACRANSAC_VERBOSE_LOG (see below), which is 0 by
+ *            default, so passing `true` alone prints nothing.
  *
  * @return (errorMax, minNFA)
  */
@@ -898,6 +917,10 @@ std::pair<double, double> ACRANSAC
 )
 {
   vec_inliers.clear();
+
+#if !OPENMVG_ACRANSAC_VERBOSE_LOG
+  (void)bVerbose; // the only trace it guards is compiled out
+#endif
 
   const unsigned int sizeSample = Kernel::MINIMUM_SAMPLES;
   const unsigned int nData = kernel.NumSamples();
@@ -1006,6 +1029,7 @@ std::pair<double, double> ACRANSAC
           errorMax = nfa_threshold.second;
           if (model) *model = model_it;
 
+#if OPENMVG_ACRANSAC_VERBOSE_LOG
           if (bVerbose)
           {
             std::ostringstream os;
@@ -1019,6 +1043,7 @@ std::pair<double, double> ACRANSAC
               std::ostream_iterator<uint32_t>(os, ","));
             OPENMVG_LOG_INFO << os.str() << ")";
           }
+#endif // OPENMVG_ACRANSAC_VERBOSE_LOG
         }
       }
     }

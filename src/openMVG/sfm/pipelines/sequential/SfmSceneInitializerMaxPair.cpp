@@ -16,6 +16,7 @@
 #include "openMVG/sfm/pipelines/sfm_matches_provider.hpp"
 #include "openMVG/sfm/pipelines/sfm_robust_model_estimation.hpp"
 #include "openMVG/sfm/sfm_data.hpp"
+#include "openMVG/sfm/sfm_logging.hpp"
 #include "openMVG/stl/stl.hpp"
 #include "openMVG/system/logger.hpp"
 
@@ -215,7 +216,7 @@ bool SfMSceneInitializerMaxPair::Process()
     if (OPENMVG_MAXPAIR_SEED_MIN_TRIANGULATED_POINTS > 0 &&
         well_triangulated < IndexT(OPENMVG_MAXPAIR_SEED_MIN_TRIANGULATED_POINTS))
     {
-      OPENMVG_LOG_INFO
+      OPENMVG_SFM_LOG_STATS_INFO
         << " -> seed candidate (" << I << "," << J << "): only "
         << well_triangulated << " pts with parallax >= "
         << OPENMVG_MAXPAIR_SEED_MIN_PARALLAX_DEG << " deg (need "
@@ -232,7 +233,7 @@ bool SfMSceneInitializerMaxPair::Process()
       median_parallax_deg = R2D(parallax_rad[mid]);
     }
 
-    OPENMVG_LOG_INFO
+    OPENMVG_SFM_LOG_STATS_INFO
       << " -> seed candidate (" << I << "," << J << "): " << matches.size()
       << " matches, " << well_triangulated << " well-parallaxed pts, median parallax "
       << median_parallax_deg << " deg" << std::endl;

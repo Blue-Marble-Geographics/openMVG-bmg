@@ -18,6 +18,7 @@
 #include "openMVG/sfm/sfm_data_filters.hpp"
 #include "openMVG/sfm/sfm_data_io.hpp"
 #include "openMVG/sfm/sfm_data_triangulation.hpp"
+#include "openMVG/sfm/sfm_logging.hpp"
 #include "openMVG/stl/stl.hpp"
 #include "openMVG/system/logger.hpp"
 
@@ -907,7 +908,7 @@ bool SequentialSfMReconstructionEngine2::Process() {
       // expensive outlier filter.
       if (ejected == 0)
       {
-        OPENMVG_LOG_INFO
+        OPENMVG_SFM_LOG_BA_INFO
           << "[ROBUST-BA iter " << iter << "]"
           << " ejected_poses=0 (converged) poses=" << prev_poses
           << " tracks=" << prev_tracks;
@@ -927,7 +928,7 @@ bool SequentialSfMReconstructionEngine2::Process() {
       const IndexT cur_poses  = static_cast<IndexT>(sfm_data_.GetPoses().size());
       const IndexT cur_tracks = static_cast<IndexT>(sfm_data_.GetLandmarks().size());
 
-      OPENMVG_LOG_INFO
+      OPENMVG_SFM_LOG_BA_INFO
         << "[ROBUST-BA iter " << iter << "]"
         << " ejected_poses=" << ejected
         << " removed=" << removed
@@ -955,6 +956,7 @@ bool SequentialSfMReconstructionEngine2::Process() {
   DiagOutputs(sfm_data_, view_diag_records);
 #endif
 
+#if OPENMVG_SFM_VERBOSE_STATS
   // [DIAG] Match-graph connectivity analysis. A healthy drone dataset has
   // hundreds of pairs per view and track median-length >= 4. If pairs/view
   // is below ~5 or median track length is 2, the upstream matching stage
@@ -1003,6 +1005,7 @@ bool SequentialSfMReconstructionEngine2::Process() {
         << " pair generation or increase neighbor_count to >= 20.";
     }
   }
+#endif // OPENMVG_SFM_VERBOSE_STATS
 
   return true;
 }
@@ -1052,7 +1055,7 @@ static void SelectiveShortTrackCut(
       if (it->second.size() < min_len) { it = map_tracks.erase(it); ++dropped; }
       else                             { ++it; }
     }
-    OPENMVG_LOG_INFO
+    OPENMVG_SFM_LOG_STATS_INFO
       << "[TRACKS-CUT] global: min_len=" << min_len
       << " dropped=" << dropped << " kept_short=0";
     return;
@@ -1133,7 +1136,7 @@ static void SelectiveShortTrackCut(
     else if (protective){ ++it; ++kept_short; }
     else                { it = map_tracks.erase(it); ++dropped; }
   }
-  OPENMVG_LOG_INFO
+  OPENMVG_SFM_LOG_STATS_INFO
     << "[TRACKS-CUT] selective(coverage+border): min_len=" << min_len
     << " min_cell_support=" << min_cell_support
     << " cell_px=" << cell_px
@@ -1164,6 +1167,10 @@ bool SequentialSfMReconstructionEngine2::InitTracksAndLandmarks()
                            OPENMVG_SFM2_TRACKS_COVERAGE_CELL_PX,
                            OPENMVG_SFM2_TRACKS_COVERAGE_BORDER_PCT);
 
+#if OPENMVG_SFM_VERBOSE_STATS
+    // Track-length histogram + image-id dump. Diagnostic only, and it walks
+    // every track twice to build the message, so the whole block is compiled
+    // out with the log.
     OPENMVG_LOG_INFO << "\n" << "Track stats";
     {
       std::ostringstream osTrack;
@@ -1191,6 +1198,7 @@ bool SequentialSfMReconstructionEngine2::InitTracksAndLandmarks()
       osTrack << "\n";
       OPENMVG_LOG_INFO << osTrack.str();
     }
+#endif // OPENMVG_SFM_VERBOSE_STATS
   }
 
   // Init the putative landmarks
@@ -1311,7 +1319,7 @@ bool SequentialSfMReconstructionEngine2::Triangulation()
   if (seed_stage)
   {
     const std::size_t n_after_erase = sfm_data_.structure.size();
-    OPENMVG_LOG_INFO
+    OPENMVG_SFM_LOG_STATS_INFO
       << "[SEED-TRI] poses=" << sfm_data_.GetPoses().size()
       << " landmarks=" << n_before_erase
       << " span_seed_pair(after_erase)=" << n_after_erase;
@@ -1327,7 +1335,7 @@ bool SequentialSfMReconstructionEngine2::Triangulation()
 
   if (seed_stage)
   {
-    OPENMVG_LOG_INFO
+    OPENMVG_SFM_LOG_STATS_INFO
       << "[SEED-TRI] triangulated(after_robust)=" << sfm_data_.structure.size()
       << " (if span_seed_pair>0 but this=0 -> degenerate seed geometry;"
       << " if span_seed_pair=0 -> no track connects the seed views)";
@@ -1807,7 +1815,11 @@ bool SequentialSfMReconstructionEngine2::AddingMissingView
         resection_data.pt2D = std::move(pt2D_original); // restore original image domain points
 
         const float inlier_ratio = resection_data.vec_inliers.size()/static_cast<float>(feature_id_for_resection.size());
-        OPENMVG_LOG_INFO
+        // One 8-line block per candidate view per resection round -- tens of
+        // thousands of lines on a few-hundred-image scene, emitted from inside
+        // the `omp parallel for` below where the logger's global mutex
+        // serializes the loop. Off unless OPENMVG_SFM_VERBOSE_RESECTION.
+        OPENMVG_SFM_LOG_RESECTION_INFO
           << std::endl
           << "-------------------------------" << "\n"
           << "-- Robust Resection of camera index: <" << view_id << "> image: "
